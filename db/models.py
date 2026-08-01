@@ -3,7 +3,7 @@
 import datetime as dt
 import enum
 
-from sqlalchemy import DateTime, Enum, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import DateTime, Enum, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -88,6 +88,31 @@ class SystemEvent(Base):
     message: Mapped[str] = mapped_column(Text)
 
 
+class ResearchResult(Base):
+    """A symbol's screening score from one research run. Written for every symbol in the
+    research universe (not just winners), so a symbol that didn't make the cut is still
+    auditable - same philosophy as Signal logging even when no trade results.
+
+    `run_at` has no column default: research_runner.research_once() generates one
+    timestamp per run and passes it to every row explicitly, so "give me the latest run"
+    queries (see db/queries.get_watchlist_symbols) can match on equality. A per-row
+    default would give each row a microsecond-different timestamp and silently break that
+    query into matching at most one row.
+    """
+
+    __tablename__ = "research_results"
+    __table_args__ = (UniqueConstraint("run_at", "symbol", name="uq_research_results_run_symbol"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_at: Mapped[dt.datetime] = mapped_column(DateTime, index=True)
+    symbol: Mapped[str] = mapped_column(String, index=True)
+    technical_score: Mapped[float] = mapped_column(Float)
+    news_score: Mapped[float] = mapped_column(Float)
+    combined_score: Mapped[float] = mapped_column(Float, index=True)
+    rationale: Mapped[str] = mapped_column(Text, default="")
+    selected: Mapped[bool] = mapped_column(default=False)
+
+
 class KillSwitch(Base):
     """Single-row table the trading loop polls each cycle; flipped by the dashboard."""
 
@@ -96,4 +121,17 @@ class KillSwitch(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     engaged: Mapped[bool] = mapped_column(default=False)
     reason: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+
+class ResearchSchedule(Base):
+    """Single-row toggle for the backend's automatic nightly research job (see
+    backend/app/main.py's BackgroundScheduler). The dashboard's "Run research now"
+    button bypasses this - it's a deliberate one-off action, not something the
+    auto-schedule toggle should block."""
+
+    __tablename__ = "research_schedule"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    enabled: Mapped[bool] = mapped_column(default=True)
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)

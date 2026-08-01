@@ -1,4 +1,5 @@
 import datetime as dt
+import math
 
 import pandas as pd
 from alpaca.data.historical import StockHistoricalDataClient
@@ -17,6 +18,24 @@ _TIMEFRAME_MAP = {
     Timeframe.MINUTE: AlpacaTimeFrame.Minute,
     Timeframe.DAY: AlpacaTimeFrame.Day,
 }
+
+_CALENDAR_DAYS_PER_TRADING_DAY = 7 / 5  # weekends alone cut ~5 of every 7 calendar days to trading days
+_HOLIDAY_BUFFER_DAYS = 15  # slack for market holidays and "today"'s bar not being published yet
+_MINUTES_PER_TRADING_DAY = 390
+
+
+def _default_start(timeframe: Timeframe, limit: int) -> dt.datetime:
+    """Alpaca's /v2/stocks/bars defaults `start` to ~today when omitted - not "the last
+    `limit` bars" - so on a day the latest bar isn't published yet (e.g. a weekend), a
+    limit-only request silently returns zero bars instead of falling back to the most
+    recent trading days. Computes an explicit start wide enough to comfortably cover
+    `limit` bars once weekends/holidays are excluded."""
+    if timeframe == Timeframe.DAY:
+        trading_days_needed = limit
+    else:
+        trading_days_needed = math.ceil(limit / _MINUTES_PER_TRADING_DAY) or 1
+    calendar_days = math.ceil(trading_days_needed * _CALENDAR_DAYS_PER_TRADING_DAY) + _HOLIDAY_BUFFER_DAYS
+    return dt.datetime.utcnow() - dt.timedelta(days=calendar_days)
 
 
 class AlpacaBroker:
@@ -37,11 +56,25 @@ class AlpacaBroker:
     def get_bars(
         self, symbol: str, timeframe: Timeframe, limit: int | None = None, start: dt.datetime | None = None
     ) -> pd.DataFrame:
-        request = StockBarsRequest(symbol_or_symbols=symbol, timeframe=_TIMEFRAME_MAP[timeframe], limit=limit, start=start)
+        using_default_start = start is None
+        request_start = start if start is not None else _default_start(timeframe, limit or 100)
+        # When we're the ones synthesizing `start` (see _default_start), don't also pass
+        # `limit` to Alpaca - its default `sort` is ascending, so `limit` truncates from the
+        # *oldest* end of the window, not the most recent bars. Fetch the whole window
+        # unbounded instead and take the most recent `limit` bars ourselves below.
+        request = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=_TIMEFRAME_MAP[timeframe],
+            start=request_start,
+            limit=None if using_default_start else limit,
+        )
         df = self._data.get_stock_bars(request).df
         if isinstance(df.index, pd.MultiIndex):
             df = df.xs(symbol, level=0)
-        return df.sort_index()[["open", "high", "low", "close", "volume"]]
+        df = df.sort_index()[["open", "high", "low", "close", "volume"]]
+        if using_default_start and limit is not None:
+            df = df.tail(limit)
+        return df
 
     def get_position_qty(self, symbol: str) -> float:
         try:

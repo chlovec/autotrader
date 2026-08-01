@@ -3,7 +3,7 @@ import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from db.models import Base, KillSwitch
+from db.models import Base, KillSwitch, ResearchSchedule
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./autotrader.db")
 
@@ -17,7 +17,9 @@ def init_db() -> None:
     with SessionLocal() as session:
         if session.get(KillSwitch, 1) is None:
             session.add(KillSwitch(id=1, engaged=False))
-            session.commit()
+        if session.get(ResearchSchedule, 1) is None:
+            session.add(ResearchSchedule(id=1, enabled=True))
+        session.commit()
 
 
 def get_session() -> Session:

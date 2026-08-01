@@ -9,14 +9,15 @@ RUN_SCRIPT ?= run_portfolio.py
 IBKR_SIM_PORT ?= 7497
 IBKR_LIVE_PORT ?= 7496
 
-.PHONY: help run-alpaca-sim run-alpaca-live run-ibkr-sim run-ibkr-live
+.PHONY: help run-alpaca-sim run-alpaca-live run-ibkr-sim run-ibkr-live research
 
 help:
-	@echo "Autotrader run targets (all run $(RUN_SCRIPT); override with RUN_SCRIPT=run.py):"
+	@echo "Autoloader run targets (all run $(RUN_SCRIPT); override with RUN_SCRIPT=run.py):"
 	@echo "  run-alpaca-sim   Alpaca paper trading"
 	@echo "  run-alpaca-live  Alpaca with real money (asks for confirmation first)"
 	@echo "  run-ibkr-sim     IBKR paper trading, TWS port $(IBKR_SIM_PORT)"
 	@echo "  run-ibkr-live    IBKR with real money, TWS port $(IBKR_LIVE_PORT) (asks for confirmation first)"
+	@echo "  research         Screen run_research.py's symbol universe and update the watchlist (no trades placed)"
 
 run-alpaca-sim:
 	BROKER=alpaca ALPACA_PAPER=true $(PYTHON) $(RUN_SCRIPT)
@@ -34,3 +35,6 @@ run-ibkr-live:
 	@echo "Make sure TWS/Gateway is logged into your LIVE account on port $(IBKR_LIVE_PORT), not paper."
 	@read -p "Type 'yes' to continue: " confirm && [ "$$confirm" = "yes" ] || (echo "Aborted."; exit 1)
 	BROKER=ibkr IBKR_PORT=$(IBKR_LIVE_PORT) $(PYTHON) $(RUN_SCRIPT)
+
+research:
+	$(PYTHON) run_research.py

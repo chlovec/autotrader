@@ -4,6 +4,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from db.models import EquitySnapshot, Signal, SignalAction
+from db.queries import get_watchlist_symbols
 from db.session import get_session, init_db
 from engine.brokers import make_broker
 from engine.brokers.base import Timeframe
@@ -17,7 +18,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("autotrader.runner")
 
 
-def run_once(symbols: list[str], strategy: Strategy) -> None:
+def run_once(strategy: Strategy, symbols: list[str] | None = None) -> None:
     config = load_config()
     broker = make_broker(config)
     notifier = make_notifier(config)
@@ -46,7 +47,12 @@ def run_once(symbols: list[str], strategy: Strategy) -> None:
             )
             return
 
-        for symbol in symbols:
+        watchlist_symbols = symbols if symbols is not None else get_watchlist_symbols(session)
+        if not watchlist_symbols:
+            log_and_notify(session, notifier, "warning", "runner", "no researched symbols in watchlist, skipping cycle")
+            return
+
+        for symbol in watchlist_symbols:
             bars = broker.get_bars(symbol, Timeframe.DAY, limit=100)
 
             action, reason = strategy.generate_signal(symbol, bars)
@@ -75,12 +81,19 @@ def run_once(symbols: list[str], strategy: Strategy) -> None:
             logger.info("submitted %s order for %s qty=%s", action.value, symbol, trade.qty)
 
 
-def main(symbols: list[str], strategy: Strategy, hour: int = 9, minute: int = 35) -> None:
+def main(strategy: Strategy, symbols: list[str] | None = None, hour: int = 9, minute: int = 35) -> None:
     """Runs once per weekday at hour:minute America/New_York, using the latest completed
-    daily bars. Default of 9:35 gives the market a few minutes to open before trading."""
+    daily bars. Default of 9:35 gives the market a few minutes to open before trading.
+
+    symbols defaults to None, meaning each cycle trades whatever engine/research_runner.py
+    most recently selected (db.queries.get_watchlist_symbols) - pass an explicit list to
+    override, e.g. for tests or a one-off manual run."""
     init_db()
     scheduler = BlockingScheduler()
     trigger = CronTrigger(day_of_week="mon-fri", hour=hour, minute=minute, timezone="America/New_York")
-    scheduler.add_job(run_once, trigger, args=[symbols, strategy])
-    logger.info("starting autotrader daily loop at %02d:%02d America/New_York, symbols=%s", hour, minute, symbols)
+    scheduler.add_job(run_once, trigger, kwargs={"strategy": strategy, "symbols": symbols})
+    logger.info(
+        "starting autotrader daily loop at %02d:%02d America/New_York, symbols=%s",
+        hour, minute, symbols if symbols is not None else "from research watchlist",
+    )
     scheduler.start()

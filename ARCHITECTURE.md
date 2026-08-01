@@ -16,10 +16,12 @@ flowchart TB
         Exec["execution.py<br/>ExecutionEngine"]
         Notify["notifications.py<br/>Notifier"]
         Runner["runner.py / portfolio_runner.py<br/>the scheduler loop"]
+        Research["research.py / research_runner.py<br/>which symbols are worth trading"]
     end
 
-    DB[("db/<br/>SQLite: trades, signals,<br/>equity, events, kill switch")]
-    Backend["backend/<br/>FastAPI REST + WebSocket"]
+    NewsAPI[("Alpaca News API")]
+    DB[("db/<br/>SQLite: trades, signals, research results,<br/>equity, events, kill switch, research schedule")]
+    Backend["backend/<br/>FastAPI REST + WebSocket<br/>+ nightly research scheduler"]
     Frontend["frontend/<br/>React dashboard"]
     Person(("You"))
 
@@ -28,15 +30,20 @@ flowchart TB
     Runner --> Risk
     Runner --> Exec
     Runner --> Notify
+    Runner -- "reads watchlist" --> DB
     Broker <--> BrokerAPI
     Exec --> Broker
     Runner --> DB
     Risk --> DB
     Exec --> DB
+    Research --> Broker
+    Research <--> NewsAPI
+    Research -- "writes ResearchResult" --> DB
 
     Backend -- reads --> DB
     Backend -- live positions --> Broker
     Backend -- kill switch writes --> DB
+    Backend -- "nightly cron + 'run now' trigger" --> Research
     Frontend <-- "REST poll + WebSocket" --> Backend
     Person --> Frontend
     Notify -. "macOS / email" .-> Person
@@ -48,8 +55,12 @@ database and makes one read-only live call to the broker for current positions. 
 frontend never talks to the broker or the database directly — everything goes
 through the backend. This keeps the loop that actually risks money small and
 auditable: one path in, through `runner.py`/`portfolio_runner.py`, everything else
-is observation. Which broker that path actually talks to is a `BROKER` env var away
-— see below.
+is observation. The backend also *invokes* `research_runner.research_once()`
+directly — on its own nightly schedule (unless the dashboard's toggle disables it)
+and via the dashboard's "Run research now" button — but `research_once` only ever
+screens candidates and never calls `submit_market_order`, so it's on the observation
+side of that line, not the trading side, even though the backend is the one calling
+it. Which broker that path actually talks to is a `BROKER` env var away — see below.
 
 ## `engine/` — the trading logic
 
@@ -87,6 +98,24 @@ copies of it.
 - **`alpaca_broker.py`** implements `BrokerClient` using the `alpaca-py` SDK — the
   only file that imports `alpaca-py`. **Verified working**: connected to a real
   paper account, placed real (paper) trades, confirmed via the dashboard.
+
+  `get_bars(symbol, timeframe, limit)` (no explicit `start`, the shape every caller
+  in this codebase actually uses) does *not* pass `limit` straight through to
+  Alpaca. Confirmed against a real account: Alpaca's `/v2/stocks/bars` defaults
+  `start` to ~today when omitted, not "the last `limit` bars" — so on any day
+  today's bar hasn't published yet (weekends, before close), a `limit`-only request
+  silently returns **zero bars**, and this affected every live caller
+  (`runner.py`, `portfolio_runner.py`, `research_runner.py`). `_default_start()`
+  computes an explicit calendar-day window wide enough to cover `limit` trading
+  days (accounting for weekends plus a holiday buffer). That window is then
+  fetched *unbounded* rather than also passing `limit` to Alpaca, because its
+  default `sort` is ascending — passing `limit` alongside a synthesized `start`
+  would return the **oldest** bars in the window, not the most recent ones (this
+  would have silently broken `portfolio_runner.py`'s "get the latest close price"
+  use case, `get_bars(symbol, Timeframe.DAY, limit=1)`, returning a stale price
+  from weeks back instead). `get_bars` takes `.tail(limit)` client-side instead.
+  An explicit `start` (the only way `scripts/common.py`'s backtest fetcher calls
+  it) skips all of this and behaves exactly as before.
 - **`ibkr_broker.py`** implements `BrokerClient` via `ib_async`. Connects to a
   locally running Trader Workstation or IB Gateway over its API socket — there's no
   API key, you authenticate by being logged into TWS/Gateway yourself. Two pure
@@ -210,32 +239,123 @@ an `EquitySnapshot`. They differ in cadence and what "the work" is:
   latest `rebalancing_portfolio` `Signal` row) stops it firing again on day 2–4 once
   one of those days succeeds.
 
+`runner.py`'s `run_once`/`main` take `symbols: list[str] | None = None`. When `None`
+(the default, used by `run.py`), each cycle trades whatever `research_runner.py` most
+recently selected (`db.queries.get_watchlist_symbols`) instead of a list baked into
+source. An explicit `symbols=[...]` still overrides this, e.g. for tests or a one-off
+manual run. `portfolio_runner.py` is unaffected — it always trades its fixed
+`target_weights`, never the research watchlist.
+
+### `research.py` / `research_runner.py` — screening a symbol universe for `run.py`
+
+Answers a different question than `strategy.py`: not "buy or sell *this* symbol
+*now*", but "which symbols are worth including in that decision at all". Deliberately
+not a `Strategy`-style ABC — there are exactly two scorers and no evidence more are
+coming, so `research.py` is plain functions rather than a plugin system:
+
+- `score_technical(bars, lookback=60)` — blends lookback return, a return/volatility
+  ratio (momentum *quality*, so one wild day doesn't outrank a steady trend), and
+  average dollar volume (a liquidity floor) into a 0–100 score, using the same
+  `BrokerClient.get_bars` data the strategies already consume.
+- `score_news(articles)` — deterministic keyword sentiment (positive/negative word
+  lists) plus a coverage-volume bonus, also 0–100. An empty article list scores a
+  neutral 50, not 0, so thinly-covered-but-solid names and ETFs aren't punished
+  relative to whatever's currently generating headline noise. Same "formula, not ML"
+  style as `strategy.py`'s RSI/ADX — has real limits (no negation/sarcasm handling,
+  every source treated as equally credible) called out in its docstring.
+- `fetch_universe_news(client, universe)` — one Alpaca News API call for the *entire*
+  universe (the SDK auto-paginates and accepts a comma-joined symbol list), then
+  buckets articles per symbol by checking `article.symbols` membership, since one
+  article commonly tags multiple tickers. Uses `config.alpaca_api_key`/`secret`,
+  which load unconditionally regardless of `BROKER` (see `config.py` above) — so the
+  news layer works even when trading through IBKR/Questrade, as long as a (free,
+  paper-tier) Alpaca key pair is set.
+- `combine(technical_score, news_score, technical_weight=0.5, news_weight=0.5)` —
+  named float params rather than a `weights` tuple, so a call site can't transpose
+  the two by accident.
+
+`research_runner.research_once(universe, top_n, ...)` runs both scorers over every
+symbol in a fixed, hand-edited universe (`DEFAULT_UNIVERSE`, defined in
+`research_runner.py` — not a dynamically pulled index), writes one `ResearchResult`
+row per symbol (not just the winners, so "why wasn't X selected" stays answerable
+later), and flags the top `top_n` by `combined_score` as `selected=True`. A per-symbol
+`try`/`except` around the bars fetch skips (and logs) symbols with insufficient
+history or that have drifted out of the live universe (delisted/renamed), rather than
+aborting the whole run.
+
+`research_runner.py` itself has no scheduler. `main()` is a one-shot call
+(`init_db()` + `research_once(...)`) — the entrypoint for `run_research.py`, useful
+for a manual run or an OS-level cron on a box that doesn't run the backend
+persistently. The *automatic* nightly schedule lives in `backend/app/main.py`
+instead (see below): the dashboard's toggle and "Run research now" button need to
+take effect immediately, and the backend is the one process guaranteed to be running
+whenever the dashboard is in use — a scheduler loop inside `research_runner.py`
+itself couldn't offer either of those without polling latency.
+
+One correctness detail worth knowing if you touch this file: `ResearchResult.run_at`
+deliberately has **no** column default. `research_once` generates one
+`dt.datetime.utcnow()` per run and passes it explicitly to every row, because a
+per-row default would give each row a microsecond-different timestamp and silently
+break `get_watchlist_symbols`'s "match the latest run" equality query down to at most
+one row.
+
 ## `db/` — the shared schema
 
-`models.py` defines five tables, all written by the engine and read by the backend:
+`models.py` defines seven tables, written by the engine and/or the backend and read
+by the backend:
 
 | Table | What it records |
 | --- | --- |
 | `Signal` | Every decision a strategy made, whether or not it became a trade — symbol, strategy name, action, human-readable reason |
 | `Trade` | Every order actually submitted, linked back to the `Signal` that caused it |
+| `ResearchResult` | Every symbol scored in a research run (not just the ones selected) — technical score, news score, combined score, rationale, and whether it made the cut |
 | `EquitySnapshot` | Account equity/cash/buying-power, recorded once per runner cycle — this is what the dashboard's equity curve and the daily-loss check both read |
 | `SystemEvent` | Errors, kill-switch engagements, daily-loss halts — anything `log_and_notify` was called for |
 | `KillSwitch` | Single-row table; the dashboard's stop/resume button writes here, both runners read it every cycle |
+| `ResearchSchedule` | Single-row table; the dashboard's "Run nightly" toggle writes here, the backend's nightly job reads it before each automatic run (the manual "Run research now" button bypasses it) |
 
 `session.py` provides `init_db()` (creates tables if missing, seeds the one
 `KillSwitch` row) and `get_session()`. Default is a local SQLite file
 (`autotrader.db`); swappable via `DATABASE_URL` to Postgres if the engine and
 backend ever need to run on separate machines.
 
-## `backend/` — read-only API over the same database
+`queries.py` provides `get_watchlist_symbols(session, limit=None)` — the read side
+`runner.py` uses by default: the most recent `ResearchResult.run_at` batch, filtered
+to `selected=True`, ordered by `combined_score` descending.
+
+## `backend/` — the API, plus the nightly research scheduler
 
 A single FastAPI app (`backend/app/main.py`). Every `GET` endpoint queries the
 database directly except `/positions`, which calls `BrokerClient.get_positions()`
 live (positions and unrealized P&L need to reflect current prices, not a snapshot).
-`POST /kill-switch` is the one write endpoint, and it only ever touches the
-`KillSwitch` row — the backend still never places an order itself. `/ws` is a
+`POST /kill-switch` and `POST /research/schedule` are simple single-row writes. The
+backend still never places an order itself — the trading side of the app is still
+only `runner.py`/`portfolio_runner.py` (see [Overview](#overview) above). `/ws` is a
 WebSocket that pushes the latest equity value every 5 seconds, for the dashboard's
 live tick without full polling.
+
+Research is the one place the backend does more than read/relay: on startup it
+registers an APScheduler `BackgroundScheduler` job (`_nightly_research_job`, 2am
+America/New_York) that checks the `ResearchSchedule.enabled` toggle and, if enabled,
+calls `research_runner.research_once()` directly — same function `run_research.py`
+calls, just invoked from the backend process instead of a CLI script. A module-level
+`threading.Lock` (`_research_lock`) prevents overlapping runs; `GET /research/status`
+exposes whether it's currently held.
+
+- `GET /research` — the latest run's `ResearchResult` rows, ordered by
+  `combined_score` descending.
+- `GET`/`POST /research/schedule` — read/write the `ResearchSchedule.enabled` toggle.
+- `GET /research/status` — `{"running": bool}`, backed by `_research_lock`.
+- `POST /research/run` — acquires `_research_lock` synchronously (so two rapid
+  clicks can't both pass the check), then runs `research_once()` via FastAPI
+  `BackgroundTasks` so the request returns immediately; `409` if a run is already in
+  progress. Ignores the `ResearchSchedule` toggle entirely — it's a deliberate manual
+  override, not something "nightly: off" should block.
+
+This lock/scheduler is per-process, in-memory — correct for the single always-on
+backend instance this app is designed to run as (no process manager, no
+multi-worker uvicorn anywhere in this doc). Running multiple backend workers would
+each start their own nightly job and lock, and isn't supported today.
 
 No authentication on any endpoint. That's fine bound to `127.0.0.1`; see
 [README.md's deployment section](README.md#option-b-an-always-on-servervm) before
@@ -294,13 +414,25 @@ historical market data and print/plot results.
 
 ## `tests/` — no network or credentials required
 
-65 tests, all against synthetic data, in-memory SQLite, or mocked network/socket
-calls — no live broker credentials or network access needed to run any of them:
+88 tests, all against synthetic data, in-memory/temp-file SQLite, or mocked
+network/socket calls — no live broker credentials or network access needed to run
+any of them:
 
 - `test_strategy.py` — crossover/RSI/regime-switching signal logic on constructed
   price series (e.g. a flat-then-jump series to force an exact golden-cross bar).
 - `test_portfolio.py` — `RebalancingPortfolio`'s drift-correction math.
 - `test_portfolio_runner.py` — the already-rebalanced-this-month guard.
+- `test_research.py` — `score_technical`/`score_news`'s pure scoring math (uptrend vs.
+  flat, liquid vs. illiquid, neutral-on-no-news, positive/negative keyword lean).
+- `test_research_runner.py` — `get_watchlist_symbols` against an in-memory DB: no
+  runs yet, only-the-latest-run, unselected rows excluded, score ordering, `limit`.
+- `test_backend.py` — the `/research*` endpoints via FastAPI's `TestClient` against
+  a temp-file SQLite (`db.session.engine`/`SessionLocal` monkeypatched, since the
+  backend has no DI seam for its session today) with the real `BackgroundScheduler`
+  swapped for a no-op fake: schedule toggle round-trips, latest-run ordering,
+  `/research/status` reflecting `_research_lock`, and `POST /research/run` returning
+  409 while a run is already in progress (`_run_research` itself is monkeypatched to
+  a no-op, so no test hits the broker or Alpaca News API).
 - `test_risk.py` — `RiskManager`'s kill-switch, daily-loss, and position-cap checks.
 - `test_notifications.py` — `Notifier` composition and that failures (a bad SMTP
   host, a failing `osascript` call) are swallowed rather than crashing the runner.
@@ -308,6 +440,11 @@ calls — no live broker credentials or network access needed to run any of them
   correctly based on `ALPACA_PAPER`.
 - `test_brokers.py` — `make_broker()` returns the right class per `BROKER` value
   and raises clearly on an unsupported one.
+- `test_alpaca_broker.py` — `_default_start`'s calendar-day math, and that
+  `get_bars()` fetches an unbounded window and takes the tail itself when `start`
+  is omitted rather than trusting Alpaca's own `limit` (see `alpaca_broker.py`'s
+  entry under `brokers/` above) - plus that an explicit `start` (the backtest
+  path) is untouched.
 - `test_ibkr_broker.py` — the `_parse_trading_hours` / `_duration_string` pure
   helpers, plus response-translation logic against a mocked `IB` connection
   (`SimpleNamespace` fakes shaped like `ib_async`'s real objects, not a live TWS).

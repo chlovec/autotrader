@@ -105,6 +105,33 @@ Three independent processes make up the running app. Each is a plain long-runnin
 process — there's no process manager wiring them together, so open a separate
 terminal (or use `nohup ... &`) for each.
 
+### 0. Research (needs at least one run before `run.py` has anything to trade)
+
+The backend (started in step 2 below) automatically runs research every night at
+2am ET, and the dashboard (step 3) has a "Run research now" button and a "Run
+nightly" toggle — once the backend is running, that's normally all you need. To run
+it by hand instead (before the backend's first nightly run, or on a box that
+doesn't run the backend persistently, e.g. via an OS-level cron job):
+
+```bash
+.venv/bin/python run_research.py
+# or
+make research
+```
+
+Screens the fixed symbol universe in `engine/research_runner.py`'s
+`DEFAULT_UNIVERSE` (edit that constant to change which tickers are considered),
+scores each on a technical (price/volume) and a news layer, and writes the results
+to the `research_results` table — see [ARCHITECTURE.md](ARCHITECTURE.md) for how
+scoring works and how the backend's nightly job/toggle/button fit together. Never
+places an order, only reads market data/news and writes to the database.
+
+`run.py`'s signal-based trading loop trades whichever symbols the most recent
+research run selected (top 10 by combined score) — if `research_results` is empty,
+`run.py` logs a warning and skips its cycle instead of trading nothing.
+`run_portfolio.py` is unaffected — it always trades its own fixed `target_weights`,
+not the research watchlist.
+
 ### 1. The trading engine
 
 ```bash
@@ -149,10 +176,18 @@ sized `MAX_POSITION_SIZE_USD` for that — they aren't aware of each other's pos
 nohup .venv/bin/uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 > backend.log 2>&1 &
 ```
 
-Serves `/positions`, `/equity`, `/trades`, `/signals`, `/events`, `/kill-switch`, and
-a `/ws` WebSocket, all reading from the same SQLite database the engine writes to
-(plus one live call to whichever broker is configured for `/positions`). Health
-check: `curl localhost:8000/health`.
+Serves `/positions`, `/equity`, `/trades`, `/signals`, `/events`, `/kill-switch`,
+`/research`, `/research/schedule`, `/research/status`, `/research/run`, and a `/ws`
+WebSocket, all reading from the same SQLite database the engine writes to (plus one
+live call to whichever broker is configured for `/positions`). Health check: `curl
+localhost:8000/health`.
+
+This process also *runs* research: on startup it registers a nightly job (2am ET,
+skipped if the dashboard's "Run nightly" toggle is off) and exposes the "Run
+research now" trigger — see [ARCHITECTURE.md](ARCHITECTURE.md#backend--the-api-plus-the-nightly-research-scheduler)
+for why that scheduling lives here rather than in `run_research.py`. This means the
+backend now needs the same Alpaca credentials `run_research.py` does (see
+[Configuration](#configuration)) even if you trade through IBKR/Questrade.
 
 ### 3. The dashboard
 
@@ -162,7 +197,10 @@ cd frontend && nohup npm run dev > ../frontend.log 2>&1 &
 
 Open `http://localhost:5173`. It polls the backend every 15 seconds and listens on
 the WebSocket for live equity ticks. The kill switch button is real — it flips the
-same database row the engine checks before every trading cycle.
+same database row the engine checks before every trading cycle. The Research card
+shows the most recent run's scored symbols (click one for its rationale and score
+breakdown), a "Run nightly" toggle for the backend's automatic schedule, and a "Run
+research now" button that triggers an on-demand run regardless of that toggle.
 
 ### Stopping everything
 
@@ -182,7 +220,7 @@ for the full list with defaults):
 | Variable | Purpose |
 | --- | --- |
 | `BROKER` | `alpaca`, `ibkr`, or `questrade` — see [Brokers](#brokers). Implementation details in [ARCHITECTURE.md](ARCHITECTURE.md) |
-| `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` | Your Alpaca **paper** API credentials — only read when `BROKER=alpaca` and `ALPACA_PAPER=true` |
+| `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` | Your Alpaca **paper** API credentials — read whenever `ALPACA_PAPER=true`, regardless of `BROKER`. Trading only uses them when `BROKER=alpaca`, but the research news layer (`run_research.py`, and the backend's nightly job/"Run research now" button) always uses them (Alpaca's News API), even when trading through IBKR/Questrade — set a free Alpaca paper key pair for that alone if needed |
 | `ALPACA_LIVE_API_KEY` / `ALPACA_LIVE_SECRET_KEY` | Your Alpaca **live** API credentials (a separate account) — only read when `BROKER=alpaca` and `ALPACA_PAPER=false` |
 | `ALPACA_BASE_URL` | Alpaca endpoint (paper by default) |
 | `ALPACA_PAPER` | `true` for paper trading, `false` for live — see [Going live](#going-live-real-money). `make run-alpaca-sim`/`run-alpaca-live` set this for you |
