@@ -35,6 +35,14 @@ def rebalance_once(portfolio: RebalancingPortfolio) -> None:
     broker = make_broker(config)
     notifier = make_notifier(config)
 
+    # Recorded before the market-hours gate below so the dashboard's equity/cash tiles
+    # reflect the account even when called outside trading hours (evenings, weekends),
+    # instead of only updating whenever a rebalance actually runs.
+    account = broker.get_account()
+    with get_session() as session:
+        session.add(EquitySnapshot(equity=account.equity, cash=account.cash, buying_power=account.buying_power))
+        session.commit()
+
     if not broker.get_clock().is_open:
         logger.info("market closed, skipping rebalance")
         return
@@ -51,10 +59,6 @@ def rebalance_once(portfolio: RebalancingPortfolio) -> None:
         if _already_rebalanced_this_month(session):
             logger.info("already rebalanced this month, skipping")
             return
-
-        account = broker.get_account()
-        session.add(EquitySnapshot(equity=account.equity, cash=account.cash, buying_power=account.buying_power))
-        session.commit()
 
         if risk.daily_loss_limit_breached():
             log_and_notify(

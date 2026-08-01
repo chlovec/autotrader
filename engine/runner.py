@@ -23,6 +23,14 @@ def run_once(strategy: Strategy, symbols: list[str] | None = None) -> None:
     broker = make_broker(config)
     notifier = make_notifier(config)
 
+    # Recorded before the market-hours gate below so the dashboard's equity/cash tiles
+    # reflect the account even when called outside trading hours (evenings, weekends),
+    # instead of only updating whenever a cycle actually trades.
+    account = broker.get_account()
+    with get_session() as session:
+        session.add(EquitySnapshot(equity=account.equity, cash=account.cash, buying_power=account.buying_power))
+        session.commit()
+
     if not broker.get_clock().is_open:
         logger.info("market closed, skipping cycle")
         return
@@ -35,10 +43,6 @@ def run_once(strategy: Strategy, symbols: list[str] | None = None) -> None:
         if engaged:
             log_and_notify(session, notifier, "warning", "runner", f"kill switch engaged, skipping cycle: {reason}")
             return
-
-        account = broker.get_account()
-        session.add(EquitySnapshot(equity=account.equity, cash=account.cash, buying_power=account.buying_power))
-        session.commit()
 
         if risk.daily_loss_limit_breached():
             log_and_notify(
