@@ -48,7 +48,16 @@ def trades(limit: int = 200) -> list[dict]:
     with get_session() as session:
         rows = session.execute(select(Trade).order_by(Trade.submitted_at.desc()).limit(limit)).scalars().all()
         return [
-            {"symbol": t.symbol, "side": t.side.value, "qty": t.qty, "fill_price": t.fill_price, "status": t.status, "submitted_at": t.submitted_at.isoformat()}
+            {
+                "id": t.id,
+                "broker_order_id": t.broker_order_id,
+                "symbol": t.symbol,
+                "side": t.side.value,
+                "qty": t.qty,
+                "fill_price": t.fill_price,
+                "status": t.status,
+                "submitted_at": t.submitted_at.isoformat(),
+            }
             for t in rows
         ]
 
@@ -57,14 +66,17 @@ def trades(limit: int = 200) -> list[dict]:
 def signals(limit: int = 200) -> list[dict]:
     with get_session() as session:
         rows = session.execute(select(Signal).order_by(Signal.timestamp.desc()).limit(limit)).scalars().all()
-        return [{"symbol": s.symbol, "strategy_name": s.strategy_name, "action": s.action.value, "reason": s.reason, "timestamp": s.timestamp.isoformat()} for s in rows]
+        return [
+            {"id": s.id, "symbol": s.symbol, "strategy_name": s.strategy_name, "action": s.action.value, "reason": s.reason, "timestamp": s.timestamp.isoformat()}
+            for s in rows
+        ]
 
 
 @app.get("/events")
 def events(limit: int = 100) -> list[dict]:
     with get_session() as session:
         rows = session.execute(select(SystemEvent).order_by(SystemEvent.timestamp.desc()).limit(limit)).scalars().all()
-        return [{"level": e.level.value, "source": e.source, "message": e.message, "timestamp": e.timestamp.isoformat()} for e in rows]
+        return [{"id": e.id, "level": e.level.value, "source": e.source, "message": e.message, "timestamp": e.timestamp.isoformat()} for e in rows]
 
 
 @app.get("/kill-switch")
