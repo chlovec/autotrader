@@ -7,20 +7,16 @@ Usage (from project root): python -m scripts.backtest_ma_crossover
 Requires ALPACA_API_KEY / ALPACA_SECRET_KEY in .env (market data access works with paper keys).
 """
 
-import datetime as dt
-
 import pandas as pd
 from backtesting import Backtest, Strategy
 from backtesting.lib import crossover
 
-from engine.brokers import make_broker
-from engine.brokers.base import Timeframe
-from engine.config import load_config
+from scripts.common import fetch_daily_bars
 
 SYMBOL = "SPY"
 SHORT_WINDOW = 20
 LONG_WINDOW = 50
-YEARS_OF_HISTORY = 3
+YEARS_OF_HISTORY = 12  # Alpaca's free data actually starts 2016-01, so this captures everything available
 
 
 def _sma(values, window: int) -> pd.Series:
@@ -40,14 +36,6 @@ class MaCross(Strategy):
             self.buy()
         elif crossover(self.sma2, self.sma1):
             self.position.close()
-
-
-def fetch_daily_bars(symbol: str, years: int) -> pd.DataFrame:
-    broker = make_broker(load_config())
-    start = dt.datetime.now() - dt.timedelta(days=365 * years)
-    df = broker.get_bars(symbol, Timeframe.DAY, start=start)
-    df = df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"})
-    return df[["Open", "High", "Low", "Close", "Volume"]]
 
 
 def main() -> None:
