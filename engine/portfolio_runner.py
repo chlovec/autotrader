@@ -1,7 +1,10 @@
+import datetime as dt
 import logging
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from db.models import EquitySnapshot, Signal
 from db.session import get_session, init_db
@@ -14,6 +17,16 @@ from engine.risk import RiskManager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("autotrader.portfolio_runner")
+
+REBALANCE_STRATEGY_NAME = "rebalancing_portfolio"
+
+
+def _already_rebalanced_this_month(session: Session, now: dt.datetime | None = None) -> bool:
+    now = now or dt.datetime.utcnow()
+    latest = session.execute(
+        select(Signal).where(Signal.strategy_name == REBALANCE_STRATEGY_NAME).order_by(Signal.timestamp.desc())
+    ).scalars().first()
+    return latest is not None and latest.timestamp.year == now.year and latest.timestamp.month == now.month
 
 
 def rebalance_once(portfolio: RebalancingPortfolio) -> None:
@@ -33,6 +46,10 @@ def rebalance_once(portfolio: RebalancingPortfolio) -> None:
             logger.info("kill switch engaged, skipping rebalance: %s", reason)
             return
 
+        if _already_rebalanced_this_month(session):
+            logger.info("already rebalanced this month, skipping")
+            return
+
         account = broker.get_account()
         session.add(EquitySnapshot(equity=account.equity, cash=account.cash, buying_power=account.buying_power))
         session.commit()
@@ -49,7 +66,7 @@ def rebalance_once(portfolio: RebalancingPortfolio) -> None:
             return
 
         for order in orders:
-            signal = Signal(symbol=order.symbol, strategy_name="rebalancing_portfolio", action=order.action, reason=order.reason)
+            signal = Signal(symbol=order.symbol, strategy_name=REBALANCE_STRATEGY_NAME, action=order.action, reason=order.reason)
             session.add(signal)
             session.commit()
 
@@ -57,14 +74,19 @@ def rebalance_once(portfolio: RebalancingPortfolio) -> None:
             logger.info("rebalance: %s %s qty=%s (%s)", order.action.value, order.symbol, trade.qty, order.reason)
 
 
-def main(target_weights: dict[str, float], day: int = 1, hour: int = 9, minute: int = 35) -> None:
-    """Runs once a month on `day` at hour:minute America/New_York. If `day` falls on a
-    non-trading day the job just no-ops (market closed) until the scheduler's next monthly
-    firing - fine for a rebalance cadence, no need to hunt for the nearest trading day."""
+def main(target_weights: dict[str, float], day: str = "1-4", hour: int = 9, minute: int = 35) -> None:
+    """Runs once a month, on the first trading day at or after `day` (a range like "1-4"
+    covers a day-1 weekend without skipping the whole month - _already_rebalanced_this_month
+    then stops it firing again on day 2-4 once day 1 or the first open day after it succeeds).
+    Also runs once immediately on startup, in case the account needs its initial allocation
+    before the next scheduled slot."""
     init_db()
     portfolio = RebalancingPortfolio(target_weights)
+
+    rebalance_once(portfolio)
+
     scheduler = BlockingScheduler()
     trigger = CronTrigger(day=day, hour=hour, minute=minute, timezone="America/New_York")
     scheduler.add_job(rebalance_once, trigger, args=[portfolio])
-    logger.info("starting monthly rebalance loop on day %d at %02d:%02d America/New_York, weights=%s", day, hour, minute, target_weights)
+    logger.info("starting monthly rebalance loop on day %s at %02d:%02d America/New_York, weights=%s", day, hour, minute, target_weights)
     scheduler.start()
