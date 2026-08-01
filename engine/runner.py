@@ -1,14 +1,12 @@
 import logging
 
-import pandas as pd
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from db.models import EquitySnapshot, Signal, SignalAction
 from db.session import get_session, init_db
-from engine.clients import make_data_client, make_trading_client
+from engine.brokers import make_broker
+from engine.brokers.base import Timeframe
 from engine.config import load_config
 from engine.execution import ExecutionEngine
 from engine.risk import RiskManager
@@ -18,41 +16,24 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("autotrader.runner")
 
 
-def _extract_symbol_bars(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
-    """alpaca-py's BarSet.df is multi-indexed by (symbol, timestamp) even for one symbol."""
-    if isinstance(df.index, pd.MultiIndex):
-        df = df.xs(symbol, level=0)
-    return df.sort_index()
-
-
-def _current_position_qty(trading_client, symbol: str) -> float:
-    try:
-        return abs(float(trading_client.get_open_position(symbol).qty))
-    except Exception:
-        return 0.0
-
-
 def run_once(symbols: list[str], strategy: Strategy) -> None:
     config = load_config()
-    trading_client = make_trading_client(config)
-    data_client = make_data_client(config)
+    broker = make_broker(config)
 
-    clock = trading_client.get_clock()
-    if not clock.is_open:
+    if not broker.get_clock().is_open:
         logger.info("market closed, skipping cycle")
         return
 
     with get_session() as session:
         risk = RiskManager(config, session)
-        execution = ExecutionEngine(trading_client, session)
+        execution = ExecutionEngine(broker, session)
 
-        account = trading_client.get_account()
-        session.add(EquitySnapshot(equity=float(account.equity), cash=float(account.cash), buying_power=float(account.buying_power)))
+        account = broker.get_account()
+        session.add(EquitySnapshot(equity=account.equity, cash=account.cash, buying_power=account.buying_power))
         session.commit()
 
         for symbol in symbols:
-            request = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day, limit=100)
-            bars = _extract_symbol_bars(data_client.get_stock_bars(request).df, symbol)
+            bars = broker.get_bars(symbol, Timeframe.DAY, limit=100)
 
             action, reason = strategy.generate_signal(symbol, bars)
             signal = Signal(symbol=symbol, strategy_name=strategy.name, action=action, reason=reason)
@@ -65,7 +46,7 @@ def run_once(symbols: list[str], strategy: Strategy) -> None:
                 qty = round(order_value_usd / last_price, 4)
             else:
                 order_value_usd = 0.0
-                qty = _current_position_qty(trading_client, symbol)
+                qty = broker.get_position_qty(symbol)
 
             approved, why = risk.approve(symbol, action, order_value_usd)
             if not approved:

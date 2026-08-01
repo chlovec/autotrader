@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import asdict
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,7 +7,7 @@ from sqlalchemy import select
 
 from db.models import EquitySnapshot, KillSwitch, Signal, SystemEvent, Trade
 from db.session import get_session, init_db
-from engine.clients import make_trading_client
+from engine.brokers import make_broker
 from engine.config import load_config
 
 app = FastAPI(title="Autotrader API")
@@ -31,12 +32,8 @@ def health() -> dict:
 
 @app.get("/positions")
 def positions() -> list[dict]:
-    config = load_config()
-    client = make_trading_client(config)
-    return [
-        {"symbol": p.symbol, "qty": p.qty, "avg_entry_price": p.avg_entry_price, "market_value": p.market_value, "unrealized_pl": p.unrealized_pl}
-        for p in client.get_all_positions()
-    ]
+    broker = make_broker(load_config())
+    return [asdict(p) for p in broker.get_positions()]
 
 
 @app.get("/equity")

@@ -10,12 +10,11 @@ Requires ALPACA_API_KEY / ALPACA_SECRET_KEY in .env (market data access works wi
 import datetime as dt
 
 import pandas as pd
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
 from backtesting import Backtest, Strategy
 from backtesting.lib import crossover
 
-from engine.clients import make_data_client
+from engine.brokers import make_broker
+from engine.brokers.base import Timeframe
 from engine.config import load_config
 
 SYMBOL = "SPY"
@@ -44,14 +43,10 @@ class MaCross(Strategy):
 
 
 def fetch_daily_bars(symbol: str, years: int) -> pd.DataFrame:
-    config = load_config()
-    client = make_data_client(config)
+    broker = make_broker(load_config())
     start = dt.datetime.now() - dt.timedelta(days=365 * years)
-    request = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day, start=start)
-    df = client.get_stock_bars(request).df
-    if isinstance(df.index, pd.MultiIndex):
-        df = df.xs(symbol, level=0)
-    df = df.sort_index().rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"})
+    df = broker.get_bars(symbol, Timeframe.DAY, start=start)
+    df = df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"})
     return df[["Open", "High", "Low", "Close", "Volume"]]
 
 
