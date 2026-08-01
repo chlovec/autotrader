@@ -119,16 +119,29 @@ startup. Logs to stdout — redirect to a file if running unattended:
 nohup .venv/bin/python run_portfolio.py > portfolio_runner.log 2>&1 &
 ```
 
-To run one of the alternative single-asset strategies instead (see
-[ARCHITECTURE.md](ARCHITECTURE.md) for what each does and why they aren't the
-default), edit `run.py` to pick a strategy and run that instead:
+A `Makefile` wraps this with the broker/mode combination baked in, so you don't
+have to remember which env vars to set:
 
 ```bash
-.venv/bin/python run.py
+make run-alpaca-sim    # Alpaca, paper trading
+make run-alpaca-live   # Alpaca, real money - asks you to type "yes" first
+make run-ibkr-sim      # IBKR, paper trading (TWS port 7497)
+make run-ibkr-live     # IBKR, real money (TWS port 7496) - asks you to type "yes" first
+make help              # list targets and current port/script settings
 ```
 
-Don't run both at once against the same account unless you've deliberately sized
-`MAX_POSITION_SIZE_USD` for that — they aren't aware of each other's positions.
+These set `BROKER` and the paper/live flag as env vars for that one invocation —
+they don't touch `.env`, and `ALPACA_PAPER=false` automatically picks up
+`ALPACA_LIVE_API_KEY`/`ALPACA_LIVE_SECRET_KEY` instead of the paper pair (see
+[Configuration](#configuration)). Using IB Gateway instead of TWS, or non-default
+ports? `make run-ibkr-sim IBKR_SIM_PORT=4002`. Want to run one of the alternative
+single-asset strategies instead of the deployed portfolio rebalancer? `make
+run-alpaca-sim RUN_SCRIPT=run.py` (edit `run.py` first to pick which strategy —
+see [ARCHITECTURE.md](ARCHITECTURE.md) for what each does and why they aren't the
+default).
+
+Don't run two of these at once against the same account unless you've deliberately
+sized `MAX_POSITION_SIZE_USD` for that — they aren't aware of each other's positions.
 
 ### 2. The backend API
 
@@ -169,9 +182,10 @@ for the full list with defaults):
 | Variable | Purpose |
 | --- | --- |
 | `BROKER` | `alpaca`, `ibkr`, or `questrade` — see [Brokers](#brokers). Implementation details in [ARCHITECTURE.md](ARCHITECTURE.md) |
-| `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` | Your Alpaca API credentials — only read when `BROKER=alpaca` |
+| `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` | Your Alpaca **paper** API credentials — only read when `BROKER=alpaca` and `ALPACA_PAPER=true` |
+| `ALPACA_LIVE_API_KEY` / `ALPACA_LIVE_SECRET_KEY` | Your Alpaca **live** API credentials (a separate account) — only read when `BROKER=alpaca` and `ALPACA_PAPER=false` |
 | `ALPACA_BASE_URL` | Alpaca endpoint (paper by default) |
-| `ALPACA_PAPER` | `true` for paper trading, `false` for live — see [Going live](#going-live-real-money) |
+| `ALPACA_PAPER` | `true` for paper trading, `false` for live — see [Going live](#going-live-real-money). `make run-alpaca-sim`/`run-alpaca-live` set this for you |
 | `IBKR_HOST` / `IBKR_PORT` / `IBKR_CLIENT_ID` | Connection details for a locally running TWS/Gateway — only read when `BROKER=ibkr` |
 | `QUESTRADE_REFRESH_TOKEN` | Seed OAuth token — only read when `BROKER=questrade`, and only until the first run (see [Brokers](#brokers)) |
 | `DATABASE_URL` | Where trades/signals/equity history is stored (SQLite file by default) |
@@ -185,9 +199,10 @@ for the full list with defaults):
 .venv/bin/python -m pytest tests/ -q
 ```
 
-62 tests covering strategy logic, risk checks, portfolio rebalancing math, the
-notification system, and all three broker integrations — all using synthetic data,
-in-memory databases, or mocked network/socket calls, no live credentials or network
+65 tests covering strategy logic, risk checks, portfolio rebalancing math, the
+notification system, config's paper/live key selection, and all three broker
+integrations — all using synthetic data, in-memory databases, or mocked
+network/socket calls, no live credentials or network
 access required.
 
 ## Backtesting
@@ -227,6 +242,14 @@ Everything above runs as plain local processes tied to whatever machine started
 them — if that machine sleeps, restarts, or the terminal closes, trading stops
 until you start it again. There's no Docker image or CI pipeline; deploying just
 means running the same commands somewhere that stays on.
+
+Unattended deployment (`launchd`, `systemd`) should invoke `.venv/bin/python
+run_portfolio.py` directly with explicit `BROKER`/`ALPACA_PAPER`/`IBKR_PORT` env
+vars, **not** `make run-alpaca-live` / `make run-ibkr-live` — those two prompt for
+interactive confirmation on purpose, which just hangs forever with no terminal
+attached to answer it. The `make` targets are for you, running something by hand
+and meaning to; a service definition should already encode that intent explicitly
+in its own config, the way the example below does.
 
 ### Option A: keep it on your Mac, survive reboots
 
@@ -307,22 +330,26 @@ the part that matters:
    days, and ideally through at least one real rebalance cycle so you've seen the
    full loop (signal → order → fill → dashboard update) work unattended, not just
    in a one-off test.
-3. **Update `.env`**:
+3. **Add the live keys to `.env`**, alongside the paper ones already there — don't
+   replace them:
 
    ```bash
-   ALPACA_API_KEY=<your live key>
-   ALPACA_SECRET_KEY=<your live secret>
-   ALPACA_BASE_URL=https://api.alpaca.markets
-   ALPACA_PAPER=false
+   ALPACA_LIVE_API_KEY=<your live key>
+   ALPACA_LIVE_SECRET_KEY=<your live secret>
    ```
 
 4. **Start small.** Fund the live account with less than you're ultimately willing
    to allocate, and/or lower `MAX_POSITION_SIZE_USD`, so a bug costs a bounded
    amount to discover rather than the full account.
-5. **Everything else keeps working the same way** — the kill switch, the daily loss
+5. **Run `make run-alpaca-live`** instead of `run-alpaca-sim` when you actually
+   mean to go live — it sets `ALPACA_PAPER=false` for that one run (which picks up
+   the live keys from step 3) and asks you to type `yes` first. `.env` itself never
+   needs to change, so `make run-alpaca-sim` stays available for paper testing at
+   any time without undoing anything.
+6. **Everything else keeps working the same way** — the kill switch, the daily loss
    halt, the alerts, the dashboard. They're the same code paths regardless of
    `ALPACA_PAPER`; nothing extra to configure for them to apply to the live account.
 
-Nothing in this codebase enforces steps 1–4 for you — the flag change alone is
-enough to start placing real orders, so the caution has to come from you, not from
-the software.
+Nothing in this codebase enforces steps 1–4 for you — typing `yes` at the `make
+run-alpaca-live` prompt is enough to start placing real orders, so the caution has
+to come from you, not from the software.

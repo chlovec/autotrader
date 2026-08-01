@@ -67,6 +67,16 @@ a local socket connection with no key at all, an OAuth refresh token), not one
 generic `broker_api_key` field with per-broker interpretation. Adding a fourth
 broker means adding its own `<name>_*` fields, not fitting it into an existing shape.
 
+`load_config()` does one piece of resolution rather than a straight env-var copy:
+Alpaca paper and live are separate accounts with separate keys, so `.env` holds
+both pairs (`ALPACA_API_KEY`/`ALPACA_SECRET_KEY` and
+`ALPACA_LIVE_API_KEY`/`ALPACA_LIVE_SECRET_KEY`), and `load_config()` picks the pair
+matching `ALPACA_PAPER` before building `Config` - by the time `AlpacaBroker` sees
+`config.alpaca_api_key`, it's already the right one. This is what lets the
+`Makefile`'s `run-alpaca-sim`/`run-alpaca-live` targets switch modes by setting
+just `ALPACA_PAPER` for that invocation, without touching `.env` or needing two
+copies of it.
+
 ### `brokers/` — the only place that talks to a broker's SDK/API
 
 - **`base.py`** defines `BrokerClient`, a `Protocol` (interface) with everything the
@@ -284,7 +294,7 @@ historical market data and print/plot results.
 
 ## `tests/` — no network or credentials required
 
-62 tests, all against synthetic data, in-memory SQLite, or mocked network/socket
+65 tests, all against synthetic data, in-memory SQLite, or mocked network/socket
 calls — no live broker credentials or network access needed to run any of them:
 
 - `test_strategy.py` — crossover/RSI/regime-switching signal logic on constructed
@@ -294,6 +304,8 @@ calls — no live broker credentials or network access needed to run any of them
 - `test_risk.py` — `RiskManager`'s kill-switch, daily-loss, and position-cap checks.
 - `test_notifications.py` — `Notifier` composition and that failures (a bad SMTP
   host, a failing `osascript` call) are swallowed rather than crashing the runner.
+- `test_config.py` — `load_config()` picks the paper vs. live Alpaca key pair
+  correctly based on `ALPACA_PAPER`.
 - `test_brokers.py` — `make_broker()` returns the right class per `BROKER` value
   and raises clearly on an unsupported one.
 - `test_ibkr_broker.py` — the `_parse_trading_hours` / `_duration_string` pure

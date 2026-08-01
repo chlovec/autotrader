@@ -14,6 +14,11 @@ class Config:
     # would have its own fields here (IBKR has no API key at all; Questrade uses an
     # OAuth refresh token), not a shared "generic" shape, since brokers genuinely
     # don't share an auth model.
+    #
+    # alpaca_api_key/alpaca_secret_key are already resolved to whichever pair
+    # matches alpaca_paper (see load_config()) - paper and live are separate
+    # Alpaca accounts with separate keys, so AlpacaBroker just uses these two
+    # fields without needing to know there were ever two pairs to choose from.
     alpaca_api_key: str
     alpaca_secret_key: str
     alpaca_base_url: str
@@ -42,12 +47,20 @@ class Config:
 
 
 def load_config() -> Config:
+    alpaca_paper = os.environ.get("ALPACA_PAPER", "true").lower() == "true"
+    if alpaca_paper:
+        alpaca_api_key = os.environ.get("ALPACA_API_KEY", "")
+        alpaca_secret_key = os.environ.get("ALPACA_SECRET_KEY", "")
+    else:
+        alpaca_api_key = os.environ.get("ALPACA_LIVE_API_KEY", "")
+        alpaca_secret_key = os.environ.get("ALPACA_LIVE_SECRET_KEY", "")
+
     return Config(
         broker=os.environ.get("BROKER", "alpaca"),
-        alpaca_api_key=os.environ.get("ALPACA_API_KEY", ""),
-        alpaca_secret_key=os.environ.get("ALPACA_SECRET_KEY", ""),
+        alpaca_api_key=alpaca_api_key,
+        alpaca_secret_key=alpaca_secret_key,
         alpaca_base_url=os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets"),
-        alpaca_paper=os.environ.get("ALPACA_PAPER", "true").lower() == "true",
+        alpaca_paper=alpaca_paper,
         ibkr_host=os.environ.get("IBKR_HOST", "127.0.0.1"),
         ibkr_port=int(os.environ.get("IBKR_PORT", "7497")),
         ibkr_client_id=int(os.environ.get("IBKR_CLIENT_ID", "1")),
