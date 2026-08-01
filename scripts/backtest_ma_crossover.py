@@ -3,7 +3,7 @@
 Mirrors the live rules exactly (buy on golden cross, flatten on death cross, no shorting)
 so the backtest result is actually predictive of what the runner would have done.
 
-Usage: python scripts/backtest_ma_crossover.py
+Usage (from project root): python -m scripts.backtest_ma_crossover
 Requires ALPACA_API_KEY / ALPACA_SECRET_KEY in .env (market data access works with paper keys).
 """
 
