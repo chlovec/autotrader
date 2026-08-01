@@ -53,10 +53,16 @@ path in, through `runner.py`/`portfolio_runner.py`, everything else is observati
 
 ### `config.py`
 
-Loads `.env` into a single frozen `Config` dataclass — Alpaca credentials, risk
-limits, database URL, SMTP settings. Every other module takes a `Config` instance
-rather than reading environment variables itself, so tests can construct one
-in-memory without touching real env vars.
+Loads `.env` into a single frozen `Config` dataclass — a `broker` selector, Alpaca
+credentials, risk limits, database URL, SMTP settings. Every other module takes a
+`Config` instance rather than reading environment variables itself, so tests can
+construct one in-memory without touching real env vars.
+
+The `alpaca_*` fields live alongside `broker`, not behind it — there's no attempt at
+a generic `broker_api_key`-style field, because a second broker wouldn't fit one
+anyway (IBKR authenticates via a local gateway connection, no key at all; Questrade
+uses an OAuth refresh token). Adding IBKR means adding `ibkr_*` fields next to the
+`alpaca_*` ones, not replacing them.
 
 ### `brokers/` — the only place that talks to Alpaca
 
@@ -67,10 +73,15 @@ in-memory without touching real env vars.
   a `Timeframe` enum — none of them are Alpaca types.
 - **`alpaca_broker.py`** implements `BrokerClient` using the `alpaca-py` SDK. This is
   the *only* file in the whole codebase that imports `alpaca-py`.
-- **`__init__.py`** exports `make_broker(config)`, which currently always returns an
-  `AlpacaBroker`. Adding IBKR or Questrade later means writing one new class against
-  `BrokerClient` — nothing else changes, since `runner.py`, `execution.py`, and the
-  backend all depend on the interface, not the implementation.
+- **`__init__.py`** exports `make_broker(config)`, which looks up `config.broker`
+  (the `BROKER` env var, `alpaca` by default) in a `{"alpaca": AlpacaBroker}` map and
+  raises immediately on anything else — `alpaca` is the only entry today, but the
+  selector already exists rather than being hardcoded to it. Adding IBKR or
+  Questrade means writing one new `BrokerClient` class, adding its own config fields
+  to `Config` (see `config.py` below — they won't share Alpaca's api-key/secret
+  shape), and adding one line to that map. `runner.py`, `execution.py`, and the
+  backend never change, since they all depend on the `BrokerClient` interface, not
+  on Alpaca.
 
 ### `strategy.py` — signal-based strategies (used by `run.py`)
 
@@ -263,10 +274,17 @@ historical market data and print/plot results.
 
 A few decisions that aren't obvious from reading any single file in isolation:
 
-- **`BrokerClient` exists before there's a second broker.** The interface seam was
-  worth building early specifically because Alpaca-specific types had already leaked
-  into `execution.py`, `runner.py`, and the backend once, before the refactor — the
-  cost of *not* having the interface was concrete, not hypothetical.
+- **`BrokerClient` and the `BROKER` selector exist before there's a second broker.**
+  The interface seam was worth building early specifically because Alpaca-specific
+  types had already leaked into `execution.py`, `runner.py`, and the backend once,
+  before the refactor — the cost of *not* having the interface was concrete, not
+  hypothetical. The `BROKER` env var (`make_broker`'s lookup table) is a smaller,
+  same-spirit call: it makes broker choice an explicit, named thing rather than an
+  implicit fact you'd have to read `engine/brokers/__init__.py` to discover. What it
+  deliberately *doesn't* do is invent a generic config shape for brokers that don't
+  exist yet in this codebase — `Config` still has `alpaca_*`-prefixed fields, not
+  `broker_api_key`, because IBKR and Questrade don't share Alpaca's auth model and
+  guessing at a shared shape now would likely just be wrong later.
 - **`RebalancingPortfolio` is not a `Strategy`.** Two different data shapes
   (whole-account state vs. one symbol's bars) that happen to both produce
   buy/sell decisions is not the same interface — see `portfolio.py` above.

@@ -8,10 +8,17 @@ load_dotenv()
 
 @dataclass(frozen=True)
 class Config:
+    broker: str  # which BrokerClient implementation to use - see engine/brokers/make_broker()
+
+    # Alpaca-specific. Only read/used when broker == "alpaca" - a different broker
+    # would have its own fields here (IBKR has no API key at all; Questrade uses an
+    # OAuth refresh token), not a shared "generic" shape, since brokers genuinely
+    # don't share an auth model.
     alpaca_api_key: str
     alpaca_secret_key: str
     alpaca_base_url: str
     alpaca_paper: bool
+
     max_position_size_usd: float
     max_daily_loss_usd: float
     smtp_host: str
@@ -24,6 +31,7 @@ class Config:
 
 def load_config() -> Config:
     return Config(
+        broker=os.environ.get("BROKER", "alpaca"),
         alpaca_api_key=os.environ.get("ALPACA_API_KEY", ""),
         alpaca_secret_key=os.environ.get("ALPACA_SECRET_KEY", ""),
         alpaca_base_url=os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets"),

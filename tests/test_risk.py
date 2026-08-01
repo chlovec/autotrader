@@ -16,6 +16,7 @@ def _session():
 
 def _config(max_position_size_usd: float = 1000.0, max_daily_loss_usd: float = 200.0) -> Config:
     return Config(
+        broker="alpaca",
         alpaca_api_key="",
         alpaca_secret_key="",
         alpaca_base_url="",

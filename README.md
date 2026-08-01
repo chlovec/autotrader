@@ -108,7 +108,8 @@ for the full list with defaults):
 
 | Variable | Purpose |
 | --- | --- |
-| `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` | Your Alpaca API credentials |
+| `BROKER` | Which broker to trade through. `alpaca` is the only one implemented — see [ARCHITECTURE.md](ARCHITECTURE.md#brokers--the-only-place-that-talks-to-alpaca) for what adding another looks like |
+| `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` | Your Alpaca API credentials — only read when `BROKER=alpaca` |
 | `ALPACA_BASE_URL` | Alpaca endpoint (paper by default) |
 | `ALPACA_PAPER` | `true` for paper trading, `false` for live — see [Going live](#going-live-real-money) |
 | `DATABASE_URL` | Where trades/signals/equity history is stored (SQLite file by default) |

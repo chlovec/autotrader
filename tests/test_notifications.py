@@ -6,6 +6,7 @@ from engine.notifications import CompositeNotifier, EmailNotifier, MacNotifier, 
 
 def _config(smtp_host: str = "", alert_email_to: str = "") -> Config:
     return Config(
+        broker="alpaca",
         alpaca_api_key="",
         alpaca_secret_key="",
         alpaca_base_url="",
