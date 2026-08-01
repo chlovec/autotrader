@@ -174,6 +174,8 @@ sized `MAX_POSITION_SIZE_USD` for that — they aren't aware of each other's pos
 
 ```bash
 nohup .venv/bin/uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 > backend.log 2>&1 &
+# or, in the foreground:
+make backend
 ```
 
 Serves `/positions`, `/equity`, `/trades`, `/signals`, `/events`, `/kill-switch`,
@@ -193,6 +195,8 @@ backend now needs the same Alpaca credentials `run_research.py` does (see
 
 ```bash
 cd frontend && nohup npm run dev > ../frontend.log 2>&1 &
+# or, in the foreground:
+make dashboard
 ```
 
 Open `http://localhost:5173`. It polls the backend every 15 seconds and listens on
