@@ -1,5 +1,7 @@
 from engine.brokers.alpaca_broker import AlpacaBroker
 from engine.brokers.base import AccountSnapshot, BrokerClient, ClockSnapshot, OrderResult, PositionSnapshot, Timeframe
+from engine.brokers.ibkr_broker import IBKRBroker
+from engine.brokers.questrade_broker import QuestradeBroker
 from engine.config import Config
 
 __all__ = [
@@ -14,9 +16,8 @@ __all__ = [
 
 _BROKERS = {
     "alpaca": AlpacaBroker,
-    # Add a new entry here (e.g. "ibkr": IBKRBroker) once a second BrokerClient
-    # implementation exists. Its config fields go in engine/config.py alongside
-    # (not replacing) the alpaca_* fields - see the comment there.
+    "ibkr": IBKRBroker,
+    "questrade": QuestradeBroker,
 }
 
 

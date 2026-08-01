@@ -7,10 +7,10 @@ usage, see [README.md](README.md).
 
 ```mermaid
 flowchart TB
-    Alpaca[("Alpaca API<br/>(paper or live)")]
+    BrokerAPI[("Broker API<br/>Alpaca, IBKR, or Questrade<br/>(BROKER env var picks one)")]
 
     subgraph Engine["engine/ — the trading logic (run_portfolio.py / run.py)"]
-        Broker["brokers/<br/>BrokerClient + AlpacaBroker"]
+        Broker["brokers/<br/>BrokerClient + one implementation"]
         Strategy["strategy.py / portfolio.py<br/>what to trade"]
         Risk["risk.py<br/>RiskManager"]
         Exec["execution.py<br/>ExecutionEngine"]
@@ -28,7 +28,7 @@ flowchart TB
     Runner --> Risk
     Runner --> Exec
     Runner --> Notify
-    Broker <--> Alpaca
+    Broker <--> BrokerAPI
     Exec --> Broker
     Runner --> DB
     Risk --> DB
@@ -42,46 +42,69 @@ flowchart TB
     Notify -. "macOS / email" .-> Person
 ```
 
-The engine (whichever runner you start) is the only thing that talks to Alpaca for
-trading. The backend never places orders — it only reads history from the database
-and makes one read-only live call to Alpaca for current positions. The frontend
-never talks to Alpaca or the database directly — everything goes through the
-backend. This keeps the loop that actually risks money small and auditable: one
-path in, through `runner.py`/`portfolio_runner.py`, everything else is observation.
+The engine (whichever runner you start) is the only thing that talks to the broker
+for trading. The backend never places orders — it only reads history from the
+database and makes one read-only live call to the broker for current positions. The
+frontend never talks to the broker or the database directly — everything goes
+through the backend. This keeps the loop that actually risks money small and
+auditable: one path in, through `runner.py`/`portfolio_runner.py`, everything else
+is observation. Which broker that path actually talks to is a `BROKER` env var away
+— see below.
 
 ## `engine/` — the trading logic
 
 ### `config.py`
 
-Loads `.env` into a single frozen `Config` dataclass — a `broker` selector, Alpaca
-credentials, risk limits, database URL, SMTP settings. Every other module takes a
-`Config` instance rather than reading environment variables itself, so tests can
-construct one in-memory without touching real env vars.
+Loads `.env` into a single frozen `Config` dataclass — a `broker` selector, one
+config block per broker, risk limits, database URL, SMTP settings. Every other
+module takes a `Config` instance rather than reading environment variables itself,
+so tests can construct one in-memory without touching real env vars.
 
-The `alpaca_*` fields live alongside `broker`, not behind it — there's no attempt at
-a generic `broker_api_key`-style field, because a second broker wouldn't fit one
-anyway (IBKR authenticates via a local gateway connection, no key at all; Questrade
-uses an OAuth refresh token). Adding IBKR means adding `ibkr_*` fields next to the
-`alpaca_*` ones, not replacing them.
+Each broker's fields live alongside `broker`, not behind a shared shape:
+`alpaca_api_key`/`alpaca_secret_key`, `ibkr_host`/`ibkr_port`/`ibkr_client_id`,
+`questrade_refresh_token` are three genuinely different auth models (API key pair,
+a local socket connection with no key at all, an OAuth refresh token), not one
+generic `broker_api_key` field with per-broker interpretation. Adding a fourth
+broker means adding its own `<name>_*` fields, not fitting it into an existing shape.
 
-### `brokers/` — the only place that talks to Alpaca
+### `brokers/` — the only place that talks to a broker's SDK/API
 
 - **`base.py`** defines `BrokerClient`, a `Protocol` (interface) with everything the
   rest of the app needs from a broker: `get_account`, `get_clock`, `get_bars`,
   `get_position_qty`, `get_positions`, `submit_market_order`. Also defines the plain
   dataclasses those methods return (`AccountSnapshot`, `PositionSnapshot`, etc.) and
-  a `Timeframe` enum — none of them are Alpaca types.
-- **`alpaca_broker.py`** implements `BrokerClient` using the `alpaca-py` SDK. This is
-  the *only* file in the whole codebase that imports `alpaca-py`.
+  a `Timeframe` enum — none of them are broker-specific types.
+- **`alpaca_broker.py`** implements `BrokerClient` using the `alpaca-py` SDK — the
+  only file that imports `alpaca-py`. **Verified working**: connected to a real
+  paper account, placed real (paper) trades, confirmed via the dashboard.
+- **`ibkr_broker.py`** implements `BrokerClient` via `ib_async`. Connects to a
+  locally running Trader Workstation or IB Gateway over its API socket — there's no
+  API key, you authenticate by being logged into TWS/Gateway yourself. Two pure
+  helper functions are factored out specifically because the rest of the class
+  can't be exercised without a live connection: `_parse_trading_hours` (IB's
+  `ContractDetails.tradingHours` string format, used for `get_clock`) and
+  `_duration_string` (builds the duration string `reqHistoricalData` expects).
+  **Untested against a live connection** — no TWS/Gateway instance was available
+  while writing it. Method and field names were checked against the installed
+  `ib_async` package's actual signatures (not just remembered from docs), and the
+  translation logic is covered by tests against mocked IB responses, but real
+  account behavior needs confirming.
+- **`questrade_broker.py`** implements `BrokerClient` via `requests` directly against
+  Questrade's REST API (no official Python SDK exists). Handles Questrade's OAuth
+  quirk: refresh tokens are single-use and rotate on every refresh, so the token
+  from `.env` only has to work once — the current one is cached in
+  `questrade_token.json` (gitignored) after that. **Untested against a live
+  account** — no Questrade account was available while writing it. Endpoint paths
+  and response field names (`combinedBalances`, `openPnl`, etc.) are from
+  Questrade's public API documentation, covered by tests against mocked HTTP
+  responses matching that documented shape, but not verified against a real
+  response.
 - **`__init__.py`** exports `make_broker(config)`, which looks up `config.broker`
-  (the `BROKER` env var, `alpaca` by default) in a `{"alpaca": AlpacaBroker}` map and
-  raises immediately on anything else — `alpaca` is the only entry today, but the
-  selector already exists rather than being hardcoded to it. Adding IBKR or
-  Questrade means writing one new `BrokerClient` class, adding its own config fields
-  to `Config` (see `config.py` below — they won't share Alpaca's api-key/secret
-  shape), and adding one line to that map. `runner.py`, `execution.py`, and the
-  backend never change, since they all depend on the `BrokerClient` interface, not
-  on Alpaca.
+  (the `BROKER` env var, `alpaca` by default) in a
+  `{"alpaca": ..., "ibkr": ..., "questrade": ...}` map and raises immediately on
+  anything else. `runner.py`, `execution.py`, and the backend never change
+  regardless of which broker is selected, since they all depend on the
+  `BrokerClient` interface, never on a specific broker's types.
 
 ### `strategy.py` — signal-based strategies (used by `run.py`)
 
@@ -240,7 +263,8 @@ the same validated palette rather than one mode with the other auto-derived.
 ## `scripts/` — backtesting, not part of the running app
 
 - **`common.py`** — `fetch_daily_bars()`, the one place historical data is pulled
-  from Alpaca via `BrokerClient`, shared by every backtest script.
+  via `BrokerClient` (whichever broker is configured), shared by every backtest
+  script.
 - **`backtest_ma_crossover.py`**, **`backtest_mean_reversion.py`**,
   **`backtest_diversified_portfolio.py`** — each reimplements its strategy's logic
   in `backtesting`-library idioms, built to match the live `engine/strategy.py` /
@@ -260,7 +284,8 @@ historical market data and print/plot results.
 
 ## `tests/` — no network or credentials required
 
-35 tests, all against synthetic data or in-memory SQLite, no Alpaca API calls:
+62 tests, all against synthetic data, in-memory SQLite, or mocked network/socket
+calls — no live broker credentials or network access needed to run any of them:
 
 - `test_strategy.py` — crossover/RSI/regime-switching signal logic on constructed
   price series (e.g. a flat-then-jump series to force an exact golden-cross bar).
@@ -269,22 +294,40 @@ historical market data and print/plot results.
 - `test_risk.py` — `RiskManager`'s kill-switch, daily-loss, and position-cap checks.
 - `test_notifications.py` — `Notifier` composition and that failures (a bad SMTP
   host, a failing `osascript` call) are swallowed rather than crashing the runner.
+- `test_brokers.py` — `make_broker()` returns the right class per `BROKER` value
+  and raises clearly on an unsupported one.
+- `test_ibkr_broker.py` — the `_parse_trading_hours` / `_duration_string` pure
+  helpers, plus response-translation logic against a mocked `IB` connection
+  (`SimpleNamespace` fakes shaped like `ib_async`'s real objects, not a live TWS).
+- `test_questrade_broker.py` — request/response translation and the refresh-token
+  rotation behavior against mocked HTTP responses, not a live Questrade account.
 
 ## Why things are split up this way
 
 A few decisions that aren't obvious from reading any single file in isolation:
 
-- **`BrokerClient` and the `BROKER` selector exist before there's a second broker.**
-  The interface seam was worth building early specifically because Alpaca-specific
-  types had already leaked into `execution.py`, `runner.py`, and the backend once,
-  before the refactor — the cost of *not* having the interface was concrete, not
-  hypothetical. The `BROKER` env var (`make_broker`'s lookup table) is a smaller,
-  same-spirit call: it makes broker choice an explicit, named thing rather than an
-  implicit fact you'd have to read `engine/brokers/__init__.py` to discover. What it
-  deliberately *doesn't* do is invent a generic config shape for brokers that don't
-  exist yet in this codebase — `Config` still has `alpaca_*`-prefixed fields, not
-  `broker_api_key`, because IBKR and Questrade don't share Alpaca's auth model and
-  guessing at a shared shape now would likely just be wrong later.
+- **`BrokerClient` was built before there was a second broker, and it held up
+  without changes once IBKR and Questrade were added.** The interface seam was
+  worth building early specifically because Alpaca-specific types had already
+  leaked into `execution.py`, `runner.py`, and the backend once, before the
+  refactor — the cost of *not* having the interface was concrete, not
+  hypothetical. Adding two more implementations confirmed the bet: `runner.py`,
+  `execution.py`, and the backend needed zero changes, and the "don't invent a
+  generic config shape" call held up too — IBKR's local-socket auth and
+  Questrade's rotating OAuth token turned out just as different from Alpaca's
+  api-key/secret pair as expected, so `ibkr_*` and `questrade_*` fields sit
+  alongside `alpaca_*` rather than forcing a shared shape that never would have
+  fit all three.
+- **IBKR and Questrade were built without an account to test against.** Both were
+  written to their SDK's/API's documented behavior, with method and field names
+  checked against what's actually installed where possible (`ib_async`'s real
+  signatures were inspected directly), and covered by tests against mocked
+  responses. That's a meaningfully weaker guarantee than Alpaca's, which was
+  connected to a real paper account and had real trades verified end-to-end
+  through the dashboard. Treat `ibkr_broker.py` and `questrade_broker.py` as a
+  well-researched starting point, not as verified the way `alpaca_broker.py` is,
+  until someone runs them against a real TWS/Gateway instance and a real
+  Questrade account.
 - **`RebalancingPortfolio` is not a `Strategy`.** Two different data shapes
   (whole-account state vs. one symbol's bars) that happen to both produce
   buy/sell decisions is not the same interface — see `portfolio.py` above.

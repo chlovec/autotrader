@@ -1,12 +1,14 @@
 # Autotrader
 
-An autotrader for [Alpaca](https://alpaca.markets). It connects to your Alpaca
-account, decides what to trade based on a pluggable strategy, places orders
-automatically, and exposes a dashboard to monitor what it's doing. The goal is to
-trade a real account with real money; it currently runs against Alpaca's paper
-(simulated) account while the strategy and infrastructure are being validated, with
-live trading a one-line config flip away once you're ready — see
-[Going live](#going-live-real-money).
+An autotrader that connects to your brokerage account, decides what to trade based
+on a pluggable strategy, places orders automatically, and exposes a dashboard to
+monitor what it's doing. Three brokers are supported — [Alpaca](https://alpaca.markets),
+[Interactive Brokers](https://www.interactivebrokers.com), and
+[Questrade](https://www.questrade.com) — selected with one `BROKER` env var; see
+[Brokers](#brokers) for setup. The goal is to trade a real account with real money;
+it's currently validated against Alpaca's paper (simulated) account while the
+strategy and infrastructure prove themselves out, with live trading a one-line
+config flip away once you're ready — see [Going live](#going-live-real-money).
 
 **Current strategy**: an equal-weight SPY / TLT / GLD portfolio, rebalanced monthly.
 This was chosen after backtesting several single-asset signal strategies
@@ -19,7 +21,8 @@ and how everything fits together.
 
 - Python 3.11+ (developed on 3.14)
 - Node 20+ (developed on 22)
-- An [Alpaca](https://alpaca.markets) account with paper-trading API keys (free)
+- An account with one of the supported brokers — see [Brokers](#brokers) for what
+  each one needs
 
 ## Setup
 
@@ -35,10 +38,66 @@ cd frontend && npm install && cd ..
 cp .env.example .env
 ```
 
-Edit `.env` and fill in `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` from your
-[Alpaca paper dashboard](https://app.alpaca.markets/paper/dashboard/overview). Every
-field is documented in `.env.example`; see [Configuration](#configuration) below for
-what each one does.
+Edit `.env`: set `BROKER` to the one you're using, then fill in that broker's
+section below it (see [Brokers](#brokers) for what each needs). Every field is also
+documented inline in `.env.example`; see [Configuration](#configuration) for a
+summary table.
+
+## Brokers
+
+Three are supported, picked via the `BROKER` env var. Only Alpaca has actually been
+run against a live account by this project — see the caveat under each.
+
+### Alpaca (`BROKER=alpaca`)
+
+The most complete integration, and the only one verified end-to-end (real paper
+trades placed, confirmed via the dashboard). Sign up at
+[alpaca.markets](https://alpaca.markets), grab paper-trading API keys from the
+[paper dashboard](https://app.alpaca.markets/paper/dashboard/overview), and set
+`ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in `.env`. No local software needed —
+it's a pure REST/WebSocket API.
+
+### Interactive Brokers (`BROKER=ibkr`)
+
+**Untested against a live account** — built against `ib_async`'s actual installed
+API (method and field names were checked directly, not just remembered from docs),
+covered by tests against mocked responses, but no TWS/Gateway instance was
+available to confirm real behavior. Verify it yourself before trusting it with
+money.
+
+Requires Trader Workstation (TWS) or IB Gateway **running locally** — unlike
+Alpaca/Questrade, IBKR isn't a pure remote API, it's a socket connection to
+software you keep running and logged into:
+
+1. Install [TWS or IB Gateway](https://www.interactivebrokers.com/en/trading/tws.php)
+   and log in (use paper-trading login credentials for a simulated account).
+2. Enable API access: File → Global Configuration → API → Settings → check "Enable
+   ActiveX and Socket Clients", and make sure "Read-Only API" is **unchecked** (or
+   this app can read your account but never place orders).
+3. Set `IBKR_PORT` in `.env` to match: `7497` for TWS paper (the default),
+   `7496` for TWS live, `4002` for Gateway paper, `4001` for Gateway live.
+4. Leave TWS/Gateway running whenever the engine runs — there's no key/secret to
+   configure because authentication *is* being logged into that software.
+
+### Questrade (`BROKER=questrade`)
+
+**Untested against a live account** — built against Questrade's public API
+documentation, covered by tests against mocked HTTP responses matching that
+documented shape, but no Questrade account was available to confirm field names
+against a real response. Verify it yourself before trusting it with money.
+
+1. Get a refresh token from the
+   [App Hub](https://login.questrade.com/APIAccess/UserApps.aspx) (use a
+   [practice account](https://www.questrade.com/api/documentation/getting-started)
+   for simulated trading — same API, separate App Hub/token).
+2. Set `QUESTRADE_REFRESH_TOKEN` in `.env` to that token.
+3. That's it for setup, but know this going in: Questrade refresh tokens are
+   **single-use** — every API session exchanges it for a new one, invalidating the
+   old. This app handles that automatically (the current token gets cached in
+   `questrade_token.json`, gitignored, which takes over from the `.env` value after
+   the first run), but if you ever manually re-generate a token in the App Hub
+   while a cached one already exists, delete `questrade_token.json` first so the
+   new seed token actually gets used.
 
 ## Running it
 
@@ -79,7 +138,8 @@ nohup .venv/bin/uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 > back
 
 Serves `/positions`, `/equity`, `/trades`, `/signals`, `/events`, `/kill-switch`, and
 a `/ws` WebSocket, all reading from the same SQLite database the engine writes to
-(plus live calls to Alpaca for `/positions`). Health check: `curl localhost:8000/health`.
+(plus one live call to whichever broker is configured for `/positions`). Health
+check: `curl localhost:8000/health`.
 
 ### 3. The dashboard
 
@@ -108,10 +168,12 @@ for the full list with defaults):
 
 | Variable | Purpose |
 | --- | --- |
-| `BROKER` | Which broker to trade through. `alpaca` is the only one implemented — see [ARCHITECTURE.md](ARCHITECTURE.md#brokers--the-only-place-that-talks-to-alpaca) for what adding another looks like |
+| `BROKER` | `alpaca`, `ibkr`, or `questrade` — see [Brokers](#brokers). Implementation details in [ARCHITECTURE.md](ARCHITECTURE.md) |
 | `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` | Your Alpaca API credentials — only read when `BROKER=alpaca` |
 | `ALPACA_BASE_URL` | Alpaca endpoint (paper by default) |
 | `ALPACA_PAPER` | `true` for paper trading, `false` for live — see [Going live](#going-live-real-money) |
+| `IBKR_HOST` / `IBKR_PORT` / `IBKR_CLIENT_ID` | Connection details for a locally running TWS/Gateway — only read when `BROKER=ibkr` |
+| `QUESTRADE_REFRESH_TOKEN` | Seed OAuth token — only read when `BROKER=questrade`, and only until the first run (see [Brokers](#brokers)) |
 | `DATABASE_URL` | Where trades/signals/equity history is stored (SQLite file by default) |
 | `MAX_POSITION_SIZE_USD` | Per-symbol position cap for the signal-based strategies (`run.py`) — not used by the portfolio rebalancer, which sizes by target weight instead |
 | `MAX_DAILY_LOSS_USD` | If today's equity drop exceeds this, both runners halt all trading for the day |
@@ -123,9 +185,10 @@ for the full list with defaults):
 .venv/bin/python -m pytest tests/ -q
 ```
 
-35 tests covering strategy logic, risk checks, portfolio rebalancing math, and the
-notification system — all using synthetic data or in-memory databases, no network
-or Alpaca credentials required.
+62 tests covering strategy logic, risk checks, portfolio rebalancing math, the
+notification system, and all three broker integrations — all using synthetic data,
+in-memory databases, or mocked network/socket calls, no live credentials or network
+access required.
 
 ## Backtesting
 
@@ -140,10 +203,11 @@ historical data:
 ```
 
 Each mirrors the corresponding live strategy's exact decision logic against
-historical Alpaca data (requires API keys — market data works fine with paper
-credentials), so results are actually predictive of what the live runner would have
-done. `optimize_ma_crossover.py` and `optimize_regime_switching.py` sweep parameters
-for those two strategies. See [ARCHITECTURE.md](ARCHITECTURE.md) for the results that
+historical data pulled through whichever broker is configured (paper/practice
+credentials work fine for this — these backtests were built and run against
+Alpaca specifically), so results are actually predictive of what the live runner
+would have done. `optimize_ma_crossover.py` and `optimize_regime_switching.py`
+sweep parameters for those two strategies. See [ARCHITECTURE.md](ARCHITECTURE.md) for the results that
 led to the current default.
 
 ## Safety features
@@ -199,6 +263,12 @@ doesn't need to run unattended the way the engine and backend do.
 
 More robust than relying on a laptop staying awake. On a fresh Linux box:
 
+Note if you're on `BROKER=ibkr`: TWS/Gateway would need to run on that same server
+too (or something needs to bridge to wherever it runs) — it's real, GUI-adjacent
+software you log into, not a REST API. This makes IBKR the awkward fit for
+headless server deployment; Alpaca and Questrade, both pure remote APIs, don't
+have this problem.
+
 1. Install Python 3.11+ and Node 20+.
 2. Clone the repo, follow [Setup](#setup) above.
 3. Switch `DATABASE_URL` to a real database (Postgres) if the backend and engine
@@ -220,8 +290,9 @@ More robust than relying on a laptop staying awake. On a fresh Linux box:
    only because it's bound to `127.0.0.1` and never exposed publicly.
 7. macOS notifications obviously don't work on a Linux server — configure the
    `SMTP_*` / `ALERT_EMAIL_*` variables so you still get alerted.
-8. Keep `.env` off the server's filesystem in version control and out of any logs
-   — it holds your Alpaca keys and (if configured) email credentials.
+8. Keep `.env` (and, if using Questrade, `questrade_token.json`) out of version
+   control and out of any logs — they hold your broker credentials and (if
+   configured) email credentials.
 
 ### Going live (real money)
 

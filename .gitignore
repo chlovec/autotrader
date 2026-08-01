@@ -1,4 +1,5 @@
 .env
+questrade_token.json
 *.db
 __pycache__/
 *.pyc

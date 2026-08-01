@@ -19,6 +19,18 @@ class Config:
     alpaca_base_url: str
     alpaca_paper: bool
 
+    # IBKR-specific. Only read when broker == "ibkr". No API key - auth happens by
+    # logging into a locally running TWS/Gateway instance yourself; this just
+    # connects to its socket.
+    ibkr_host: str
+    ibkr_port: int
+    ibkr_client_id: int
+
+    # Questrade-specific. Only read when broker == "questrade". Auth is an OAuth
+    # refresh token - see engine/brokers/questrade_broker.py for why this single
+    # field isn't the whole story (Questrade rotates it on every use).
+    questrade_refresh_token: str
+
     max_position_size_usd: float
     max_daily_loss_usd: float
     smtp_host: str
@@ -36,6 +48,10 @@ def load_config() -> Config:
         alpaca_secret_key=os.environ.get("ALPACA_SECRET_KEY", ""),
         alpaca_base_url=os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets"),
         alpaca_paper=os.environ.get("ALPACA_PAPER", "true").lower() == "true",
+        ibkr_host=os.environ.get("IBKR_HOST", "127.0.0.1"),
+        ibkr_port=int(os.environ.get("IBKR_PORT", "7497")),
+        ibkr_client_id=int(os.environ.get("IBKR_CLIENT_ID", "1")),
+        questrade_refresh_token=os.environ.get("QUESTRADE_REFRESH_TOKEN", ""),
         max_position_size_usd=float(os.environ.get("MAX_POSITION_SIZE_USD", "1000")),
         max_daily_loss_usd=float(os.environ.get("MAX_DAILY_LOSS_USD", "200")),
         smtp_host=os.environ.get("SMTP_HOST", ""),
