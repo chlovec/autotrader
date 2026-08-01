@@ -36,6 +36,12 @@ class RiskManager:
         ).scalar_one()
         return float(total)
 
+    def daily_loss_limit_breached(self) -> bool:
+        """Checked once per cycle by the runners (before generating any signals) so a
+        breach halts everything for the day rather than being rejected signal-by-signal
+        the way the position-size cap below is."""
+        return self.daily_pnl() <= -self.config.max_daily_loss_usd
+
     def approve(self, symbol: str, action: SignalAction, order_value_usd: float) -> tuple[bool, str]:
         engaged, reason = self.kill_switch_engaged()
         if engaged:
@@ -43,9 +49,6 @@ class RiskManager:
 
         if action == SignalAction.hold:
             return False, "hold signal, nothing to do"
-
-        if self.daily_pnl() <= -self.config.max_daily_loss_usd:
-            return False, "daily loss limit reached"
 
         if action == SignalAction.buy:
             projected = self.current_exposure_usd(symbol) + order_value_usd

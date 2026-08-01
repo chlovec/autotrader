@@ -9,6 +9,7 @@ from engine.brokers import make_broker
 from engine.brokers.base import Timeframe
 from engine.config import load_config
 from engine.execution import ExecutionEngine
+from engine.notifications import log_and_notify, make_notifier
 from engine.risk import RiskManager
 from engine.strategy import Strategy
 
@@ -19,6 +20,7 @@ logger = logging.getLogger("autotrader.runner")
 def run_once(symbols: list[str], strategy: Strategy) -> None:
     config = load_config()
     broker = make_broker(config)
+    notifier = make_notifier(config)
 
     if not broker.get_clock().is_open:
         logger.info("market closed, skipping cycle")
@@ -26,11 +28,23 @@ def run_once(symbols: list[str], strategy: Strategy) -> None:
 
     with get_session() as session:
         risk = RiskManager(config, session)
-        execution = ExecutionEngine(broker, session)
+        execution = ExecutionEngine(broker, session, notifier)
+
+        engaged, reason = risk.kill_switch_engaged()
+        if engaged:
+            log_and_notify(session, notifier, "warning", "runner", f"kill switch engaged, skipping cycle: {reason}")
+            return
 
         account = broker.get_account()
         session.add(EquitySnapshot(equity=account.equity, cash=account.cash, buying_power=account.buying_power))
         session.commit()
+
+        if risk.daily_loss_limit_breached():
+            log_and_notify(
+                session, notifier, "critical", "runner",
+                f"daily loss limit breached (limit=${config.max_daily_loss_usd}), halting trading for today",
+            )
+            return
 
         for symbol in symbols:
             bars = broker.get_bars(symbol, Timeframe.DAY, limit=100)

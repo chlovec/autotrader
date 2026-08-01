@@ -1,22 +1,23 @@
 from sqlalchemy.orm import Session
 
-from db.models import OrderSide, SignalAction, SystemEvent, Trade
+from db.models import OrderSide, SignalAction, Trade
 from engine.brokers.base import BrokerClient
+from engine.notifications import Notifier, log_and_notify
 
 
 class ExecutionEngine:
     """Translates an approved signal into a broker order and records the result."""
 
-    def __init__(self, broker: BrokerClient, session: Session):
+    def __init__(self, broker: BrokerClient, session: Session, notifier: Notifier):
         self.broker = broker
         self.session = session
+        self.notifier = notifier
 
     def submit_market_order(self, symbol: str, action: SignalAction, qty: float, signal_id: int | None = None) -> Trade:
         try:
             result = self.broker.submit_market_order(symbol, action, qty)
         except Exception as exc:
-            self.session.add(SystemEvent(level="error", source="execution", message=f"order submit failed for {symbol}: {exc}"))
-            self.session.commit()
+            log_and_notify(self.session, self.notifier, "error", "execution", f"order submit failed for {symbol} ({action.value} {qty}): {exc}")
             raise
 
         trade = Trade(

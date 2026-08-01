@@ -14,6 +14,12 @@ class Config:
     alpaca_paper: bool
     max_position_size_usd: float
     max_daily_loss_usd: float
+    smtp_host: str
+    smtp_port: int
+    smtp_username: str
+    smtp_password: str
+    alert_email_from: str
+    alert_email_to: str
 
 
 def load_config() -> Config:
@@ -24,4 +30,10 @@ def load_config() -> Config:
         alpaca_paper=os.environ.get("ALPACA_PAPER", "true").lower() == "true",
         max_position_size_usd=float(os.environ.get("MAX_POSITION_SIZE_USD", "1000")),
         max_daily_loss_usd=float(os.environ.get("MAX_DAILY_LOSS_USD", "200")),
+        smtp_host=os.environ.get("SMTP_HOST", ""),
+        smtp_port=int(os.environ.get("SMTP_PORT", "587")),
+        smtp_username=os.environ.get("SMTP_USERNAME", ""),
+        smtp_password=os.environ.get("SMTP_PASSWORD", ""),
+        alert_email_from=os.environ.get("ALERT_EMAIL_FROM", ""),
+        alert_email_to=os.environ.get("ALERT_EMAIL_TO", ""),
     )

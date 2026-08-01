@@ -12,6 +12,7 @@ from engine.brokers import make_broker
 from engine.brokers.base import Timeframe
 from engine.config import load_config
 from engine.execution import ExecutionEngine
+from engine.notifications import log_and_notify, make_notifier
 from engine.portfolio import RebalancingPortfolio
 from engine.risk import RiskManager
 
@@ -32,6 +33,7 @@ def _already_rebalanced_this_month(session: Session, now: dt.datetime | None = N
 def rebalance_once(portfolio: RebalancingPortfolio) -> None:
     config = load_config()
     broker = make_broker(config)
+    notifier = make_notifier(config)
 
     if not broker.get_clock().is_open:
         logger.info("market closed, skipping rebalance")
@@ -39,11 +41,11 @@ def rebalance_once(portfolio: RebalancingPortfolio) -> None:
 
     with get_session() as session:
         risk = RiskManager(config, session)
-        execution = ExecutionEngine(broker, session)
+        execution = ExecutionEngine(broker, session, notifier)
 
         engaged, reason = risk.kill_switch_engaged()
         if engaged:
-            logger.info("kill switch engaged, skipping rebalance: %s", reason)
+            log_and_notify(session, notifier, "warning", "portfolio_runner", f"kill switch engaged, skipping rebalance: {reason}")
             return
 
         if _already_rebalanced_this_month(session):
@@ -53,6 +55,13 @@ def rebalance_once(portfolio: RebalancingPortfolio) -> None:
         account = broker.get_account()
         session.add(EquitySnapshot(equity=account.equity, cash=account.cash, buying_power=account.buying_power))
         session.commit()
+
+        if risk.daily_loss_limit_breached():
+            log_and_notify(
+                session, notifier, "critical", "portfolio_runner",
+                f"daily loss limit breached (limit=${config.max_daily_loss_usd}), skipping this month's rebalance",
+            )
+            return
 
         positions = {p.symbol: p for p in broker.get_positions()}
         prices = {
