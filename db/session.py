@@ -35,8 +35,26 @@ def _create_all_with_retry() -> None:
             time.sleep(_CREATE_ALL_RETRY_DELAY_SECONDS)
 
 
+def _add_column_if_missing(table: str, column: str, ddl_type: str) -> None:
+    """sqlite-specific poor-man's migration: create_all() only creates missing *tables*,
+    never adds columns to ones that already exist. This project has no Alembic (see
+    ARCHITECTURE.md) - additive, defaulted columns (like Account.max_total_exposure_usd)
+    self-heal here on every startup instead of needing a bespoke one-off script each time
+    one gets added. Renames/drops/type changes still need a hand-written migration (see
+    scripts/migrate_to_accounts.py for that shape) - this only ever adds a column."""
+    if not DATABASE_URL.startswith("sqlite"):
+        return  # PRAGMA table_info is sqlite-specific; other engines need a real migration tool
+    with engine.connect() as conn:
+        existing = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})")}
+        if not existing or column in existing:
+            return  # table doesn't exist yet (create_all() will make it) or already has the column
+        conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}")
+        conn.commit()
+
+
 def init_db() -> None:
     _create_all_with_retry()
+    _add_column_if_missing("accounts", "max_total_exposure_usd", "FLOAT DEFAULT 0.0")
     with SessionLocal() as session:
         if session.get(ResearchSchedule, 1) is None:
             session.add(ResearchSchedule(id=1, enabled=True))

@@ -222,16 +222,18 @@ its lower raw return.
 
 No per-symbol dollar cap applies here the way `RiskManager` enforces for the
 directional strategies — target weight × equity *is* the position size by
-construction. The kill switch and daily loss limit still apply.
+construction. The kill switch and daily loss limit still apply, and so does
+`max_total_exposure_usd` (see `risk.py` below) - `compute_rebalance_orders` takes it as
+an optional argument and throttles (never force-sells) buy orders that would breach it.
 
 ### `risk.py` — `RiskManager`
 
 Takes a `Session` and a `db.models.Account` row — limits and kill-switch state come
 straight off that row (`account.max_position_size_usd`, `account.max_daily_loss_usd`,
-`account.kill_switch_engaged`/`kill_switch_reason`), not a global `Config` and a
-separate single-row `KillSwitch` table the way it worked before multi-account support.
-Three checks, all reading from the database (via the same SQLAlchemy session the
-runner is already using), scoped to `account.id`:
+`account.max_total_exposure_usd`, `account.kill_switch_engaged`/`kill_switch_reason`),
+not a global `Config` and a separate single-row `KillSwitch` table the way it worked
+before multi-account support. Three checks, all reading from the database (via the same
+SQLAlchemy session the runner is already using), scoped to `account.id`:
 
 - `kill_switch_engaged()` — reads straight off the `Account` row passed in.
 - `daily_loss_limit_breached()` — compares the latest `EquitySnapshot` (filtered to this
@@ -239,9 +241,21 @@ runner is already using), scoped to `account.id`:
   `account.max_daily_loss_usd`. Checked once per cycle for each account by
   `multi_runner.py`, before any signals are generated — a breach halts that *account's*
   entire cycle, not just individual trades, and never affects other accounts.
-- `approve(symbol, action, order_value_usd)` — used only by the signal-based strategies,
-  checks the kill switch and the per-symbol cap against `account.max_position_size_usd`.
-  The portfolio rebalancer doesn't call this (see `portfolio.py` above).
+- `approve(symbol, action, order_value_usd, current_total_exposure_usd=0.0)` — used only
+  by the signal-based strategies, checks the kill switch, the per-symbol cap against
+  `account.max_position_size_usd`, and (when `account.max_total_exposure_usd > 0`) the
+  total-exposure cap against `current_total_exposure_usd + order_value_usd`. The portfolio
+  rebalancer doesn't call this (see `portfolio.py` above) - it enforces the same total-
+  exposure cap itself, since it never goes through `approve()` for its per-symbol sizing.
+
+  `current_total_exposure_usd` is deliberately a caller-supplied number, not something
+  `RiskManager` derives from `Trade` history the way `current_exposure_usd` (the
+  per-symbol figure) does: a just-submitted order's `Trade.fill_price` is still null
+  until the backend's async reconciliation catches up (see `broker_stream.py`), so
+  re-querying the DB between orders in the same cycle would under-count consecutive
+  buys against each other. `multi_runner.py` seeds this from one
+  `BrokerClient.get_positions()` snapshot at the start of each account's cycle and
+  updates it locally in Python as each order in that cycle is approved.
 
 ### `execution.py` — `ExecutionEngine`
 
@@ -395,6 +409,17 @@ triple and still correct.
 `ResearchSchedule` row) and `get_session()`. Default is a local SQLite file
 (`autotrader.db`); swappable via `DATABASE_URL` to Postgres if the engine and
 backend ever need to run on separate machines.
+
+`init_db()` also runs `_add_column_if_missing()` - a small, sqlite-specific "poor-man's
+migration" for the common case of an additive, defaulted column on a table that already
+exists (e.g. `Account.max_total_exposure_usd`, added after the initial multi-account
+rollout). `Base.metadata.create_all()` only ever creates missing *tables*; it doesn't
+alter existing ones. Since this project deliberately has no Alembic, every startup
+checks each such column via `PRAGMA table_info` and `ALTER TABLE ADD COLUMN`s it in if
+missing - self-healing, idempotent, and safe to run against a real database with real
+data. Column renames/drops/type changes are a different, riskier shape of change and
+still need a hand-written one-off script (see `scripts/migrate_to_accounts.py`) - this
+mechanism only ever adds.
 
 `queries.py` provides `get_watchlist_symbols(session, limit=None)` — the read side
 `multi_runner.py` uses for signal-strategy accounts by default: the most recent
@@ -561,7 +586,7 @@ read historical market data and print/plot results.
 
 ## `tests/` — no network or credentials required
 
-124 tests, all against synthetic data, in-memory/temp-file SQLite, or mocked
+132 tests, all against synthetic data, in-memory/temp-file SQLite, or mocked
 network/socket calls — no live broker credentials or network access needed to run
 any of them:
 

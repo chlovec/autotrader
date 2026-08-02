@@ -17,6 +17,7 @@ def _account(
     account_id: str = "acct-1",
     max_position_size_usd: float = 1000.0,
     max_daily_loss_usd: float = 200.0,
+    max_total_exposure_usd: float = 0.0,
     kill_switch_engaged: bool = False,
     kill_switch_reason: str = "",
 ) -> Account:
@@ -28,6 +29,7 @@ def _account(
         strategy_name="ma_crossover",
         max_position_size_usd=max_position_size_usd,
         max_daily_loss_usd=max_daily_loss_usd,
+        max_total_exposure_usd=max_total_exposure_usd,
         kill_switch_engaged=kill_switch_engaged,
         kill_switch_reason=kill_switch_reason,
     )
@@ -126,4 +128,29 @@ def test_current_exposure_ignores_trades_from_a_different_account():
 
     risk = RiskManager(session, _account("acct-1", max_position_size_usd=1000.0))
     approved, _ = risk.approve("SPY", SignalAction.buy, 200.0)
+    assert approved is True
+
+
+def test_approve_ignores_total_exposure_cap_when_zero():
+    risk = RiskManager(_session(), _account(max_total_exposure_usd=0.0))
+    approved, _ = risk.approve("SPY", SignalAction.buy, 100.0, current_total_exposure_usd=1_000_000.0)
+    assert approved is True
+
+
+def test_approve_rejects_buy_exceeding_total_exposure_cap():
+    risk = RiskManager(_session(), _account(max_position_size_usd=100_000.0, max_total_exposure_usd=1000.0))
+    approved, reason = risk.approve("SPY", SignalAction.buy, 200.0, current_total_exposure_usd=900.0)
+    assert approved is False
+    assert "max total exposure" in reason
+
+
+def test_approve_allows_buy_within_total_exposure_cap():
+    risk = RiskManager(_session(), _account(max_position_size_usd=100_000.0, max_total_exposure_usd=1000.0))
+    approved, _ = risk.approve("SPY", SignalAction.buy, 200.0, current_total_exposure_usd=700.0)
+    assert approved is True
+
+
+def test_approve_allows_sell_regardless_of_total_exposure_cap():
+    risk = RiskManager(_session(), _account(max_total_exposure_usd=100.0))
+    approved, _ = risk.approve("SPY", SignalAction.sell, 0.0, current_total_exposure_usd=1_000_000.0)
     assert approved is True

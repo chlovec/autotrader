@@ -94,6 +94,14 @@ def _run_signal_account_once(account: Account, strategy: Strategy, config: Confi
             )
             return
 
+        # Tracked locally rather than re-derived from Trade history each iteration - see
+        # RiskManager.approve's docstring for why (a just-submitted order's fill_price
+        # isn't in the DB yet, so consecutive buys within this loop would under-count
+        # each other if re-queried). Seeded from a live snapshot, then updated in step
+        # with each order actually submitted below.
+        current_positions = {p.symbol: p for p in broker.get_positions()}
+        running_total_exposure = sum(p.market_value for p in current_positions.values())
+
         for symbol in watchlist_symbols:
             bars = broker.get_bars(symbol, Timeframe.DAY, limit=100)
 
@@ -110,7 +118,7 @@ def _run_signal_account_once(account: Account, strategy: Strategy, config: Confi
                 order_value_usd = 0.0
                 qty = broker.get_position_qty(symbol)
 
-            approved, why = risk.approve(symbol, action, order_value_usd)
+            approved, why = risk.approve(symbol, action, order_value_usd, running_total_exposure)
             if not approved:
                 logger.info("[%s] signal for %s not executed: %s", account.id, symbol, why)
                 continue
@@ -121,6 +129,11 @@ def _run_signal_account_once(account: Account, strategy: Strategy, config: Confi
 
             trade = execution.submit_market_order(symbol, action, qty, signal_id=signal.id)
             logger.info("[%s] submitted %s order for %s qty=%s", account.id, action.value, symbol, trade.qty)
+
+            if action == SignalAction.buy:
+                running_total_exposure += order_value_usd
+            else:
+                running_total_exposure -= current_positions[symbol].market_value if symbol in current_positions else qty * last_price
 
 
 def _rebalance_account_once(account: Account, portfolio: RebalancingPortfolio, config: Config) -> None:
@@ -169,7 +182,7 @@ def _rebalance_account_once(account: Account, portfolio: RebalancingPortfolio, c
             for symbol in portfolio.target_weights
         }
 
-        orders = portfolio.compute_rebalance_orders(account_snapshot, positions, prices)
+        orders = portfolio.compute_rebalance_orders(account_snapshot, positions, prices, db_account.max_total_exposure_usd)
         if not orders:
             logger.info("[%s] portfolio already within target weights, nothing to rebalance", account.id)
             return

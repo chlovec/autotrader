@@ -41,6 +41,11 @@ class Account(Base):
     .env the first time an id is seen and owned by the dashboard from then on; a later env
     change to those values is deliberately ignored so a dashboard edit can't be silently
     reverted by a restart.
+
+    max_total_exposure_usd caps the total value of open positions across every symbol at
+    once (as opposed to max_position_size_usd, which caps one symbol) - 0 means no cap,
+    which is also the backfilled value for any account that existed before this column
+    did, so adding it never silently starts throttling an account that hasn't opted in.
     """
 
     __tablename__ = "accounts"
@@ -53,6 +58,7 @@ class Account(Base):
     strategy_params: Mapped[str] = mapped_column(Text, default="{}")
     max_position_size_usd: Mapped[float] = mapped_column(Float)
     max_daily_loss_usd: Mapped[float] = mapped_column(Float)
+    max_total_exposure_usd: Mapped[float] = mapped_column(Float, default=0.0)
     kill_switch_engaged: Mapped[bool] = mapped_column(default=False)
     kill_switch_reason: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)

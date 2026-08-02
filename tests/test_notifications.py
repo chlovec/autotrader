@@ -8,6 +8,7 @@ def _config(smtp_host: str = "", alert_email_to: str = "") -> Config:
     return Config(
         max_position_size_usd=1000.0,
         max_daily_loss_usd=200.0,
+        max_total_exposure_usd=0.0,
         questrade_poll_interval_seconds=5.0,
         alpaca_news_api_key="",
         alpaca_news_secret_key="",

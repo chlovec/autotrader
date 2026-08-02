@@ -89,6 +89,7 @@ export interface AccountDetail {
   strategy_params: Record<string, unknown>
   max_position_size_usd: number
   max_daily_loss_usd: number
+  max_total_exposure_usd: number
   kill_switch_engaged: boolean
   kill_switch_reason: string
 }
@@ -96,6 +97,7 @@ export interface AccountDetail {
 export interface TradingLimits {
   max_position_size_usd: number
   max_daily_loss_usd: number
+  max_total_exposure_usd: number
 }
 
 async function getJSON<T>(path: string): Promise<T> {

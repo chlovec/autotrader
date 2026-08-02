@@ -14,14 +14,16 @@ class Config:
     once trading multiple accounts became possible; a single global "the broker" no longer
     means anything.
 
-    max_position_size_usd/max_daily_loss_usd here are seed defaults only, used once when an
-    id from ACCOUNT_IDS is first seen (engine/accounts.py's sync_accounts_from_env) - after
-    that the per-account values on db.models.Account are what RiskManager actually enforces,
-    and are owned by the dashboard from then on.
+    max_position_size_usd/max_daily_loss_usd/max_total_exposure_usd here are seed defaults
+    only, used once when an id from ACCOUNT_IDS is first seen (engine/accounts.py's
+    sync_accounts_from_env) - after that the per-account values on db.models.Account are
+    what RiskManager/the rebalancer actually enforce, and are owned by the dashboard from
+    then on.
     """
 
     max_position_size_usd: float
     max_daily_loss_usd: float
+    max_total_exposure_usd: float
     questrade_poll_interval_seconds: float
     # Research (engine/research.py's fetch_universe_news) always uses Alpaca's News API,
     # independent of which broker(s) any account actually trades through - it's a global
@@ -69,6 +71,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-position-size-usd", type=float, default=None)
     parser.add_argument("--max-daily-loss-usd", type=float, default=None)
+    parser.add_argument("--max-total-exposure-usd", type=float, default=None)
     parser.add_argument("--questrade-poll-interval-seconds", type=float, default=None)
     parser.add_argument("--alpaca-news-api-key", default=None)
     parser.add_argument("--alpaca-news-secret-key", default=None)
@@ -98,6 +101,11 @@ def load_config(argv: list[str] | None = None) -> Config:
         ),
         max_daily_loss_usd=(
             args.max_daily_loss_usd if args.max_daily_loss_usd is not None else float(os.environ.get("MAX_DAILY_LOSS_USD", "200"))
+        ),
+        max_total_exposure_usd=(
+            args.max_total_exposure_usd
+            if args.max_total_exposure_usd is not None
+            else float(os.environ.get("MAX_TOTAL_EXPOSURE_USD", "0"))
         ),
         questrade_poll_interval_seconds=(
             args.questrade_poll_interval_seconds

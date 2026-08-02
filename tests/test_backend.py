@@ -66,7 +66,7 @@ def _add_account(account_id: str = "acct-1", **overrides) -> None:
     defaults = dict(
         id=account_id, broker="alpaca", display_name="Test Account", active=True,
         strategy_name="rebalancing_portfolio", strategy_params='{"target_weights": {"SPY": 1.0}}',
-        max_position_size_usd=1000.0, max_daily_loss_usd=200.0,
+        max_position_size_usd=1000.0, max_daily_loss_usd=200.0, max_total_exposure_usd=0.0,
     )
     defaults.update(overrides)
     with db_session.get_session() as session:
@@ -210,12 +210,16 @@ def test_activate_account_flips_active(client, monkeypatch):
 def test_set_account_limits(client):
     _add_account("acct-1")
 
-    response = client.patch("/accounts/acct-1/limits", params={"max_position_size_usd": 2000.0, "max_daily_loss_usd": 300.0})
-    assert response.json() == {"max_position_size_usd": 2000.0, "max_daily_loss_usd": 300.0}
+    response = client.patch(
+        "/accounts/acct-1/limits",
+        params={"max_position_size_usd": 2000.0, "max_daily_loss_usd": 300.0, "max_total_exposure_usd": 5000.0},
+    )
+    assert response.json() == {"max_position_size_usd": 2000.0, "max_daily_loss_usd": 300.0, "max_total_exposure_usd": 5000.0}
 
     detail = client.get("/accounts/acct-1").json()
     assert detail["max_position_size_usd"] == 2000.0
     assert detail["max_daily_loss_usd"] == 300.0
+    assert detail["max_total_exposure_usd"] == 5000.0
 
 
 def test_kill_switch_round_trip(client):

@@ -81,6 +81,7 @@ def sync_accounts_from_env(session: Session, config: Config) -> None:
                 strategy_params=json.dumps(strategy_params),
                 max_position_size_usd=config.max_position_size_usd,
                 max_daily_loss_usd=config.max_daily_loss_usd,
+                max_total_exposure_usd=config.max_total_exposure_usd,
             )
         )
 

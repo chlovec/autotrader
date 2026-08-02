@@ -174,6 +174,7 @@ def _account_detail_dict(account: Account) -> dict:
         "strategy_params": json.loads(account.strategy_params),
         "max_position_size_usd": account.max_position_size_usd,
         "max_daily_loss_usd": account.max_daily_loss_usd,
+        "max_total_exposure_usd": account.max_total_exposure_usd,
         "kill_switch_engaged": account.kill_switch_engaged,
         "kill_switch_reason": account.kill_switch_reason,
     }
@@ -229,14 +230,19 @@ async def deactivate_account(account_id: str) -> dict:
 
 
 @app.patch("/accounts/{account_id}/limits")
-def set_account_limits(account_id: str, max_position_size_usd: float, max_daily_loss_usd: float) -> dict:
+def set_account_limits(account_id: str, max_position_size_usd: float, max_daily_loss_usd: float, max_total_exposure_usd: float) -> dict:
     with get_session() as session:
         account = _get_account_or_404(session, account_id)
         account.max_position_size_usd = max_position_size_usd
         account.max_daily_loss_usd = max_daily_loss_usd
+        account.max_total_exposure_usd = max_total_exposure_usd
         account.updated_at = dt.datetime.utcnow()
         session.commit()
-        return {"max_position_size_usd": account.max_position_size_usd, "max_daily_loss_usd": account.max_daily_loss_usd}
+        return {
+            "max_position_size_usd": account.max_position_size_usd,
+            "max_daily_loss_usd": account.max_daily_loss_usd,
+            "max_total_exposure_usd": account.max_total_exposure_usd,
+        }
 
 
 @app.get("/accounts/{account_id}/kill-switch")

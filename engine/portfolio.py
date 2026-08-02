@@ -36,6 +36,7 @@ class RebalancingPortfolio:
         account: AccountSnapshot,
         positions: dict[str, PositionSnapshot],
         prices: dict[str, float],
+        max_total_exposure_usd: float = 0.0,
     ) -> list[RebalanceOrder]:
         orders = []
         for symbol, target_weight in self.target_weights.items():
@@ -58,4 +59,43 @@ class RebalancingPortfolio:
                     reason=f"rebalance: target {target_weight:.1%} (${target_value:,.2f}), actual ${current_value:,.2f}",
                 )
             )
+
+        if max_total_exposure_usd > 0:
+            orders = self._cap_buys_to_total_exposure(orders, positions, prices, max_total_exposure_usd)
         return orders
+
+    @staticmethod
+    def _cap_buys_to_total_exposure(
+        orders: list[RebalanceOrder],
+        positions: dict[str, PositionSnapshot],
+        prices: dict[str, float],
+        max_total_exposure_usd: float,
+    ) -> list[RebalanceOrder]:
+        """Throttles this cycle's buy orders (never sells - selling is always what frees
+        up room under the cap, never what should be blocked by it) so total exposure after
+        this rebalance never exceeds max_total_exposure_usd. Existing overweight positions
+        aren't force-sold down to the cap on their own - only new buys that would push
+        the account further over it are held back."""
+        current_total = sum(p.market_value for p in positions.values())
+        sells = [o for o in orders if o.action == SignalAction.sell]
+        buys = [o for o in orders if o.action == SignalAction.buy]
+
+        sell_value = sum(o.qty * prices[o.symbol] for o in sells)
+        buy_value = sum(o.qty * prices[o.symbol] for o in buys)
+        headroom = max_total_exposure_usd - (current_total - sell_value)
+
+        if headroom <= 0 or not buys:
+            return sells
+
+        if buy_value <= headroom:
+            return orders
+
+        scale = headroom / buy_value
+        scaled_buys = []
+        for order in buys:
+            price = prices[order.symbol]
+            qty = round(order.qty * scale, 4)
+            if qty * price < max(price, 1.0):  # dust after scaling - not worth trading
+                continue
+            scaled_buys.append(RebalanceOrder(symbol=order.symbol, action=order.action, qty=qty, reason=f"{order.reason} (scaled down to stay within max total exposure)"))
+        return sells + scaled_buys

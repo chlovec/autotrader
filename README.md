@@ -278,7 +278,7 @@ and a repeated `ACCOUNT_<id>_*` block per account.
 | `ACCOUNT_<id>_STRATEGY` / `_STRATEGY_PARAMS` | Only read the first time that id appears — after that, the assigned strategy is dashboard/database state, not `.env`. One of `ma_crossover`, `mean_reversion`, `regime_switching`, `rebalancing_portfolio`; `_STRATEGY_PARAMS` is JSON constructor kwargs (e.g. `{"target_weights": {...}}` for the rebalancer) |
 | `ALPACA_NEWS_API_KEY` / `ALPACA_NEWS_SECRET_KEY` | Global — research's news layer (`run_research.py`, and the backend's nightly job/"Run research now" button) always uses Alpaca's News API regardless of any account's broker; set a free Alpaca paper key pair here |
 | `DATABASE_URL` | Where account state/trades/signals/equity history is stored (SQLite file by default) |
-| `MAX_POSITION_SIZE_USD` / `MAX_DAILY_LOSS_USD` | Global — only used to seed a newly-discovered account's limits the first time its id appears; edit an account's actual limits from its dashboard page afterward |
+| `MAX_POSITION_SIZE_USD` / `MAX_DAILY_LOSS_USD` / `MAX_TOTAL_EXPOSURE_USD` | Global — only used to seed a newly-discovered account's limits the first time its id appears; edit an account's actual limits from its dashboard page afterward. `MAX_TOTAL_EXPOSURE_USD` caps total open-position value across every symbol at once (0 = no cap, the default) — separate from `MAX_POSITION_SIZE_USD`, which caps one symbol |
 | `SMTP_*` / `ALERT_EMAIL_*` | Global. Optional email alerts on errors, kill-switch trips, and daily-loss halts. Leave blank to skip — macOS notifications fire regardless, with no setup needed |
 
 ## Testing
@@ -287,7 +287,7 @@ and a repeated `ACCOUNT_<id>_*` block per account.
 .venv/bin/python -m pytest tests/ -q
 ```
 
-124 tests covering strategy logic, risk checks, portfolio rebalancing math, the
+132 tests covering strategy logic, risk checks, portfolio rebalancing math, the
 notification system, per-account credential loading, the multi-account runner's
 dispatch/isolation behavior, and all three broker integrations — all using synthetic
 data, in-memory databases, or mocked network/socket calls, no live credentials or
@@ -321,6 +321,10 @@ led to the current default.
 - **Daily loss limit**: per account — if an account's equity drops more than its
   own `max_daily_loss_usd` since the first snapshot of the day, that account halts
   trading until the next day. Editable from its dashboard page.
+- **Max total exposure**: per account — caps total open-position value across every
+  symbol at once (0 = no cap, the default). Once hit, new buys are blocked (or, for
+  `rebalancing_portfolio` accounts, scaled down) until a sale frees up room; sells are
+  never blocked by this. Editable from the dashboard alongside the other two limits.
 - **Alerts**: order failures, kill-switch engagements, and daily-loss halts trigger
   a macOS notification and (if configured) an email — not just a log line.
 

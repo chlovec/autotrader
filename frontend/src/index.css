@@ -563,6 +563,13 @@ tr.clickable-row:focus-visible {
   color: var(--text-secondary);
 }
 
+.limits-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  max-width: 260px;
+  white-space: normal;
+}
+
 .limits-field input {
   padding: 8px 10px;
   border-radius: 6px;

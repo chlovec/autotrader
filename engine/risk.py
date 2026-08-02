@@ -44,7 +44,17 @@ class RiskManager:
         the way the position-size cap below is."""
         return self.daily_pnl() <= -self.account.max_daily_loss_usd
 
-    def approve(self, symbol: str, action: SignalAction, order_value_usd: float) -> tuple[bool, str]:
+    def approve(
+        self, symbol: str, action: SignalAction, order_value_usd: float, current_total_exposure_usd: float = 0.0
+    ) -> tuple[bool, str]:
+        """current_total_exposure_usd is the caller's own running total of open-position
+        value across every symbol, *before* this order - unlike current_exposure_usd
+        above, this isn't derived from Trade history here, because a just-submitted
+        order's Trade.fill_price is still null until the backend's async reconciliation
+        catches up (see backend/app/broker_stream.py), which would make consecutive buys
+        within one cycle under-count each other. Callers (engine/multi_runner.py) seed
+        this from a live BrokerClient.get_positions() snapshot and update it locally as
+        each order in the cycle is approved."""
         engaged, reason = self.kill_switch_engaged()
         if engaged:
             return False, f"kill switch engaged: {reason}"
@@ -56,5 +66,10 @@ class RiskManager:
             projected = self.current_exposure_usd(symbol) + order_value_usd
             if projected > self.account.max_position_size_usd:
                 return False, f"order would exceed max position size (${self.account.max_position_size_usd})"
+
+            if self.account.max_total_exposure_usd > 0:
+                projected_total = current_total_exposure_usd + order_value_usd
+                if projected_total > self.account.max_total_exposure_usd:
+                    return False, f"order would exceed max total exposure (${self.account.max_total_exposure_usd})"
 
         return True, "approved"
