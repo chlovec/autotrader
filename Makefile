@@ -13,7 +13,7 @@ IBKR_LIVE_PORT ?= 7496
 BACKEND_HOST ?= 127.0.0.1
 BACKEND_PORT ?= 8000
 
-.PHONY: help run-alpaca-sim run-alpaca-live run-ibkr-sim run-ibkr-live research backend dashboard
+.PHONY: help run-alpaca-sim run-alpaca-live run-ibkr-sim run-ibkr-live research backend dashboard stop restart
 
 help:
 	@echo "Autoloader run targets (all run $(RUN_SCRIPT); override with RUN_SCRIPT=run.py):"
@@ -24,14 +24,11 @@ help:
 	@echo "  research         Screen run_research.py's symbol universe and update the watchlist (no trades placed)"
 	@echo "  backend          Start the FastAPI backend API on $(BACKEND_HOST):$(BACKEND_PORT)"
 	@echo "  dashboard        Start the React dashboard (UI) dev server - needs 'backend' running in another terminal"
+	@echo "  restart          Background backend+dashboard+trading loop+research (bin/restart.sh); BROKER=/MODE= or interactive"
+	@echo "  stop             Kill whatever 'restart' (or a previous manual run) started (bin/stop.sh)"
 
 run-alpaca-sim:
-	@echo "Starting backend, dashboard, and Alpaca sim..."
-	@trap 'kill 0' EXIT; \
-	make backend & \
-	make dashboard & \
 	BROKER=alpaca ALPACA_PAPER=true $(PYTHON) $(RUN_SCRIPT) & \
-	wait
 
 run-alpaca-live:
 	@echo "This will place REAL trades with REAL money on your live Alpaca account."
@@ -55,3 +52,11 @@ backend:
 
 dashboard:
 	cd frontend && npm run dev
+
+# BROKER/MODE deliberately have no default here (unlike RUN_SCRIPT etc. above) - leaving
+# either unset lets bin/restart.sh fall through to its own interactive prompt.
+restart:
+	@bin/restart.sh $(BROKER) $(MODE)
+
+stop:
+	@bin/stop.sh

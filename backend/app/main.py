@@ -1,6 +1,7 @@
 import asyncio
 import datetime as dt
 import logging
+import os
 import threading
 from dataclasses import asdict
 
@@ -20,9 +21,23 @@ logger = logging.getLogger("autotrader.backend")
 
 app = FastAPI(title="Autotrader API")
 
+# No default on purpose: a wrong-but-plausible default (e.g. localhost:5173) is exactly
+# how this broke before - the dashboard silently got "Backend unreachable" instead of a
+# real error when it ran on a different origin. Every deployment (dev or prod) must set
+# this explicitly. Comma-separated, e.g. "http://localhost:5173,http://localhost:5174".
+_cors_origins_raw = os.environ.get("CORS_ORIGINS")
+if not _cors_origins_raw:
+    raise RuntimeError(
+        "CORS_ORIGINS is not set. Set it to the dashboard's origin(s) in .env, e.g. "
+        "CORS_ORIGINS=http://localhost:5173 - see .env.example."
+    )
+_cors_origins = [origin.strip() for origin in _cors_origins_raw.split(",") if origin.strip()]
+if not _cors_origins:
+    raise RuntimeError("CORS_ORIGINS is set but empty after parsing - check its value in .env.")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )

@@ -105,6 +105,34 @@ Three independent processes make up the running app. Each is a plain long-runnin
 process — there's no process manager wiring them together, so open a separate
 terminal (or use `nohup ... &`) for each.
 
+### Quick start: all of it in one command
+
+`bin/restart.sh` (or `make restart`) backgrounds all three processes plus one
+research run for you — the backend, the dashboard, the trading loop, and
+`run_research.py` — instead of doing steps 0-3 below by hand across separate
+terminals:
+
+```bash
+make restart                       # prompts for broker, then live/sim
+make restart BROKER=alpaca MODE=sim
+make restart BROKER=ibkr MODE=sim
+```
+
+Live modes are always refused here — real-money trading needs the "type yes to
+continue" confirmation that `run-alpaca-live`/`run-ibkr-live` provide (see below),
+which a backgrounded script has no terminal to answer. Output goes to
+`services.log`; stop everything it started with:
+
+```bash
+make stop
+```
+
+`bin/stop.sh` matches processes by command line (backend, dashboard, trading loop,
+a still-running research run) rather than tracking PIDs, so it works regardless of
+how they were started — including a stray process from a previous session. The
+rest of this section covers running each piece by hand, useful if you want them in
+separate terminals you can watch individually.
+
 ### 0. Research (needs at least one run before `run.py` has anything to trade)
 
 The backend (started in step 2 below) automatically runs research every night at
@@ -208,7 +236,15 @@ research now" button that triggers an on-demand run regardless of that toggle.
 
 ### Stopping everything
 
-Each process was started with `&`; find and kill them by PID (printed on start) or:
+```bash
+make stop
+# or directly:
+bin/stop.sh
+```
+
+Matches by command line rather than tracked PIDs, so it finds and kills the trading
+loop, backend, dashboard, and any still-running research run no matter which of the
+methods above started them. Equivalent by hand, if you'd rather not use the script:
 
 ```bash
 pkill -f run_portfolio.py
