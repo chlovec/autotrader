@@ -113,6 +113,13 @@ async function postJSON<T>(path: string, params: Record<string, string | number 
   return res.json()
 }
 
+async function deleteJSON<T>(path: string, params: Record<string, string | number | boolean> = {}): Promise<T> {
+  const query = new URLSearchParams(Object.entries(params).map(([k, v]) => [k, String(v)])).toString()
+  const res = await fetch(`${API_BASE}${path}${query ? `?${query}` : ''}`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(`${path} failed: ${res.status}`)
+  return res.json()
+}
+
 export function accountWsUrl(accountId: string): string {
   return `${API_BASE.replace(/^http/, 'ws')}/ws/accounts/${accountId}`
 }
@@ -120,6 +127,12 @@ export function accountWsUrl(accountId: string): string {
 export const api = {
   health: () => getJSON<{ status: string }>('/health'),
   events: () => getJSON<SystemEvent[]>('/events'),
+  clearEvent: (id: number) => deleteJSON<{ cleared: number }>(`/events/${id}`),
+  clearEvents: (scope?: { accountId?: string; unassigned?: boolean }) =>
+    deleteJSON<{ cleared: number }>(
+      '/events',
+      scope?.unassigned ? { unassigned: true } : scope?.accountId ? { account_id: scope.accountId } : {},
+    ),
   research: () => getJSON<ResearchResult[]>('/research'),
   researchSchedule: () => getJSON<ResearchScheduleState>('/research/schedule'),
   setResearchSchedule: (enabled: boolean) => postJSON<ResearchScheduleState>('/research/schedule', { enabled }),

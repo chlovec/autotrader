@@ -335,6 +335,36 @@ def events(limit: int = 100) -> list[dict]:
         ]
 
 
+@app.delete("/events/{event_id}")
+def clear_event(event_id: int) -> dict:
+    with get_session() as session:
+        event = session.get(SystemEvent, event_id)
+        if event is None:
+            raise HTTPException(status_code=404, detail=f"unknown event {event_id!r}")
+        session.delete(event)
+        session.commit()
+    return {"cleared": 1}
+
+
+@app.delete("/events")
+def clear_events(account_id: str | None = None, unassigned: bool = False) -> dict:
+    """Bulk-clear notifications. With no params, clears everything; `unassigned=true`
+    clears only events with no account_id (the "General" group on the dashboard);
+    `account_id` clears just that account's group. unassigned takes precedence if both
+    are somehow passed together."""
+    with get_session() as session:
+        query = select(SystemEvent)
+        if unassigned:
+            query = query.where(SystemEvent.account_id.is_(None))
+        elif account_id is not None:
+            query = query.where(SystemEvent.account_id == account_id)
+        rows = session.execute(query).scalars().all()
+        for row in rows:
+            session.delete(row)
+        session.commit()
+        return {"cleared": len(rows)}
+
+
 @app.get("/research")
 def research(limit: int = 100) -> list[dict]:
     with get_session() as session:

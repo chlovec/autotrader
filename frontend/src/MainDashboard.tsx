@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import type { AccountSummary, ResearchResult, ResearchScheduleState, ResearchStatus, SystemEvent } from './api'
 import { api } from './api'
 import { AccountsTable } from './components/AccountsTable'
-import { EventsFeed } from './components/EventsFeed'
+import { NotificationsPanel } from './components/NotificationsPanel'
 import { ResearchPanel } from './components/ResearchPanel'
 
 const POLL_INTERVAL_MS = 15_000
@@ -81,8 +81,8 @@ export function MainDashboard({ connected, onConnectedChange }: { connected: boo
       </div>
 
       <div className="card">
-        <h2>System events</h2>
-        <EventsFeed events={events} />
+        <h2>Notifications</h2>
+        <NotificationsPanel events={events} accounts={accounts} onChange={refresh} />
       </div>
     </main>
   )

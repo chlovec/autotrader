@@ -9,7 +9,7 @@ from sqlalchemy.orm import sessionmaker
 import backend.app.main as backend_main
 import db.session as db_session
 from backend.app.main import AccountRuntime
-from db.models import Account, EquitySnapshot, ResearchResult
+from db.models import Account, EquitySnapshot, ResearchResult, SystemEvent
 from engine.brokers.base import AccountSnapshot, PositionSnapshot
 
 
@@ -230,6 +230,77 @@ def test_kill_switch_round_trip(client):
     response = client.post("/accounts/acct-1/kill-switch", params={"engaged": True, "reason": "manual stop"})
     assert response.json() == {"engaged": True, "reason": "manual stop"}
     assert client.get("/accounts/acct-1/kill-switch").json() == {"engaged": True, "reason": "manual stop"}
+
+
+def _add_event(**overrides) -> int:
+    defaults = dict(level="info", source="test", message="something happened", account_id=None)
+    defaults.update(overrides)
+    with db_session.get_session() as session:
+        event = SystemEvent(**defaults)
+        session.add(event)
+        session.commit()
+        return event.id
+
+
+def test_events_empty_with_no_events(client):
+    assert client.get("/events").json() == []
+
+
+def test_events_returns_newest_first(client):
+    _add_event(message="first")
+    _add_event(message="second")
+    rows = client.get("/events").json()
+    assert [r["message"] for r in rows] == ["second", "first"]
+
+
+def test_clear_event_removes_just_that_one(client):
+    keep_id = _add_event(message="keep")
+    clear_id = _add_event(message="clear me")
+
+    response = client.delete(f"/events/{clear_id}")
+    assert response.json() == {"cleared": 1}
+
+    rows = client.get("/events").json()
+    assert [r["id"] for r in rows] == [keep_id]
+
+
+def test_clear_event_404_for_unknown_id(client):
+    assert client.delete("/events/999").status_code == 404
+
+
+def test_clear_events_removes_everything(client):
+    _add_event(message="one")
+    _add_event(message="two")
+
+    response = client.delete("/events")
+    assert response.json() == {"cleared": 2}
+    assert client.get("/events").json() == []
+
+
+def test_clear_events_scoped_to_account(client):
+    _add_account("acct-1")
+    _add_account("acct-2")
+    _add_event(account_id="acct-1", message="acct-1 event")
+    _add_event(account_id="acct-2", message="acct-2 event")
+    _add_event(account_id=None, message="general event")
+
+    response = client.delete("/events", params={"account_id": "acct-1"})
+    assert response.json() == {"cleared": 1}
+
+    rows = client.get("/events").json()
+    assert {r["message"] for r in rows} == {"acct-2 event", "general event"}
+
+
+def test_clear_events_scoped_to_unassigned(client):
+    _add_account("acct-1")
+    _add_event(account_id="acct-1", message="acct-1 event")
+    _add_event(account_id=None, message="general event")
+
+    response = client.delete("/events", params={"unassigned": True})
+    assert response.json() == {"cleared": 1}
+
+    rows = client.get("/events").json()
+    assert [r["message"] for r in rows] == ["acct-1 event"]
 
 
 def test_positions_returns_409_for_inactive_account(client):
