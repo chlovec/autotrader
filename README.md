@@ -248,7 +248,7 @@ button), and System Events. Click an account to open its **detail page**
 (`/accounts/<id>`): equity chart, positions, trade log, signal history, the kill
 switch (per-account — flips that account's own database row, checked before every
 one of *its* trading cycles), and editable trading limits (max position size, max
-daily loss). Both pages poll the backend every 15 seconds; the detail page also
+daily loss, max total exposure). Both pages poll the backend every 15 seconds; the detail page also
 listens on that account's WebSocket for live equity/position/trade ticks.
 
 ### Stopping everything
@@ -295,7 +295,7 @@ and a repeated `ACCOUNT_<id>_*` block per account.
 .venv/bin/python -m pytest tests/ -q
 ```
 
-132 tests covering strategy logic, risk checks, portfolio rebalancing math, the
+133 tests covering strategy logic, risk checks, portfolio rebalancing math, the
 notification system, per-account credential loading, the multi-account runner's
 dispatch/isolation behavior, and all three broker integrations — all using synthetic
 data, in-memory databases, or mocked network/socket calls, no live credentials or

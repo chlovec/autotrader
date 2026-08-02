@@ -198,10 +198,10 @@ bars) -> (action, reason)`, called independently per symbol. Three concrete
 strategies, all long/flat (they buy or hold a position, never short), any of which
 an account can be assigned via its `strategy_name`:
 
-| Strategy | Logic | Backtested result (6yr) |
+| Strategy | Logic | Backtested result (~10.5yr) |
 | --- | --- | --- |
-| `MovingAverageCrossoverStrategy` | Buy on a golden cross (20-day SMA crosses above 50-day), sell on a death cross | Return 38.9%, Sharpe 0.47, max drawdown -29.1% |
-| `MeanReversionStrategy` | Buy when 14-day RSI crosses below 30 (oversold), sell crossing above 70 (overbought) | Return 46.7%, Sharpe 0.50, max drawdown -20.6% |
+| `MovingAverageCrossoverStrategy` | Buy on a golden cross (20-day SMA crosses above 50-day), sell on a death cross | Return 114.4%, Sharpe 0.62, max drawdown -29.2% |
+| `MeanReversionStrategy` | Buy when 14-day RSI crosses below 30 (oversold), sell crossing above 70 (overbought) | Return 85.9%, Sharpe 0.41, max drawdown -29.1% |
 | `RegimeSwitchingStrategy` | ADX(14) detects trending vs. range-bound; delegates to the crossover strategy when trending, to mean-reversion (with RSI bands that tighten the more range-bound ADX indicates) otherwise | Return 61.9%, Sharpe 0.71, max drawdown -7.4% — but see caveat below |
 
 Buy-and-hold SPY over the same window: return 271.6%, Sharpe 0.795, max drawdown
@@ -418,7 +418,12 @@ triple and still correct.
 `session.py` provides `init_db()` (creates tables if missing, seeds the one
 `ResearchSchedule` row) and `get_session()`. Default is a local SQLite file
 (`autotrader.db`); swappable via `DATABASE_URL` to Postgres if the engine and
-backend ever need to run on separate machines.
+backend ever need to run on separate machines. `init_db()`'s table creation goes through
+`_create_all_with_retry()`, which retries (up to `_CREATE_ALL_RETRIES`) on a "table already
+exists" `OperationalError` — `bin/restart.sh` starts the backend and engine at nearly the
+same time, and both call `init_db()` on startup, so one process's `CREATE TABLE` can land
+mid-check by the other; any other `OperationalError` is re-raised immediately rather than
+retried.
 
 `init_db()` also runs `_add_column_if_missing()` - a small, sqlite-specific "poor-man's
 migration" for the common case of an additive, defaulted column on a table that already
@@ -467,7 +472,7 @@ above).
 - `GET /accounts/{id}` — one account's full detail: limits, strategy, kill-switch state.
 - `POST /accounts/{id}/activate` / `/deactivate` — flips `Account.active` and
   starts/stops that account's broker connection + stream.
-- `PATCH /accounts/{id}/limits` — writes `max_position_size_usd`/`max_daily_loss_usd`.
+- `PATCH /accounts/{id}/limits` — writes `max_position_size_usd`/`max_daily_loss_usd`/`max_total_exposure_usd`.
 - `GET`/`POST /accounts/{id}/kill-switch` — per-account, replacing the old global
   `/kill-switch`.
 - `GET /accounts/{id}/positions|equity|trades|signals` — replace the old unscoped
@@ -540,7 +545,7 @@ that router's switch between two top-level pages:
   `/accounts/{id}/...` endpoints and its own `/ws/accounts/{id}` socket instead of a
   single global set. Also owns `KillSwitchPanel` (now takes `accountId` and calls the
   account-scoped kill-switch endpoints) and the new **`TradingLimitsPanel`** component
-  (two number inputs + save, calling `PATCH /accounts/{id}/limits`) — this is where
+  (three number inputs + save, calling `PATCH /accounts/{id}/limits`) — this is where
   "edit account trading limits from the accounts dashboard" actually lives.
 
 Components, each owning one card on one of the two pages:
@@ -561,8 +566,11 @@ Components, each owning one card on one of the two pages:
 - **`KillSwitchPanel.tsx`** — the one interactive control on the account page that
   writes anything besides limits: toggles that account's kill switch via
   `POST /accounts/{id}/kill-switch`.
-- **`TradingLimitsPanel.tsx`** — edits `max_position_size_usd`/`max_daily_loss_usd` for
-  one account.
+- **`TradingLimitsPanel.tsx`** — edits `max_position_size_usd`/`max_daily_loss_usd`/
+  `max_total_exposure_usd` for one account.
+- **`ResearchDetailModal.tsx`** — a per-symbol detail popup opened from `ResearchPanel`:
+  combined/technical/news scores, selected-or-not status with the run timestamp, and
+  the scorer's rationale text.
 
 Theming: CSS custom properties in `index.css`, one block for light and one for dark
 (`prefers-color-scheme` plus a `data-theme` attribute override), both instances of
@@ -596,7 +604,7 @@ read historical market data and print/plot results.
 
 ## `tests/` — no network or credentials required
 
-132 tests, all against synthetic data, in-memory/temp-file SQLite, or mocked
+133 tests, all against synthetic data, in-memory/temp-file SQLite, or mocked
 network/socket calls — no live broker credentials or network access needed to run
 any of them:
 
@@ -624,6 +632,9 @@ any of them:
   `account_id` (including that a same `broker_order_id` under a different account is
   never matched), and `ConnectionManager.broadcast` only reaching the connections
   registered for that account.
+- `test_session.py` — `db.session._create_all_with_retry()`'s recovery from a concurrent
+  "table already exists" race, that unrelated `OperationalError`s are re-raised
+  immediately, and that it gives up after `_CREATE_ALL_RETRIES` attempts.
 - `test_risk.py` — `RiskManager`'s kill-switch, daily-loss, and position-cap checks,
   all against a `db.models.Account` row rather than a global config.
 - `test_notifications.py` — `Notifier` composition and that failures (a bad SMTP
