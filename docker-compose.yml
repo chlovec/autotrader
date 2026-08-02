@@ -1,0 +1,50 @@
+# Containerized version of the same processes bin/restart.sh backgrounds locally -
+# see README.md "Deploying" > "Option C: Docker Compose".
+#
+# BROKER/ALPACA_PAPER/RUN_SCRIPT etc. all come from .env, same as running these by
+# hand. There's no interactive "type yes" live-trading confirmation here (no
+# terminal attached) - same reasoning README.md already gives for launchd/systemd:
+# set .env explicitly and mean it before going live this way.
+x-python-service: &python-service
+  build: .
+  image: autotrader-app
+  env_file: .env
+  # TWS/Gateway (BROKER=ibkr) runs on the host, not in a container - set
+  # IBKR_HOST=host.docker.internal in .env to reach it. This resolves that name
+  # on any platform (a no-op if IBKR_HOST is never used).
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  volumes:
+    - ./autotrader.db:/app/autotrader.db
+    # Only needed for BROKER=questrade - `touch questrade_token.json` on the host
+    # first, or Docker will create a directory here instead of a file.
+    - ./questrade_token.json:/app/questrade_token.json
+
+services:
+  backend:
+    <<: *python-service
+    command: uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  engine:
+    <<: *python-service
+    command: python ${RUN_SCRIPT:-run_portfolio.py}
+    restart: unless-stopped
+
+  # On-demand only - the backend already runs this nightly and exposes a
+  # "run now" trigger. Invoke by hand: docker compose run --rm research
+  research:
+    <<: *python-service
+    command: python run_research.py
+    profiles: ["manual"]
+
+  dashboard:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
+    ports:
+      - "5173:80"
+    restart: unless-stopped

@@ -318,8 +318,9 @@ None of this replaces watching the account yourself, especially in the first wee
 
 Everything above runs as plain local processes tied to whatever machine started
 them — if that machine sleeps, restarts, or the terminal closes, trading stops
-until you start it again. There's no Docker image or CI pipeline; deploying just
-means running the same commands somewhere that stays on.
+until you start it again. There's no CI pipeline; deploying just means running the
+same commands somewhere that stays on, either directly (Options A/B) or in
+containers (Option C).
 
 Unattended deployment (`launchd`, `systemd`) should invoke `.venv/bin/python
 run_portfolio.py` directly with explicit `BROKER`/`ALPACA_PAPER`/`IBKR_PORT` env
@@ -394,6 +395,58 @@ have this problem.
 8. Keep `.env` (and, if using Questrade, `questrade_token.json`) out of version
    control and out of any logs — they hold your broker credentials and (if
    configured) email credentials.
+
+### Option C: Docker Compose
+
+Packages the backend, engine, and dashboard as containers instead of plain
+processes — `docker-compose.yml` builds one shared Python image (`Dockerfile`) for
+the backend and trading engine, and a separate `node`→`nginx` image
+(`frontend/Dockerfile`) that builds the dashboard for production and serves the
+static `dist/` output, matching Option B's step 5 above instead of running
+`npm run dev`.
+
+```bash
+cp .env.example .env   # fill in BROKER, keys, etc. - same file the local setup uses
+docker compose up -d --build
+```
+
+This starts three services:
+
+- `backend` — the FastAPI API, published on `localhost:8000`
+- `engine` — the trading loop (`RUN_SCRIPT` from `.env`, default `run_portfolio.py`)
+- `dashboard` — the built dashboard served by nginx, published on `localhost:5173`
+
+`research` is not part of the default `up` — the backend already runs it nightly
+and exposes a "run now" trigger from the dashboard. Run it on demand instead:
+
+```bash
+docker compose run --rm research
+```
+
+Notes specific to running this way:
+
+- **Same `.env`, same ports as local dev** — `CORS_ORIGINS=http://localhost:5173`
+  and the dashboard's default API base of `http://localhost:8000` (both already in
+  `.env.example`) work unchanged, since the browser talks to the containers over
+  these published host ports either way.
+- **The SQLite database and Questrade token are bind-mounted**, not baked into the
+  image (`./autotrader.db` and `./questrade_token.json`), so they persist across
+  `docker compose down`/`up` the same file a non-Docker run would use. If you're on
+  `BROKER=questrade`, `touch questrade_token.json` before the first `up` — Docker
+  turns a bind-mount source that doesn't exist yet into a directory instead of a
+  file, which breaks the token cache.
+- **`BROKER=ibkr`**: TWS/Gateway still runs on your host, not in a container — set
+  `IBKR_HOST=host.docker.internal` in `.env` so the `engine`/`backend` containers
+  can reach it (already wired up in `docker-compose.yml` via `extra_hosts`).
+- **No interactive live-trading prompt here** — same reasoning as Option B's
+  `launchd`/`systemd` units: a backgrounded container has no terminal to answer
+  `make run-alpaca-live`'s "type yes" confirmation. The `engine` service just runs
+  whatever `BROKER`/`ALPACA_PAPER`/`RUN_SCRIPT` you've set in `.env`, live included
+  — treat editing `.env` to go live as the deliberate action, the same way typing
+  `yes` is outside Docker.
+
+`make docker-build` / `make docker-up` / `make docker-down` / `make docker-logs`
+wrap the equivalent `docker compose` commands.
 
 ### Going live (real money)
 

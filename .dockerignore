@@ -1,0 +1,16 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.db
+*.log
+.env
+.git/
+.gitignore
+frontend/
+tests/
+.pytest_cache/
+.trunk/
+.claude/
+questrade_token.json
+backtest_result.html

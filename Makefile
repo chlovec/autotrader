@@ -13,7 +13,7 @@ IBKR_LIVE_PORT ?= 7496
 BACKEND_HOST ?= 127.0.0.1
 BACKEND_PORT ?= 8000
 
-.PHONY: help run-alpaca-sim run-alpaca-live run-ibkr-sim run-ibkr-live research backend dashboard stop restart
+.PHONY: help run-alpaca-sim run-alpaca-live run-ibkr-sim run-ibkr-live research backend dashboard stop restart docker-build docker-up docker-down docker-logs
 
 help:
 	@echo "Autoloader run targets (all run $(RUN_SCRIPT); override with RUN_SCRIPT=run.py):"
@@ -26,6 +26,10 @@ help:
 	@echo "  dashboard        Start the React dashboard (UI) dev server - needs 'backend' running in another terminal"
 	@echo "  restart          Background backend+dashboard+trading loop+research (bin/restart.sh); BROKER=/MODE= or interactive"
 	@echo "  stop             Kill whatever 'restart' (or a previous manual run) started (bin/stop.sh)"
+	@echo "  docker-build     Build the backend/engine and dashboard images"
+	@echo "  docker-up        Start backend+engine+dashboard in containers (see docker-compose.yml)"
+	@echo "  docker-down      Stop and remove the containers docker-up started"
+	@echo "  docker-logs      Tail logs from all running containers"
 
 run-alpaca-sim:
 	BROKER=alpaca ALPACA_PAPER=true $(PYTHON) $(RUN_SCRIPT) & \
@@ -60,3 +64,15 @@ restart:
 
 stop:
 	@bin/stop.sh
+
+docker-build:
+	docker compose build
+
+docker-up:
+	docker compose up -d --build
+
+docker-down:
+	docker compose down
+
+docker-logs:
+	docker compose logs -f
