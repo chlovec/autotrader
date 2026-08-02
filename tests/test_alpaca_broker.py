@@ -6,29 +6,16 @@ from alpaca.common.exceptions import APIError
 
 from engine.brokers.alpaca_broker import AlpacaBroker, _default_start
 from engine.brokers.base import Timeframe
-from engine.config import Config
+from engine.config import AccountCredentials
 
 
-def _config() -> Config:
-    return Config(
+def _config() -> AccountCredentials:
+    return AccountCredentials(
         broker="alpaca",
         alpaca_api_key="key",
         alpaca_secret_key="secret",
         alpaca_base_url="https://paper-api.alpaca.markets",
         alpaca_paper=True,
-        ibkr_host="127.0.0.1",
-        ibkr_port=7497,
-        ibkr_client_id=1,
-        questrade_refresh_token="token",
-        questrade_poll_interval_seconds=5.0,
-        max_position_size_usd=1000.0,
-        max_daily_loss_usd=200.0,
-        smtp_host="",
-        smtp_port=587,
-        smtp_username="",
-        smtp_password="",
-        alert_email_from="",
-        alert_email_to="",
     )
 
 

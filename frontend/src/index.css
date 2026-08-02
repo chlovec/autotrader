@@ -510,6 +510,69 @@ tr.clickable-row:focus-visible {
   color: var(--status-good);
 }
 
+.badge-inactive {
+  background: color-mix(in srgb, var(--text-muted) 18%, transparent);
+  color: var(--text-muted);
+}
+
+/* Accounts table / small inline actions */
+
+.btn-small {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-1);
+  color: var(--text-primary);
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.btn-small:hover:not(:disabled) {
+  background: var(--page);
+}
+
+.btn-small:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.account-subtitle {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* Trading limits panel */
+
+.limits-panel {
+  display: flex;
+  align-items: flex-end;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.limits-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.limits-field input {
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--page);
+  color: var(--text-primary);
+  font-size: 13px;
+  width: 160px;
+}
+
 /* Research detail modal */
 
 .modal-backdrop {

@@ -1,37 +1,37 @@
 import datetime as dt
 import json
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
 from db.models import SignalAction
-from engine.brokers import questrade_broker
 from engine.brokers.questrade_broker import QuestradeBroker
-from engine.config import Config
+from engine.config import AccountCredentials
 
 
-def _config(refresh_token: str = "seed-token") -> Config:
-    return Config(
-        broker="questrade",
-        alpaca_api_key="",
-        alpaca_secret_key="",
-        alpaca_base_url="",
-        alpaca_paper=True,
-        ibkr_host="127.0.0.1",
-        ibkr_port=7497,
-        ibkr_client_id=1,
-        questrade_refresh_token=refresh_token,
-        questrade_poll_interval_seconds=5.0,
-        max_position_size_usd=1000.0,
-        max_daily_loss_usd=200.0,
-        smtp_host="",
-        smtp_port=587,
-        smtp_username="",
-        smtp_password="",
-        alert_email_from="",
-        alert_email_to="",
-    )
+def _credentials(refresh_token: str = "seed-token") -> AccountCredentials:
+    return AccountCredentials(broker="questrade", questrade_refresh_token=refresh_token, questrade_poll_interval_seconds=5.0)
+
+
+@pytest.fixture
+def cache_path(tmp_path):
+    return tmp_path / "questrade_token.json"
+
+
+def _broker(refresh_token: str = "seed-token", cache_path=None) -> QuestradeBroker:
+    """cache_path always gets overridden, even when the caller doesn't pass one - a real
+    QuestradeBroker writes to disk on _authenticate(), and no test here should ever touch
+    a real file in the project root (see the bug this replaced: a test that hit the 401
+    reauth path without overriding the path wrote a real questrade_token_acct1.json into
+    the repo)."""
+    broker = QuestradeBroker(_credentials(refresh_token), account_id="acct1")
+    if cache_path is None:
+        cache_path = Path(tempfile.mkdtemp()) / "questrade_token.json"
+    broker._token_cache_path = cache_path
+    return broker
 
 
 def _fake_response(json_data: dict, status_code: int = 200) -> SimpleNamespace:
@@ -42,13 +42,6 @@ def _fake_response(json_data: dict, status_code: int = 200) -> SimpleNamespace:
     return SimpleNamespace(status_code=status_code, json=lambda: json_data, raise_for_status=raise_for_status)
 
 
-@pytest.fixture(autouse=True)
-def _isolated_token_cache(tmp_path, monkeypatch):
-    cache_path = tmp_path / "questrade_token.json"
-    monkeypatch.setattr(questrade_broker, "_TOKEN_CACHE_PATH", cache_path)
-    return cache_path
-
-
 AUTH_RESPONSE = {
     "access_token": "access-1",
     "api_server": "https://api01.iq.questrade.com/",
@@ -56,26 +49,38 @@ AUTH_RESPONSE = {
 }
 
 
-def test_authenticate_stores_new_refresh_token(_isolated_token_cache):
+def test_authenticate_stores_new_refresh_token(cache_path):
     with patch("engine.brokers.questrade_broker.requests.get", return_value=_fake_response(AUTH_RESPONSE)) as mock_get:
-        broker = QuestradeBroker(_config())
+        broker = _broker(cache_path=cache_path)
         broker._authenticate()
 
     mock_get.assert_called_once()
     assert mock_get.call_args.kwargs["params"]["refresh_token"] == "seed-token"
     assert broker._access_token == "access-1"
     assert broker._api_server == "https://api01.iq.questrade.com"  # trailing slash stripped
-    assert json.loads(_isolated_token_cache.read_text()) == {"refresh_token": "rotated-token-1"}
+    assert json.loads(cache_path.read_text()) == {"refresh_token": "rotated-token-1"}
 
 
-def test_second_instance_uses_cached_rotated_token(_isolated_token_cache):
-    _isolated_token_cache.write_text(json.dumps({"refresh_token": "rotated-token-1"}))
+def test_second_instance_uses_cached_rotated_token(cache_path):
+    cache_path.write_text(json.dumps({"refresh_token": "rotated-token-1"}))
 
     with patch("engine.brokers.questrade_broker.requests.get", return_value=_fake_response(AUTH_RESPONSE)) as mock_get:
-        broker = QuestradeBroker(_config(refresh_token="seed-token"))
+        broker = _broker(refresh_token="seed-token", cache_path=cache_path)
         broker._authenticate()
 
     assert mock_get.call_args.kwargs["params"]["refresh_token"] == "rotated-token-1"
+
+
+def test_two_accounts_use_independent_token_caches(tmp_path):
+    """The whole point of scoping the cache file by account_id: two Questrade accounts in
+    one deployment must never read/write each other's rotated refresh token."""
+    broker1 = QuestradeBroker(_credentials("token-1"), account_id="acct1")
+    broker2 = QuestradeBroker(_credentials("token-2"), account_id="acct2")
+    broker1._token_cache_path = tmp_path / "questrade_token_acct1.json"
+    broker2._token_cache_path = tmp_path / "questrade_token_acct2.json"
+
+    assert broker1._current_refresh_token() == "token-1"
+    assert broker2._current_refresh_token() == "token-2"
 
 
 def test_get_account_parses_usd_combined_balance():
@@ -85,7 +90,7 @@ def test_get_account_parses_usd_combined_balance():
             {"currency": "USD", "totalEquity": 10000.0, "cash": 4000.0, "buyingPower": 16000.0},
         ]
     }
-    broker = QuestradeBroker(_config())
+    broker = _broker()
     broker._access_token = "token"
     broker._api_server = "https://api.example.com"
     broker._account_id = "123"
@@ -111,7 +116,7 @@ def test_get_positions_translates_openpnl_field():
             }
         ]
     }
-    broker = QuestradeBroker(_config())
+    broker = _broker()
     broker._access_token = "token"
     broker._api_server = "https://api.example.com"
     broker._account_id = "123"
@@ -134,7 +139,7 @@ def test_get_clock_open_during_market_hours():
             }
         ]
     }
-    broker = QuestradeBroker(_config())
+    broker = _broker()
     broker._access_token = "token"
     broker._api_server = "https://api.example.com"
 
@@ -152,7 +157,7 @@ def test_get_clock_open_during_market_hours():
 
 
 def test_submit_market_order_builds_correct_request_body():
-    broker = QuestradeBroker(_config())
+    broker = _broker()
     broker._access_token = "token"
     broker._api_server = "https://api.example.com"
     broker._account_id = "123"
@@ -171,7 +176,7 @@ def test_submit_market_order_builds_correct_request_body():
 
 
 def test_request_reauthenticates_once_on_401():
-    broker = QuestradeBroker(_config())
+    broker = _broker()
     broker._access_token = "stale-token"
     broker._api_server = "https://api.example.com"
 

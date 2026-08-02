@@ -1,28 +1,32 @@
 # Autotrader
 
-An autotrader that connects to your brokerage account, decides what to trade based
+An autotrader that connects to your brokerage account(s), decides what to trade based
 on a pluggable strategy, places orders automatically, and exposes a dashboard to
-monitor what it's doing. Three brokers are supported — [Alpaca](https://alpaca.markets),
+monitor what it's doing. Trades **multiple accounts** at once, each with its own
+broker, credentials, strategy, and risk limits — a main dashboard lists every account's
+live summary (equity/cash/P&L), and clicking one opens its own detail page. Three
+brokers are supported per account — [Alpaca](https://alpaca.markets),
 [Interactive Brokers](https://www.interactivebrokers.com), and
-[Questrade](https://www.questrade.com) — selected with one `BROKER` env var; see
-[Brokers](#brokers) for setup. The goal is to trade a real account with real money;
-it's currently validated against Alpaca's paper (simulated) account while the
-strategy and infrastructure prove themselves out, with live trading a one-line
-config flip away once you're ready — see [Going live](#going-live-real-money).
+[Questrade](https://www.questrade.com) — see [Brokers](#brokers) for setup. The goal is
+to trade real accounts with real money; it's currently validated against Alpaca's paper
+(simulated) account while the strategy and infrastructure prove themselves out, with
+live trading a one-line config flip away once you're ready — see
+[Going live](#going-live-real-money).
 
-**Current strategy**: an equal-weight SPY / TLT / GLD portfolio, rebalanced monthly.
-This was chosen after backtesting several single-asset signal strategies
+**Current default strategy**: an equal-weight SPY / TLT / GLD portfolio, rebalanced
+monthly. This was chosen after backtesting several single-asset signal strategies
 (moving-average crossover, RSI mean-reversion, an ADX regime-switching composite) —
 none of them beat simply holding SPY on a risk-adjusted basis, while the diversified
-portfolio did. See [ARCHITECTURE.md](ARCHITECTURE.md) for the full strategy comparison
-and how everything fits together.
+portfolio did. Each account picks its own strategy independently (see
+[Configuration](#configuration)); see [ARCHITECTURE.md](ARCHITECTURE.md) for the full
+strategy comparison and how everything fits together.
 
 ## Prerequisites
 
 - Python 3.11+ (developed on 3.14)
 - Node 20+ (developed on 22)
-- An account with one of the supported brokers — see [Brokers](#brokers) for what
-  each one needs
+- An account with one of the supported brokers, for each account you want to trade —
+  see [Brokers](#brokers) for what each one needs
 
 ## Setup
 
@@ -38,26 +42,31 @@ cd frontend && npm install && cd ..
 cp .env.example .env
 ```
 
-Edit `.env`: set `BROKER` to the one you're using, then fill in that broker's
-section below it (see [Brokers](#brokers) for what each needs). Every field is also
-documented inline in `.env.example`; see [Configuration](#configuration) for a
-summary table.
+Edit `.env`: list every account you want to trade in `ACCOUNT_IDS` (comma-separated
+ids, e.g. `alpaca_paper,ibkr_main`), then for each id fill in its
+`ACCOUNT_<id>_BROKER` and that broker's fields (see [Brokers](#brokers) for what each
+needs). Every field is also documented inline in `.env.example`; see
+[Configuration](#configuration) for a summary table. The first time the backend or
+engine starts, each id in `ACCOUNT_IDS` gets a row in the database (active by default)
+— from then on, activation, strategy limits, and the kill switch are edited from the
+dashboard, not `.env`.
 
 ## Brokers
 
-Three are supported, picked via the `BROKER` env var. Only Alpaca has actually been
-run against a live account by this project — see the caveat under each.
+Three are supported, picked per-account via that account's `ACCOUNT_<id>_BROKER` var.
+Only Alpaca has actually been run against a live account by this project — see the
+caveat under each.
 
-### Alpaca (`BROKER=alpaca`)
+### Alpaca (`ACCOUNT_<id>_BROKER=alpaca`)
 
 The most complete integration, and the only one verified end-to-end (real paper
 trades placed, confirmed via the dashboard). Sign up at
 [alpaca.markets](https://alpaca.markets), grab paper-trading API keys from the
-[paper dashboard](https://app.alpaca.markets/paper/dashboard/overview), and set
-`ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in `.env`. No local software needed —
-it's a pure REST/WebSocket API.
+[paper dashboard](https://app.alpaca.markets/paper/dashboard/overview), and set that
+account's `ACCOUNT_<id>_ALPACA_API_KEY` / `ACCOUNT_<id>_ALPACA_SECRET_KEY` in `.env`.
+No local software needed — it's a pure REST/WebSocket API.
 
-### Interactive Brokers (`BROKER=ibkr`)
+### Interactive Brokers (`ACCOUNT_<id>_BROKER=ibkr`)
 
 **Untested against a live account** — built against `ib_async`'s actual installed
 API (method and field names were checked directly, not just remembered from docs),
@@ -74,12 +83,16 @@ software you keep running and logged into:
 2. Enable API access: File → Global Configuration → API → Settings → check "Enable
    ActiveX and Socket Clients", and make sure "Read-Only API" is **unchecked** (or
    this app can read your account but never place orders).
-3. Set `IBKR_PORT` in `.env` to match: `7497` for TWS paper (the default),
-   `7496` for TWS live, `4002` for Gateway paper, `4001` for Gateway live.
-4. Leave TWS/Gateway running whenever the engine runs — there's no key/secret to
+3. Set that account's `ACCOUNT_<id>_IBKR_PORT` in `.env` to match: `7497` for TWS
+   paper (the default), `7496` for TWS live, `4002` for Gateway paper, `4001` for
+   Gateway live.
+4. If you're connecting more than one IBKR account to the same TWS/Gateway
+   instance, give each a distinct `ACCOUNT_<id>_IBKR_CLIENT_ID` — TWS rejects two
+   simultaneous connections sharing a client id.
+5. Leave TWS/Gateway running whenever the engine runs — there's no key/secret to
    configure because authentication *is* being logged into that software.
 
-### Questrade (`BROKER=questrade`)
+### Questrade (`ACCOUNT_<id>_BROKER=questrade`)
 
 **Untested against a live account** — built against Questrade's public API
 documentation, covered by tests against mocked HTTP responses matching that
@@ -90,20 +103,24 @@ against a real response. Verify it yourself before trusting it with money.
    [App Hub](https://login.questrade.com/APIAccess/UserApps.aspx) (use a
    [practice account](https://www.questrade.com/api/documentation/getting-started)
    for simulated trading — same API, separate App Hub/token).
-2. Set `QUESTRADE_REFRESH_TOKEN` in `.env` to that token.
+2. Set that account's `ACCOUNT_<id>_QUESTRADE_REFRESH_TOKEN` in `.env` to that
+   token.
 3. That's it for setup, but know this going in: Questrade refresh tokens are
    **single-use** — every API session exchanges it for a new one, invalidating the
    old. This app handles that automatically (the current token gets cached in
-   `questrade_token.json`, gitignored, which takes over from the `.env` value after
-   the first run), but if you ever manually re-generate a token in the App Hub
-   while a cached one already exists, delete `questrade_token.json` first so the
-   new seed token actually gets used.
+   `questrade_token_<id>.json`, gitignored, which takes over from the `.env` value
+   after the first run), but if you ever manually re-generate a token in the App
+   Hub while a cached one already exists, delete that account's
+   `questrade_token_<id>.json` first so the new seed token actually gets used.
 
 ## Running it
 
 Three independent processes make up the running app. Each is a plain long-running
 process — there's no process manager wiring them together, so open a separate
-terminal (or use `nohup ... &`) for each.
+terminal (or use `nohup ... &`) for each. Unlike before, there's only **one** trading
+process (`run_engine.py`) regardless of how many accounts or brokers you're trading —
+each cycle it loops over every active account and trades it with that account's own
+broker connection and assigned strategy.
 
 ### Quick start: all of it in one command
 
@@ -113,15 +130,13 @@ research run for you — the backend, the dashboard, the trading loop, and
 terminals:
 
 ```bash
-make restart                       # prompts for broker
-make restart BROKER=alpaca
-make restart BROKER=ibkr
+make restart
 ```
 
-Paper vs live isn't a choice this makes - it comes entirely from `.env`
-(`ALPACA_PAPER`, `IBKR_PORT`, ...), same as any other `engine/config.py` value, and
-applies to the backend, trading loop, and research run alike. Output goes to
-`services.log`; stop everything it started with:
+Which broker(s)/paper-vs-live each account uses comes entirely from `.env` (each
+account's own `ACCOUNT_<id>_*` vars) — there's no per-run broker selection anymore,
+since one run now trades every active account, possibly across several different
+brokers at once. Output goes to `services.log`; stop everything it started with:
 
 ```bash
 make stop
@@ -133,10 +148,10 @@ how they were started — including a stray process from a previous session. The
 rest of this section covers running each piece by hand, useful if you want them in
 separate terminals you can watch individually.
 
-### 0. Research (needs at least one run before `run.py` has anything to trade)
+### 0. Research (needs at least one run before any signal-strategy account has anything to trade)
 
 The backend (started in step 2 below) automatically runs research every night at
-2am ET, and the dashboard (step 3) has a "Run research now" button and a "Run
+2am ET, and the dashboard's main page has a "Run research now" button and a "Run
 nightly" toggle — once the backend is running, that's normally all you need. To run
 it by hand instead (before the backend's first nightly run, or on a box that
 doesn't run the backend persistently, e.g. via an OS-level cron job):
@@ -151,52 +166,39 @@ Screens the fixed symbol universe in `engine/research_runner.py`'s
 `DEFAULT_UNIVERSE` (edit that constant to change which tickers are considered),
 scores each on a technical (price/volume) and a news layer, and writes the results
 to the `research_results` table — see [ARCHITECTURE.md](ARCHITECTURE.md) for how
-scoring works and how the backend's nightly job/toggle/button fit together. Never
-places an order, only reads market data/news and writes to the database.
+scoring works, how the backend's nightly job/toggle/button fit together, and which
+account's broker connection research borrows for market data. Never places an
+order, only reads market data/news and writes to the database.
 
-`run.py`'s signal-based trading loop trades whichever symbols the most recent
-research run selected (top 10 by combined score) — if `research_results` is empty,
-`run.py` logs a warning and skips its cycle instead of trading nothing.
-`run_portfolio.py` is unaffected — it always trades its own fixed `target_weights`,
-not the research watchlist.
+Research is global, shared by every account assigned a signal-based strategy
+(`ma_crossover`, `mean_reversion`, `regime_switching`) — those accounts trade
+whichever symbols the most recent research run selected (top 10 by combined score);
+if `research_results` is empty, such an account logs a warning and skips its cycle
+instead of trading nothing. Accounts assigned `rebalancing_portfolio` are
+unaffected — they always trade their own fixed `target_weights`, not the research
+watchlist.
 
 ### 1. The trading engine
 
 ```bash
-.venv/bin/python run_portfolio.py
+.venv/bin/python run_engine.py
+# or
+make run-engine
 ```
 
-Runs the live diversified-portfolio strategy: rebalances SPY/TLT/GLD to equal weight
-once a month (first trading day of the month, 9:35am ET), and once immediately on
-startup. Logs to stdout — redirect to a file if running unattended:
+Each cycle (weekdays at 9:35am ET, plus once immediately on startup), loops over
+every account marked active in the dashboard and trades it with whatever strategy
+it's assigned — a signal strategy trades daily, `rebalancing_portfolio` only
+actually rebalances once a month but is checked every cycle (idempotent, so this is
+safe). One account's failure is logged and never blocks the others. Logs to
+stdout — redirect to a file if running unattended:
 
 ```bash
-nohup .venv/bin/python run_portfolio.py > portfolio_runner.log 2>&1 &
+nohup .venv/bin/python run_engine.py > engine.log 2>&1 &
 ```
 
-A `Makefile` wraps this with the broker/mode combination baked in, so you don't
-have to remember which flags to pass:
-
-```bash
-make run-alpaca-sim    # Alpaca, paper trading
-make run-alpaca-live   # Alpaca, real money - asks you to type "yes" first
-make run-ibkr-sim      # IBKR, paper trading (TWS port 7497)
-make run-ibkr-live     # IBKR, real money (TWS port 7496) - asks you to type "yes" first
-make help              # list targets and current port/script settings
-```
-
-These pass `--broker` and the paper/live flag as CLI args for that one invocation —
-they don't touch `.env`, and `--alpaca-paper false` automatically picks up
-`ALPACA_LIVE_API_KEY`/`ALPACA_LIVE_SECRET_KEY` instead of the paper pair (see
-[Configuration](#configuration)). Using IB Gateway instead of TWS, or non-default
-ports? `make run-ibkr-sim IBKR_SIM_PORT=4002`. Want to run one of the alternative
-single-asset strategies instead of the deployed portfolio rebalancer? `make
-run-alpaca-sim RUN_SCRIPT=run.py` (edit `run.py` first to pick which strategy —
-see [ARCHITECTURE.md](ARCHITECTURE.md) for what each does and why they aren't the
-default).
-
-Don't run two of these at once against the same account unless you've deliberately
-sized `MAX_POSITION_SIZE_USD` for that — they aren't aware of each other's positions.
+Don't run two of these at once — accounts aren't aware of a second process also
+acting on their behalf.
 
 ### 2. The backend API
 
@@ -206,18 +208,22 @@ nohup .venv/bin/uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 > back
 make backend
 ```
 
-Serves `/positions`, `/equity`, `/trades`, `/signals`, `/events`, `/kill-switch`,
-`/research`, `/research/schedule`, `/research/status`, `/research/run`, and a `/ws`
-WebSocket, all reading from the same SQLite database the engine writes to (plus one
-live call to whichever broker is configured for `/positions`). Health check: `curl
-localhost:8000/health`.
+Serves `/accounts` (every account's summary), `/accounts/{id}` and its
+`/positions`/`/equity`/`/trades`/`/signals`/`/kill-switch`/`/limits` sub-resources,
+`/events`, `/research`, `/research/schedule`, `/research/status`, `/research/run`,
+and a `/ws/accounts/{id}` WebSocket per account — all reading from the same SQLite
+database the engine writes to (plus one live broker call per active account for its
+positions). Health check: `curl localhost:8000/health`.
 
-This process also *runs* research: on startup it registers a nightly job (2am ET,
-skipped if the dashboard's "Run nightly" toggle is off) and exposes the "Run
-research now" trigger — see [ARCHITECTURE.md](ARCHITECTURE.md#backend--the-api-plus-the-nightly-research-scheduler)
-for why that scheduling lives here rather than in `run_research.py`. This means the
-backend now needs the same Alpaca credentials `run_research.py` does (see
-[Configuration](#configuration)) even if you trade through IBKR/Questrade.
+On startup this process opens one broker connection per **active** account and keeps
+it open for live position/equity/trade streaming — activating or deactivating an
+account from the dashboard opens/closes that connection at runtime. This process
+also *runs* research: on startup it registers a nightly job (2am ET, skipped if the
+dashboard's "Run nightly" toggle is off) and exposes the "Run research now" trigger
+— see [ARCHITECTURE.md](ARCHITECTURE.md#backend--the-api-plus-the-nightly-research-scheduler)
+for why that scheduling lives here rather than in `run_research.py`. Research
+borrows the first active account's broker connection for market data — the backend
+needs at least one active account configured for research to run.
 
 ### 3. The dashboard
 
@@ -227,12 +233,15 @@ cd frontend && nohup npm run dev > ../frontend.log 2>&1 &
 make dashboard
 ```
 
-Open `http://localhost:5173`. It polls the backend every 15 seconds and listens on
-the WebSocket for live equity ticks. The kill switch button is real — it flips the
-same database row the engine checks before every trading cycle. The Research card
-shows the most recent run's scored symbols (click one for its rationale and score
-breakdown), a "Run nightly" toggle for the backend's automatic schedule, and a "Run
-research now" button that triggers an on-demand run regardless of that toggle.
+Open `http://localhost:5173`. The **main page** lists every account (active and
+inactive) with its live equity/cash/unrealized P&L, an activate/deactivate button,
+the Research card (scored symbols, "Run nightly" toggle, "Run research now"
+button), and System Events. Click an account to open its **detail page**
+(`/accounts/<id>`): equity chart, positions, trade log, signal history, the kill
+switch (per-account — flips that account's own database row, checked before every
+one of *its* trading cycles), and editable trading limits (max position size, max
+daily loss). Both pages poll the backend every 15 seconds; the detail page also
+listens on that account's WebSocket for live equity/position/trade ticks.
 
 ### Stopping everything
 
@@ -247,7 +256,7 @@ loop, backend, dashboard, and any still-running research run no matter which of 
 methods above started them. Equivalent by hand, if you'd rather not use the script:
 
 ```bash
-pkill -f run_portfolio.py
+pkill -f run_engine.py
 pkill -f "uvicorn backend.app.main"
 pkill -f "vite"
 ```
@@ -255,21 +264,22 @@ pkill -f "vite"
 ## Configuration
 
 All configuration is environment variables, loaded from `.env` (see `.env.example`
-for the full list with defaults):
+for the full list with defaults). Two kinds: a handful of genuinely global settings,
+and a repeated `ACCOUNT_<id>_*` block per account.
 
 | Variable | Purpose |
 | --- | --- |
-| `BROKER` | `alpaca`, `ibkr`, or `questrade` — see [Brokers](#brokers). Implementation details in [ARCHITECTURE.md](ARCHITECTURE.md) |
-| `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` | Your Alpaca **paper** API credentials — read whenever `ALPACA_PAPER=true`, regardless of `BROKER`. Trading only uses them when `BROKER=alpaca`, but the research news layer (`run_research.py`, and the backend's nightly job/"Run research now" button) always uses them (Alpaca's News API), even when trading through IBKR/Questrade — set a free Alpaca paper key pair for that alone if needed |
-| `ALPACA_LIVE_API_KEY` / `ALPACA_LIVE_SECRET_KEY` | Your Alpaca **live** API credentials (a separate account) — only read when `BROKER=alpaca` and `ALPACA_PAPER=false` |
-| `ALPACA_BASE_URL` | Alpaca endpoint (paper by default) |
-| `ALPACA_PAPER` | `true` for paper trading, `false` for live — see [Going live](#going-live-real-money). `make run-alpaca-sim`/`run-alpaca-live` set this for you |
-| `IBKR_HOST` / `IBKR_PORT` / `IBKR_CLIENT_ID` | Connection details for a locally running TWS/Gateway — only read when `BROKER=ibkr` |
-| `QUESTRADE_REFRESH_TOKEN` | Seed OAuth token — only read when `BROKER=questrade`, and only until the first run (see [Brokers](#brokers)) |
-| `DATABASE_URL` | Where trades/signals/equity history is stored (SQLite file by default) |
-| `MAX_POSITION_SIZE_USD` | Per-symbol position cap for the signal-based strategies (`run.py`) — not used by the portfolio rebalancer, which sizes by target weight instead |
-| `MAX_DAILY_LOSS_USD` | If today's equity drop exceeds this, both runners halt all trading for the day |
-| `SMTP_*` / `ALERT_EMAIL_*` | Optional email alerts on errors, kill-switch trips, and daily-loss halts. Leave blank to skip — macOS notifications fire regardless, with no setup needed |
+| `ACCOUNT_IDS` | Comma-separated list of account ids this deployment trades — every id needs a matching `ACCOUNT_<id>_*` block below |
+| `ACCOUNT_<id>_BROKER` | `alpaca`, `ibkr`, or `questrade` for that account — see [Brokers](#brokers). Implementation details in [ARCHITECTURE.md](ARCHITECTURE.md) |
+| `ACCOUNT_<id>_DISPLAY_NAME` | Shown on the dashboard for that account (defaults to the id itself) |
+| `ACCOUNT_<id>_ALPACA_API_KEY` / `_ALPACA_SECRET_KEY` / `_ALPACA_BASE_URL` / `_ALPACA_PAPER` | That account's Alpaca paper credentials/endpoint, plus `_ALPACA_LIVE_API_KEY`/`_ALPACA_LIVE_SECRET_KEY`/`_ALPACA_LIVE_BASE_URL` for live (only read when `_ALPACA_PAPER=false`) |
+| `ACCOUNT_<id>_IBKR_HOST` / `_IBKR_PORT` / `_IBKR_CLIENT_ID` | Connection details for that account's TWS/Gateway — `_IBKR_CLIENT_ID` must be unique per account sharing a TWS/Gateway instance |
+| `ACCOUNT_<id>_QUESTRADE_REFRESH_TOKEN` / `_QUESTRADE_POLL_INTERVAL_SECONDS` | Seed OAuth token (only until that account's first run — see [Brokers](#brokers)) and polling cadence for that account's simulated stream |
+| `ACCOUNT_<id>_STRATEGY` / `_STRATEGY_PARAMS` | Only read the first time that id appears — after that, the assigned strategy is dashboard/database state, not `.env`. One of `ma_crossover`, `mean_reversion`, `regime_switching`, `rebalancing_portfolio`; `_STRATEGY_PARAMS` is JSON constructor kwargs (e.g. `{"target_weights": {...}}` for the rebalancer) |
+| `ALPACA_NEWS_API_KEY` / `ALPACA_NEWS_SECRET_KEY` | Global — research's news layer (`run_research.py`, and the backend's nightly job/"Run research now" button) always uses Alpaca's News API regardless of any account's broker; set a free Alpaca paper key pair here |
+| `DATABASE_URL` | Where account state/trades/signals/equity history is stored (SQLite file by default) |
+| `MAX_POSITION_SIZE_USD` / `MAX_DAILY_LOSS_USD` | Global — only used to seed a newly-discovered account's limits the first time its id appears; edit an account's actual limits from its dashboard page afterward |
+| `SMTP_*` / `ALERT_EMAIL_*` | Global. Optional email alerts on errors, kill-switch trips, and daily-loss halts. Leave blank to skip — macOS notifications fire regardless, with no setup needed |
 
 ## Testing
 
@@ -277,11 +287,11 @@ for the full list with defaults):
 .venv/bin/python -m pytest tests/ -q
 ```
 
-65 tests covering strategy logic, risk checks, portfolio rebalancing math, the
-notification system, config's paper/live key selection, and all three broker
-integrations — all using synthetic data, in-memory databases, or mocked
-network/socket calls, no live credentials or network
-access required.
+124 tests covering strategy logic, risk checks, portfolio rebalancing math, the
+notification system, per-account credential loading, the multi-account runner's
+dispatch/isolation behavior, and all three broker integrations — all using synthetic
+data, in-memory databases, or mocked network/socket calls, no live credentials or
+network access required.
 
 ## Backtesting
 
@@ -305,14 +315,16 @@ led to the current default.
 
 ## Safety features
 
-- **Kill switch**: a manual stop, toggleable from the dashboard or `POST
-  /kill-switch`. Checked before every trading cycle.
-- **Daily loss limit**: if equity drops more than `MAX_DAILY_LOSS_USD` since the
-  first snapshot of the day, both runners halt all trading until the next day.
+- **Kill switch**: a manual stop, per account — toggleable from that account's
+  dashboard page or `POST /accounts/{id}/kill-switch`. Checked before every one of
+  that account's trading cycles; other accounts are unaffected.
+- **Daily loss limit**: per account — if an account's equity drops more than its
+  own `max_daily_loss_usd` since the first snapshot of the day, that account halts
+  trading until the next day. Editable from its dashboard page.
 - **Alerts**: order failures, kill-switch engagements, and daily-loss halts trigger
   a macOS notification and (if configured) an email — not just a log line.
 
-None of this replaces watching the account yourself, especially in the first weeks.
+None of this replaces watching the accounts yourself, especially in the first weeks.
 
 ## Deploying
 
@@ -323,44 +335,39 @@ same commands somewhere that stays on, either directly (Options A/B) or in
 containers (Option C).
 
 Unattended deployment (`launchd`, `systemd`) should invoke `.venv/bin/python
-run_portfolio.py` directly with explicit `--broker`/`--alpaca-paper`/`--ibkr-port`
-flags (e.g. `ProgramArguments: [".venv/bin/python", "run_portfolio.py", "--broker",
-"alpaca", "--alpaca-paper", "false"]`) — every flag not passed falls back to its
-`.env`/environment-variable value, same as `BROKER`/`ALPACA_PAPER`/`IBKR_PORT`
-worked before, but explicit in the service definition itself rather than relying on
-ambient env vars. **Not** `make run-alpaca-live` / `make run-ibkr-live` — those two
-prompt for interactive confirmation on purpose, which just hangs forever with no
-terminal attached to answer it. The `make` targets are for you, running something
-by hand and meaning to; a service definition should already encode that intent
-explicitly in its own config, the way the example below does.
+run_engine.py` directly — every account's broker/mode is resolved from `.env`
+(`ACCOUNT_<id>_*`), so there are no CLI flags to pass anymore. **Not** a hand-run
+`make` target with an interactive confirmation — this project no longer has one
+(there's no single "go live" flag to confirm; each account's paper/live mode is
+just its own `.env` value, so treat editing that value as the deliberate action).
 
 ### Option A: keep it on your Mac, survive reboots
 
 Use `launchd` to keep the three processes running and restart them if they crash
 or the machine reboots. Example plist for the trading engine
-(`~/Library/LaunchAgents/com.autotrader.portfolio.plist`):
+(`~/Library/LaunchAgents/com.autotrader.engine.plist`):
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.autotrader.portfolio</string>
+  <key>Label</key><string>com.autotrader.engine</string>
   <key>ProgramArguments</key>
   <array>
     <string>/path/to/autotrader/.venv/bin/python</string>
-    <string>/path/to/autotrader/run_portfolio.py</string>
+    <string>/path/to/autotrader/run_engine.py</string>
   </array>
   <key>WorkingDirectory</key><string>/path/to/autotrader</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/path/to/autotrader/portfolio_runner.log</string>
-  <key>StandardErrorPath</key><string>/path/to/autotrader/portfolio_runner.log</string>
+  <key>StandardOutPath</key><string>/path/to/autotrader/engine.log</string>
+  <key>StandardErrorPath</key><string>/path/to/autotrader/engine.log</string>
 </dict>
 </plist>
 ```
 
-Load it with `launchctl load ~/Library/LaunchAgents/com.autotrader.portfolio.plist`.
+Load it with `launchctl load ~/Library/LaunchAgents/com.autotrader.engine.plist`.
 Repeat for the backend (point `ProgramArguments` at `.venv/bin/uvicorn` with the
 same args used above). The dashboard is dev-only tooling for now (see below) — it
 doesn't need to run unattended the way the engine and backend do.
@@ -369,10 +376,10 @@ doesn't need to run unattended the way the engine and backend do.
 
 More robust than relying on a laptop staying awake. On a fresh Linux box:
 
-Note if you're on `BROKER=ibkr`: TWS/Gateway would need to run on that same server
-too (or something needs to bridge to wherever it runs) — it's real, GUI-adjacent
-software you log into, not a REST API. This makes IBKR the awkward fit for
-headless server deployment; Alpaca and Questrade, both pure remote APIs, don't
+Note if any account has `BROKER=ibkr`: TWS/Gateway would need to run on that same
+server too (or something needs to bridge to wherever it runs) — it's real,
+GUI-adjacent software you log into, not a REST API. This makes IBKR the awkward fit
+for headless server deployment; Alpaca and Questrade, both pure remote APIs, don't
 have this problem.
 
 1. Install Python 3.11+ and Node 20+.
@@ -392,13 +399,14 @@ have this problem.
    `serve`) rather than `npm run dev`.
 6. **Put the backend behind authentication before exposing it beyond
    `localhost`.** None of its endpoints require a login right now — the kill
-   switch, in particular, is an unauthenticated `POST` today. That's acceptable
-   only because it's bound to `127.0.0.1` and never exposed publicly.
+   switch and account activate/deactivate, in particular, are unauthenticated
+   `POST`s today. That's acceptable only because it's bound to `127.0.0.1` and
+   never exposed publicly.
 7. macOS notifications obviously don't work on a Linux server — configure the
    `SMTP_*` / `ALERT_EMAIL_*` variables so you still get alerted.
-8. Keep `.env` (and, if using Questrade, `questrade_token.json`) out of version
-   control and out of any logs — they hold your broker credentials and (if
-   configured) email credentials.
+8. Keep `.env` (and, for any Questrade account, its `questrade_token_<id>.json`)
+   out of version control and out of any logs — they hold your broker credentials
+   and (if configured) email credentials.
 
 ### Option C: Docker Compose
 
@@ -410,14 +418,14 @@ static `dist/` output, matching Option B's step 5 above instead of running
 `npm run dev`.
 
 ```bash
-cp .env.example .env   # fill in BROKER, keys, etc. - same file the local setup uses
+cp .env.example .env   # fill in ACCOUNT_IDS and each account's fields - same file the local setup uses
 docker compose up -d --build
 ```
 
 This starts three services:
 
 - `backend` — the FastAPI API, published on `localhost:8000`
-- `engine` — the trading loop (`RUN_SCRIPT` from `.env`, default `run_portfolio.py`)
+- `engine` — the trading loop (`run_engine.py`, every active account)
 - `dashboard` — the built dashboard served by nginx, published on `localhost:5173`
 
 `research` is not part of the default `up` — the backend already runs it nightly
@@ -434,10 +442,10 @@ docker compose down
 ```
 
 This stops and removes the `backend`/`engine`/`dashboard` containers but leaves the
-bind-mounted `autotrader.db` and `questrade_token.json` on disk, so `docker compose
-up -d --build` picks back up where you left off. Add `-v` only if you also want to
-drop any anonymous volumes Compose created — the SQLite database itself isn't one
-of those, so it's unaffected either way.
+bind-mounted `autotrader.db` on disk, so `docker compose up -d --build` picks back
+up where you left off. Add `-v` only if you also want to drop any anonymous volumes
+Compose created — the SQLite database itself isn't one of those, so it's unaffected
+either way.
 
 Notes specific to running this way:
 
@@ -445,21 +453,21 @@ Notes specific to running this way:
   and the dashboard's default API base of `http://localhost:8000` (both already in
   `.env.example`) work unchanged, since the browser talks to the containers over
   these published host ports either way.
-- **The SQLite database and Questrade token are bind-mounted**, not baked into the
-  image (`./autotrader.db` and `./questrade_token.json`), so they persist across
-  `docker compose down`/`up` the same file a non-Docker run would use. If you're on
-  `BROKER=questrade`, `touch questrade_token.json` before the first `up` — Docker
+- **The SQLite database is bind-mounted**, not baked into the image
+  (`./autotrader.db`), so it persists across `docker compose down`/`up` the same
+  file a non-Docker run would use. **Any Questrade account's token cache** needs
+  its own bind mount added to `docker-compose.yml` (`questrade_token_<id>.json`,
+  see the comment there) — `touch` it on the host before the first `up`, or Docker
   turns a bind-mount source that doesn't exist yet into a directory instead of a
   file, which breaks the token cache.
-- **`BROKER=ibkr`**: TWS/Gateway still runs on your host, not in a container — set
-  `IBKR_HOST=host.docker.internal` in `.env` so the `engine`/`backend` containers
-  can reach it (already wired up in `docker-compose.yml` via `extra_hosts`).
-- **No interactive live-trading prompt here** — same reasoning as Option B's
-  `launchd`/`systemd` units: a backgrounded container has no terminal to answer
-  `make run-alpaca-live`'s "type yes" confirmation. The `engine` service just runs
-  whatever `BROKER`/`ALPACA_PAPER`/`RUN_SCRIPT` you've set in `.env`, live included
-  — treat editing `.env` to go live as the deliberate action, the same way typing
-  `yes` is outside Docker.
+- **Any `BROKER=ibkr` account**: TWS/Gateway still runs on your host, not in a
+  container — set that account's `IBKR_HOST=host.docker.internal` in `.env` so the
+  `engine`/`backend` containers can reach it (already wired up in
+  `docker-compose.yml` via `extra_hosts`).
+- **No interactive live-trading prompt here** — a backgrounded container has no
+  terminal to answer one anyway. The `engine` service just runs whatever every
+  account's `.env` fields say, live included — treat editing `.env` to go live as
+  the deliberate action.
 
 `make docker-build` / `make docker-up` / `make docker-down` / `make docker-logs`
 wrap the equivalent `docker compose` commands.
@@ -467,36 +475,37 @@ wrap the equivalent `docker compose` commands.
 ### Going live (real money)
 
 This is the actual destination — paper trading is validation, not the end state.
-Flipping to live trading is a small config change; the judgment call of *when* is
-the part that matters:
+Flipping one account to live trading is a small config change to that account's
+`.env` block; the judgment call of *when* is the part that matters:
 
-1. **Open (or upgrade to) a live Alpaca account.** This is a separate account from
-   the paper one, requires identity verification and funding, and is a distinct set
-   of API keys from `app.alpaca.markets` (not the paper dashboard).
-2. **Watch the paper-trading results for a meaningful stretch first** — weeks, not
-   days, and ideally through at least one real rebalance cycle so you've seen the
-   full loop (signal → order → fill → dashboard update) work unattended, not just
-   in a one-off test.
-3. **Add the live keys to `.env`**, alongside the paper ones already there — don't
-   replace them:
+1. **Open (or upgrade to) a live account** with that account's broker. For Alpaca,
+   this is a separate account from the paper one, requires identity verification
+   and funding, and is a distinct set of API keys from `app.alpaca.markets` (not
+   the paper dashboard).
+2. **Watch that account's paper-trading results for a meaningful stretch first** —
+   weeks, not days, and ideally through at least one real rebalance cycle so you've
+   seen the full loop (signal → order → fill → dashboard update) work unattended,
+   not just in a one-off test.
+3. **Add the live keys to that account's `.env` block**, alongside the paper ones
+   already there — don't replace them:
 
    ```bash
-   ALPACA_LIVE_API_KEY=<your live key>
-   ALPACA_LIVE_SECRET_KEY=<your live secret>
+   ACCOUNT_<id>_ALPACA_LIVE_API_KEY=<your live key>
+   ACCOUNT_<id>_ALPACA_LIVE_SECRET_KEY=<your live secret>
    ```
 
 4. **Start small.** Fund the live account with less than you're ultimately willing
-   to allocate, and/or lower `MAX_POSITION_SIZE_USD`, so a bug costs a bounded
-   amount to discover rather than the full account.
-5. **Run `make run-alpaca-live`** instead of `run-alpaca-sim` when you actually
-   mean to go live — it sets `ALPACA_PAPER=false` for that one run (which picks up
-   the live keys from step 3) and asks you to type `yes` first. `.env` itself never
-   needs to change, so `make run-alpaca-sim` stays available for paper testing at
-   any time without undoing anything.
+   to allocate, and/or lower that account's `max_position_size_usd` from its
+   dashboard page, so a bug costs a bounded amount to discover rather than the
+   full account.
+5. **Set that account's `ACCOUNT_<id>_ALPACA_PAPER=false`** and restart the
+   engine/backend when you actually mean to go live — that one account starts
+   using its live keys from step 3; every other account keeps running unaffected,
+   paper or live, whatever it was already set to.
 6. **Everything else keeps working the same way** — the kill switch, the daily loss
    halt, the alerts, the dashboard. They're the same code paths regardless of
    `ALPACA_PAPER`; nothing extra to configure for them to apply to the live account.
 
-Nothing in this codebase enforces steps 1–4 for you — typing `yes` at the `make
-run-alpaca-live` prompt is enough to start placing real orders, so the caution has
-to come from you, not from the software.
+Nothing in this codebase enforces steps 1–4 for you — flipping `ALPACA_PAPER=false`
+in `.env` is enough to start placing real orders on that account, so the caution
+has to come from you, not from the software.

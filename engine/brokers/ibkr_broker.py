@@ -6,7 +6,7 @@ from ib_async import IB, MarketOrder, Stock
 
 from db.models import OrderSide, SignalAction
 from engine.brokers.base import AccountSnapshot, BrokerOrder, ClockSnapshot, OrderResult, PositionSnapshot, Timeframe
-from engine.config import Config
+from engine.config import AccountCredentials
 
 
 def _as_utc(moment: dt.datetime) -> dt.datetime:
@@ -72,16 +72,16 @@ class IBKRBroker:
 
     name = "ibkr"
 
-    def __init__(self, config: Config):
-        self._config = config
+    def __init__(self, credentials: AccountCredentials):
+        self._credentials = credentials
         self._ib = IB()
 
     def _ensure_connected(self) -> IB:
         if not self._ib.isConnected():
             self._ib.connect(
-                self._config.ibkr_host,
-                self._config.ibkr_port,
-                clientId=self._config.ibkr_client_id,
+                self._credentials.ibkr_host,
+                self._credentials.ibkr_port,
+                clientId=self._credentials.ibkr_client_id,
                 timeout=10,
             )
         return self._ib
@@ -210,9 +210,9 @@ class IBKRBroker:
         ib = self._ib
         if not ib.isConnected():
             await ib.connectAsync(
-                self._config.ibkr_host,
-                self._config.ibkr_port,
-                clientId=self._config.ibkr_client_id,
+                self._credentials.ibkr_host,
+                self._credentials.ibkr_port,
+                clientId=self._credentials.ibkr_client_id,
                 timeout=10,
             )
 

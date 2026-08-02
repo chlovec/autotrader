@@ -4,30 +4,11 @@ from types import SimpleNamespace
 from db.models import SignalAction
 from engine.brokers.base import Timeframe
 from engine.brokers.ibkr_broker import IBKRBroker, _duration_string, _parse_trading_hours
-from engine.config import Config
+from engine.config import AccountCredentials
 
 
-def _config() -> Config:
-    return Config(
-        broker="ibkr",
-        alpaca_api_key="",
-        alpaca_secret_key="",
-        alpaca_base_url="",
-        alpaca_paper=True,
-        ibkr_host="127.0.0.1",
-        ibkr_port=7497,
-        ibkr_client_id=1,
-        questrade_refresh_token="",
-        questrade_poll_interval_seconds=5.0,
-        max_position_size_usd=1000.0,
-        max_daily_loss_usd=200.0,
-        smtp_host="",
-        smtp_port=587,
-        smtp_username="",
-        smtp_password="",
-        alert_email_from="",
-        alert_email_to="",
-    )
+def _config() -> AccountCredentials:
+    return AccountCredentials(broker="ibkr", ibkr_host="127.0.0.1", ibkr_port=7497, ibkr_client_id=1)
 
 
 # --- _parse_trading_hours ---

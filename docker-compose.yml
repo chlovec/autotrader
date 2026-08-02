@@ -1,24 +1,27 @@
 # Containerized version of the same processes bin/restart.sh backgrounds locally -
 # see README.md "Deploying" > "Option C: Docker Compose".
 #
-# BROKER/ALPACA_PAPER/RUN_SCRIPT etc. all come from .env, same as running these by
-# hand. There's no interactive "type yes" live-trading confirmation here (no
-# terminal attached) - same reasoning README.md already gives for launchd/systemd:
-# set .env explicitly and mean it before going live this way.
+# Every account's broker/mode/strategy comes from .env's ACCOUNT_IDS/ACCOUNT_<id>_* vars
+# (see .env.example) - the engine service trades every active one, no per-process broker
+# selection anymore. There's no interactive "type yes" live-trading confirmation here (no
+# terminal attached) - same reasoning README.md already gives for launchd/systemd: set
+# .env explicitly and mean it before going live this way.
 x-python-service: &python-service
   build: .
   image: autotrader-app
   env_file: .env
-  # TWS/Gateway (BROKER=ibkr) runs on the host, not in a container - set
-  # IBKR_HOST=host.docker.internal in .env to reach it. This resolves that name
-  # on any platform (a no-op if IBKR_HOST is never used).
+  # TWS/Gateway (an account with BROKER=ibkr) runs on the host, not in a container - set
+  # that account's IBKR_HOST=host.docker.internal in .env to reach it. This resolves that
+  # name on any platform (a no-op if no account uses ibkr).
   extra_hosts:
     - "host.docker.internal:host-gateway"
   volumes:
     - ./autotrader.db:/app/autotrader.db
-    # Only needed for BROKER=questrade - `touch questrade_token.json` on the host
-    # first, or Docker will create a directory here instead of a file.
-    - ./questrade_token.json:/app/questrade_token.json
+    # Only needed for accounts with BROKER=questrade - each such account caches its
+    # rotating refresh token in questrade_token_<account id>.json (see
+    # engine/brokers/questrade_broker.py). Add one line per questrade account here,
+    # e.g. "./questrade_token_questrade_main.json:/app/questrade_token_questrade_main.json"
+    # (`touch` it on the host first, or Docker will create a directory instead of a file).
 
 services:
   backend:
@@ -30,7 +33,7 @@ services:
 
   engine:
     <<: *python-service
-    command: python ${RUN_SCRIPT:-run_portfolio.py}
+    command: python run_engine.py
     restart: unless-stopped
 
   # On-demand only - the backend already runs this nightly and exposes a

@@ -1,11 +1,14 @@
-"""Keeps the dashboard's equity/cash/positions/trades in sync with the broker in real
-time. A single BrokerClient.stream() connection (or, for Questrade, a simulated poll
-loop - see engine/brokers/questrade_broker.py) tells this module *that* something may
-have changed; _reconcile() is the one place that re-fetches the actual truth from the
-broker, writes it to the DB, and pushes it to every connected dashboard over /ws. This
-"dumb signal in, smart handling once centrally" split means the three very different
-broker event shapes (Alpaca order events, IBKR's several account/order callbacks,
-Questrade's plain timer) never need their own bespoke handling downstream.
+"""Keeps each active account's equity/cash/positions/trades in sync with its broker in real
+time. One AccountStream per active account (backend/app/main.py creates/tears these down as
+accounts are activated/deactivated) - each holds its own BrokerClient.stream() connection (or,
+for Questrade, a simulated poll loop - see engine/brokers/questrade_broker.py) that tells this
+module *that* something may have changed for *that* account; _reconcile() is the one place
+that re-fetches the actual truth from that account's broker, writes it to the DB, and pushes it
+to every dashboard connected to that account's /ws/accounts/{id}. This "dumb signal in, smart
+handling once centrally" split means the three very different broker event shapes (Alpaca order
+events, IBKR's several account/order callbacks, Questrade's plain timer) never need their own
+bespoke handling downstream - now just replicated once per active account instead of once per
+process.
 """
 
 import asyncio
@@ -24,7 +27,7 @@ from engine.brokers.base import BrokerClient, BrokerOrder
 logger = logging.getLogger("autotrader.backend.broker_stream")
 
 # Protects against a dropped/reconnecting stream (Questrade's poll loop especially, but
-# also Alpaca/IBKR if their connection silently dies) leaving the dashboard stale forever.
+# also Alpaca/IBKR if their connection silently dies) leaving a dashboard stale forever.
 RECONCILE_SAFETY_NET_INTERVAL_SECONDS = 30
 # How far back to look for orders on a cold start / after downtime, when there's no
 # Trade row yet to derive "since" from.
@@ -36,74 +39,59 @@ _STREAM_RECONNECT_DELAY_SECONDS = 5
 
 
 class ConnectionManager:
-    """Tracks connected dashboard websocket clients so _reconcile() can push to all of
-    them, replacing the old model of each connection polling the DB on its own timer."""
+    """Tracks connected dashboard websocket clients per account_id, so _reconcile() can
+    push only to the clients watching that account - replacing the old model of one global
+    connection set for the single account this backend used to run."""
 
     def __init__(self) -> None:
-        self._connections: set[WebSocket] = set()
+        self._connections: dict[str, set[WebSocket]] = {}
 
-    async def connect(self, websocket: WebSocket) -> None:
+    async def connect(self, account_id: str, websocket: WebSocket) -> None:
         await websocket.accept()
-        self._connections.add(websocket)
+        self._connections.setdefault(account_id, set()).add(websocket)
 
-    def disconnect(self, websocket: WebSocket) -> None:
-        self._connections.discard(websocket)
+    def disconnect(self, account_id: str, websocket: WebSocket) -> None:
+        self._connections.get(account_id, set()).discard(websocket)
 
-    async def broadcast(self, message: dict) -> None:
-        for websocket in list(self._connections):
+    async def broadcast(self, account_id: str, message: dict) -> None:
+        for websocket in list(self._connections.get(account_id, set())):
             try:
                 await websocket.send_json(message)
             except Exception:
-                self.disconnect(websocket)
+                self.disconnect(account_id, websocket)
 
 
 manager = ConnectionManager()
 
-_change_event = asyncio.Event()
-_reconcile_lock = asyncio.Lock()
 
-
-async def on_change() -> None:
-    """Passed to BrokerClient.stream() - called on every broker signal, regardless of
-    what it was. Never carries a payload; _reconcile_consumer re-fetches full state."""
-    _change_event.set()
-
-
-def _orders_since(session: Session, broker_name: str, account_id: str) -> dt.datetime:
+def _orders_since(session: Session, account_id: str) -> dt.datetime:
     """Derived from the DB, not in-memory state, so a restarted backend self-heals over
-    any downtime instead of missing orders placed while it was down. Scoped to the
-    currently active broker/account so a prior broker/account's order history never
-    influences this one's lookback window."""
-    latest = session.execute(
-        select(func.max(Trade.submitted_at)).where(Trade.broker == broker_name, Trade.account_id == account_id)
-    ).scalar_one_or_none()
+    any downtime instead of missing orders placed while it was down."""
+    latest = session.execute(select(func.max(Trade.submitted_at)).where(Trade.account_id == account_id)).scalar_one_or_none()
     floor = dt.datetime.utcnow() - _ORDER_LOOKBACK
     return max(latest, floor) if latest else floor
 
 
-def _upsert_trades(session: Session, broker_name: str, account_id: str, orders: list[BrokerOrder]) -> list[Trade]:
+def _upsert_trades(session: Session, account_id: str, broker_name: str, broker_account_id: str, orders: list[BrokerOrder]) -> list[Trade]:
     """Inserts unknown broker_order_ids as new Trade rows with signal_id=None (a trade
     this app didn't place, e.g. a customer trading directly through the broker's own
     UI) and patches status/fill_price/filled_at on rows that already exist. Never
     touches signal_id/symbol/side/qty on an existing row - those may have been set by
     ExecutionEngine.submit_market_order (engine/execution.py) and must survive.
 
-    Matches (and inserts) are always scoped to broker+account_id - broker_order_id alone
-    isn't a safe key across brokers (see db/models.py's Trade.__table_args__)."""
+    Matches (and inserts) are always scoped to account_id - broker_order_id alone isn't a
+    safe key across accounts (see db/models.py's Trade.__table_args__)."""
     changed: list[Trade] = []
     for order in orders:
         existing = session.execute(
-            select(Trade).where(
-                Trade.broker == broker_name,
-                Trade.account_id == account_id,
-                Trade.broker_order_id == order.broker_order_id,
-            )
+            select(Trade).where(Trade.account_id == account_id, Trade.broker_order_id == order.broker_order_id)
         ).scalar_one_or_none()
         if existing is None:
             trade = Trade(
                 signal_id=None,
-                broker=broker_name,
                 account_id=account_id,
+                broker=broker_name,
+                broker_account_id=broker_account_id,
                 broker_order_id=order.broker_order_id,
                 symbol=order.symbol,
                 side=order.side,
@@ -138,113 +126,111 @@ def _trade_dict(trade: Trade) -> dict:
     }
 
 
-async def _reconcile(broker: BrokerClient) -> None:
-    async with _reconcile_lock:
-        # get_account/get_positions/get_recent_orders are blocking REST/SDK calls with no
-        # async variant for Alpaca/Questrade - run them off-loop so a reconciliation pass
-        # doesn't stall /health, /positions, or every other connected /ws client.
-        account = await asyncio.to_thread(broker.get_account)
-        positions = await asyncio.to_thread(broker.get_positions)
-        with get_session() as session:
-            snapshot = EquitySnapshot(
-                equity=account.equity, cash=account.cash, buying_power=account.buying_power,
-                broker=broker.name, account_id=account.account_id,
-            )
-            session.add(snapshot)
-            session.flush()
-            since = _orders_since(session, broker.name, account.account_id)
-            orders = await asyncio.to_thread(broker.get_recent_orders, since)
-            changed_trades = _upsert_trades(session, broker.name, account.account_id, orders)
-            timestamp = snapshot.timestamp.isoformat()
-            trade_payloads = [_trade_dict(t) for t in changed_trades]
-            session.commit()
-
-        await manager.broadcast(
-            {
-                "type": "equity",
-                "equity": account.equity,
-                "cash": account.cash,
-                "buying_power": account.buying_power,
-                "timestamp": timestamp,
-            }
+async def _reconcile(account_id: str, broker: BrokerClient) -> None:
+    # get_account/get_positions/get_recent_orders are blocking REST/SDK calls with no
+    # async variant for Alpaca/Questrade - run them off-loop so a reconciliation pass
+    # doesn't stall /health or any other connected /ws/accounts/{id} client.
+    account = await asyncio.to_thread(broker.get_account)
+    positions = await asyncio.to_thread(broker.get_positions)
+    with get_session() as session:
+        snapshot = EquitySnapshot(
+            account_id=account_id, broker=broker.name, broker_account_id=account.account_id,
+            equity=account.equity, cash=account.cash, buying_power=account.buying_power,
         )
-        await manager.broadcast({"type": "positions", "positions": [asdict(p) for p in positions]})
-        if trade_payloads:
-            await manager.broadcast({"type": "trades", "trades": trade_payloads})
+        session.add(snapshot)
+        session.flush()
+        since = _orders_since(session, account_id)
+        orders = await asyncio.to_thread(broker.get_recent_orders, since)
+        changed_trades = _upsert_trades(session, account_id, broker.name, account.account_id, orders)
+        timestamp = snapshot.timestamp.isoformat()
+        trade_payloads = [_trade_dict(t) for t in changed_trades]
+        session.commit()
+
+    await manager.broadcast(
+        account_id,
+        {"type": "equity", "equity": account.equity, "cash": account.cash, "buying_power": account.buying_power, "timestamp": timestamp},
+    )
+    await manager.broadcast(account_id, {"type": "positions", "positions": [asdict(p) for p in positions]})
+    if trade_payloads:
+        await manager.broadcast(account_id, {"type": "trades", "trades": trade_payloads})
 
 
-async def _reconcile_consumer(broker: BrokerClient) -> None:
-    while True:
-        await _change_event.wait()
-        _change_event.clear()
-        await asyncio.sleep(_BURST_COALESCE_SECONDS)
-        _change_event.clear()
-        try:
-            await _reconcile(broker)
-        except Exception:
-            logger.exception("reconciliation failed")
+class AccountStream:
+    """One account's live-update pipeline: its broker stream/poll connection, the consumer
+    that coalesces bursts of change events into a single reconciliation pass, and a safety
+    net that reconciles on a fixed interval regardless (in case the stream connection drops
+    silently). Each active account gets its own instance - state (the change event, the
+    reconcile lock) used to be module-level globals when this backend only ever ran one
+    account; now it's per-instance so accounts' reconciliation passes never block or race
+    each other."""
 
+    def __init__(self, account_id: str, broker: BrokerClient) -> None:
+        self.account_id = account_id
+        self.broker = broker
+        self._change_event = asyncio.Event()
+        self._reconcile_lock = asyncio.Lock()
+        self._stream_task = asyncio.create_task(self._run_stream())
+        self._consumer_task = asyncio.create_task(self._reconcile_consumer())
+        self._safety_net_task = asyncio.create_task(self._safety_net_loop())
 
-async def _safety_net_loop(broker: BrokerClient) -> None:
-    while True:
-        await asyncio.sleep(RECONCILE_SAFETY_NET_INTERVAL_SECONDS)
-        try:
-            await _reconcile(broker)
-        except Exception:
-            logger.exception("safety-net reconciliation failed")
+    async def _on_change(self) -> None:
+        self._change_event.set()
 
+    async def _run_stream(self) -> None:
+        """broker.stream() can and will drop (network blip, broker-side restart) -
+        reconnect rather than letting this account's live-update pipeline die silently."""
+        while True:
+            try:
+                await self.broker.stream(self._on_change)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("[%s] broker stream died, reconnecting in %ss", self.account_id, _STREAM_RECONNECT_DELAY_SECONDS)
+                await asyncio.sleep(_STREAM_RECONNECT_DELAY_SECONDS)
 
-async def _run_broker_stream(broker: BrokerClient) -> None:
-    """broker.stream() can and will drop (network blip, broker-side restart) - reconnect
-    rather than letting the whole live-update pipeline die silently."""
-    while True:
-        try:
-            await broker.stream(on_change)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("broker stream died, reconnecting in %ss", _STREAM_RECONNECT_DELAY_SECONDS)
-            await asyncio.sleep(_STREAM_RECONNECT_DELAY_SECONDS)
+    async def _reconcile_locked(self) -> None:
+        async with self._reconcile_lock:
+            await _reconcile(self.account_id, self.broker)
 
+    async def _reconcile_consumer(self) -> None:
+        while True:
+            await self._change_event.wait()
+            self._change_event.clear()
+            await asyncio.sleep(_BURST_COALESCE_SECONDS)
+            self._change_event.clear()
+            try:
+                await self._reconcile_locked()
+            except Exception:
+                logger.exception("[%s] reconciliation failed", self.account_id)
 
-class BrokerStreamHandle:
-    def __init__(self, stream_task: asyncio.Task, consumer_task: asyncio.Task, safety_net_task: asyncio.Task) -> None:
-        self.stream_task = stream_task
-        self.consumer_task = consumer_task
-        self.safety_net_task = safety_net_task
+    async def _safety_net_loop(self) -> None:
+        while True:
+            await asyncio.sleep(RECONCILE_SAFETY_NET_INTERVAL_SECONDS)
+            try:
+                await self._reconcile_locked()
+            except Exception:
+                logger.exception("[%s] safety-net reconciliation failed", self.account_id)
 
     async def stop(self) -> None:
-        for task in (self.stream_task, self.consumer_task, self.safety_net_task):
+        for task in (self._stream_task, self._consumer_task, self._safety_net_task):
             task.cancel()
-        await asyncio.gather(self.stream_task, self.consumer_task, self.safety_net_task, return_exceptions=True)
+        await asyncio.gather(self._stream_task, self._consumer_task, self._safety_net_task, return_exceptions=True)
 
 
-def start(broker: BrokerClient) -> BrokerStreamHandle:
-    return BrokerStreamHandle(
-        stream_task=asyncio.create_task(_run_broker_stream(broker)),
-        consumer_task=asyncio.create_task(_reconcile_consumer(broker)),
-        safety_net_task=asyncio.create_task(_safety_net_loop(broker)),
-    )
+def start(account_id: str, broker: BrokerClient) -> AccountStream:
+    return AccountStream(account_id, broker)
 
 
-async def send_snapshot(websocket: WebSocket, broker: BrokerClient, account_id: str) -> None:
+async def send_snapshot(websocket: WebSocket, account_id: str, broker: BrokerClient) -> None:
     """Sent once, right after a client connects, so the dashboard shows current data
-    immediately instead of waiting for the next reconciliation event. account_id is
-    passed in (cached once at backend startup) rather than re-fetched here, so a
-    dashboard reconnect/page-load never costs an extra broker round-trip just to learn
-    an account id that hasn't changed since the process started."""
+    immediately instead of waiting for the next reconciliation event."""
     positions = await asyncio.to_thread(broker.get_positions)
     with get_session() as session:
         latest_equity = session.execute(
-            select(EquitySnapshot)
-            .where(EquitySnapshot.broker == broker.name, EquitySnapshot.account_id == account_id)
-            .order_by(EquitySnapshot.timestamp.desc())
+            select(EquitySnapshot).where(EquitySnapshot.account_id == account_id).order_by(EquitySnapshot.timestamp.desc())
         ).scalars().first()
         trades = session.execute(
-            select(Trade)
-            .where(Trade.broker == broker.name, Trade.account_id == account_id)
-            .order_by(Trade.submitted_at.desc())
-            .limit(200)
+            select(Trade).where(Trade.account_id == account_id).order_by(Trade.submitted_at.desc()).limit(200)
         ).scalars().all()
         equity_payload = (
             {

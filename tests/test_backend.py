@@ -8,7 +8,9 @@ from sqlalchemy.orm import sessionmaker
 
 import backend.app.main as backend_main
 import db.session as db_session
-from db.models import ResearchResult
+from backend.app.main import AccountRuntime
+from db.models import Account, EquitySnapshot, ResearchResult
+from engine.brokers.base import AccountSnapshot, PositionSnapshot
 
 
 class _FakeScheduler:
@@ -26,6 +28,19 @@ class _FakeScheduler:
         pass
 
 
+class FakeBroker:
+    name = "fake"
+
+    def __init__(self, positions: list[PositionSnapshot] | None = None):
+        self._positions = positions or []
+
+    def get_positions(self) -> list[PositionSnapshot]:
+        return self._positions
+
+    def get_account(self) -> AccountSnapshot:
+        return AccountSnapshot(equity=1000.0, cash=500.0, buying_power=2000.0, account_id="broker-acct-1")
+
+
 @pytest.fixture
 def client(monkeypatch, tmp_path):
     # File-based sqlite, not :memory: - the backend's request thread and the background
@@ -35,12 +50,28 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setattr(db_session, "engine", test_engine)
     monkeypatch.setattr(db_session, "SessionLocal", sessionmaker(bind=test_engine, expire_on_commit=False))
     monkeypatch.setattr(backend_main, "_scheduler", _FakeScheduler())
-    # Startup normally builds a real, long-lived broker connection and launches
-    # network-touching background tasks (see backend/app/broker_stream.py) - none of
-    # that is needed or safe to run repeatedly across many TestClient instantiations.
-    monkeypatch.setattr(backend_main, "_start_broker_stream", lambda: None)
+    # ACCOUNT_IDS would otherwise leak in from a real .env in the project root - tests
+    # seed accounts directly instead of relying on env sync.
+    monkeypatch.delenv("ACCOUNT_IDS", raising=False)
+    # Startup normally builds real, long-lived broker connections and launches
+    # network-touching background tasks per active account (see
+    # backend/app/broker_stream.py) - none of that is needed or safe to run repeatedly
+    # across many TestClient instantiations.
+    monkeypatch.setattr(backend_main, "_start_broker_streams", lambda: None)
     with TestClient(backend_main.app) as test_client:
         yield test_client
+
+
+def _add_account(account_id: str = "acct-1", **overrides) -> None:
+    defaults = dict(
+        id=account_id, broker="alpaca", display_name="Test Account", active=True,
+        strategy_name="rebalancing_portfolio", strategy_params='{"target_weights": {"SPY": 1.0}}',
+        max_position_size_usd=1000.0, max_daily_loss_usd=200.0,
+    )
+    defaults.update(overrides)
+    with db_session.get_session() as session:
+        session.add(Account(**defaults))
+        session.commit()
 
 
 def test_research_schedule_defaults_enabled(client):
@@ -106,3 +137,118 @@ def test_trigger_research_runs_in_background_and_releases_lock(client, monkeypat
     assert response.json() == {"status": "started"}
     assert completed.wait(timeout=2)
     assert not backend_main._research_lock.locked()
+
+
+def test_list_accounts_empty_when_none_configured(client):
+    assert client.get("/accounts").json() == []
+
+
+def test_list_accounts_includes_inactive_and_active(client):
+    _add_account("acct-1", active=True)
+    _add_account("acct-2", active=False)
+
+    rows = client.get("/accounts").json()
+    assert {r["id"] for r in rows} == {"acct-1", "acct-2"}
+    assert next(r for r in rows if r["id"] == "acct-1")["active"] is True
+    assert next(r for r in rows if r["id"] == "acct-2")["active"] is False
+
+
+def test_list_accounts_includes_live_unrealized_pl_for_active_accounts(client):
+    _add_account("acct-1", active=True)
+    backend_main.app.state.accounts["acct-1"] = AccountRuntime(
+        broker=FakeBroker([PositionSnapshot(symbol="SPY", qty=1, avg_entry_price=100, market_value=110, unrealized_pl=10.0)]),
+        stream=_NoOpStream(),
+    )
+
+    row = next(r for r in client.get("/accounts").json() if r["id"] == "acct-1")
+    assert row["unrealized_pl"] == 10.0
+
+
+def test_list_accounts_includes_latest_equity_snapshot(client):
+    _add_account("acct-1")
+    with db_session.get_session() as session:
+        session.add(EquitySnapshot(account_id="acct-1", broker="alpaca", broker_account_id="b1", equity=5000.0, cash=1000.0, buying_power=2000.0))
+        session.commit()
+
+    row = next(r for r in client.get("/accounts").json() if r["id"] == "acct-1")
+    assert row["equity"] == 5000.0
+    assert row["cash"] == 1000.0
+
+
+def test_get_account_404_for_unknown_id(client):
+    assert client.get("/accounts/nope").status_code == 404
+
+
+def test_get_account_detail(client):
+    _add_account("acct-1", display_name="My Account", strategy_name="ma_crossover")
+
+    detail = client.get("/accounts/acct-1").json()
+    assert detail["display_name"] == "My Account"
+    assert detail["strategy_name"] == "ma_crossover"
+    assert detail["max_position_size_usd"] == 1000.0
+
+
+def test_deactivate_account_flips_active_and_removes_runtime(client):
+    _add_account("acct-1", active=True)
+    backend_main.app.state.accounts["acct-1"] = AccountRuntime(broker=FakeBroker(), stream=_NoOpStream())
+
+    response = client.post("/accounts/acct-1/deactivate")
+    assert response.json() == {"active": False}
+    assert client.get("/accounts/acct-1").json()["active"] is False
+    assert "acct-1" not in backend_main.app.state.accounts
+
+
+def test_activate_account_flips_active(client, monkeypatch):
+    _add_account("acct-1", active=False)
+    monkeypatch.setattr(backend_main, "_start_account_stream", lambda account: None)
+
+    response = client.post("/accounts/acct-1/activate")
+    assert response.json() == {"active": True}
+    assert client.get("/accounts/acct-1").json()["active"] is True
+
+
+def test_set_account_limits(client):
+    _add_account("acct-1")
+
+    response = client.patch("/accounts/acct-1/limits", params={"max_position_size_usd": 2000.0, "max_daily_loss_usd": 300.0})
+    assert response.json() == {"max_position_size_usd": 2000.0, "max_daily_loss_usd": 300.0}
+
+    detail = client.get("/accounts/acct-1").json()
+    assert detail["max_position_size_usd"] == 2000.0
+    assert detail["max_daily_loss_usd"] == 300.0
+
+
+def test_kill_switch_round_trip(client):
+    _add_account("acct-1")
+
+    assert client.get("/accounts/acct-1/kill-switch").json() == {"engaged": False, "reason": ""}
+
+    response = client.post("/accounts/acct-1/kill-switch", params={"engaged": True, "reason": "manual stop"})
+    assert response.json() == {"engaged": True, "reason": "manual stop"}
+    assert client.get("/accounts/acct-1/kill-switch").json() == {"engaged": True, "reason": "manual stop"}
+
+
+def test_positions_returns_409_for_inactive_account(client):
+    _add_account("acct-1", active=False)
+    response = client.get("/accounts/acct-1/positions")
+    assert response.status_code == 409
+
+
+def test_positions_returns_404_for_unknown_account(client):
+    assert client.get("/accounts/nope/positions").status_code == 404
+
+
+def test_positions_returns_live_positions_for_active_account(client):
+    _add_account("acct-1", active=True)
+    backend_main.app.state.accounts["acct-1"] = AccountRuntime(
+        broker=FakeBroker([PositionSnapshot(symbol="SPY", qty=1, avg_entry_price=100, market_value=110, unrealized_pl=10.0)]),
+        stream=_NoOpStream(),
+    )
+
+    rows = client.get("/accounts/acct-1/positions").json()
+    assert rows == [{"symbol": "SPY", "qty": 1, "avg_entry_price": 100, "market_value": 110, "unrealized_pl": 10.0}]
+
+
+class _NoOpStream:
+    async def stop(self) -> None:
+        pass

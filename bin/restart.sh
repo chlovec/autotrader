@@ -1,18 +1,17 @@
 #!/bin/bash
 # Starts the full local dev stack directly - FastAPI backend, Vite dashboard, the
-# trading loop, and one research run - without going through the Makefile. Runs
-# stop.sh first so leftover processes from a previous run can't collide with these.
+# multi-account trading loop, and one research run - without going through the
+# Makefile. Runs stop.sh first so leftover processes from a previous run can't
+# collide with these.
 #
-# Usage (from anywhere - resolves the project root itself):
-#   ./bin/restart.sh                  # prompts for broker
-#   ./bin/restart.sh alpaca
-#   ./bin/restart.sh ibkr
+# Which broker(s)/paper-vs-live each account uses comes entirely from .env's
+# ACCOUNT_IDS/ACCOUNT_<id>_* vars (see .env.example) - there's no per-run broker
+# selection anymore, since one run now trades every active account, possibly across
+# several different brokers at once.
 #
-# Paper vs live isn't a choice this script makes - it comes entirely from .env
-# (ALPACA_PAPER, IBKR_PORT, ...), same as any other engine/config.py value. See
-# .env.example.
+# Usage (from anywhere - resolves the project root itself): ./bin/restart.sh
 #
-# Env overrides (same names the Makefile uses): RUN_SCRIPT, BACKEND_HOST, BACKEND_PORT.
+# Env overrides (same names the Makefile uses): BACKEND_HOST, BACKEND_PORT.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -20,45 +19,19 @@ cd "$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PYTHON=.venv/bin/python
 UVICORN=.venv/bin/uvicorn
-RUN_SCRIPT="${RUN_SCRIPT:-run_portfolio.py}"
 BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 DASHBOARD_PORT="${DASHBOARD_PORT:-5173}"
 
-BROKER="${1:-}"
-
-if [ -z "$BROKER" ]; then
-  PS3="Which broker? "
-  select choice in alpaca ibkr questrade; do
-    if [ -n "$choice" ]; then
-      BROKER="$choice"
-      break
-    fi
-    echo "Pick 1, 2, or 3."
-  done
+# A blanket warning rather than a per-broker one: any configured account could be live
+# (ACCOUNT_<id>_ALPACA_PAPER=false, etc.) - grep .env rather than trying to evaluate
+# every account's config in bash.
+LIVE_WARNING=""
+if grep -qE '_ALPACA_PAPER=false' .env 2>/dev/null; then
+  LIVE_WARNING=" - at least one account looks configured for LIVE trading"
 fi
 
-case "$BROKER" in
-  alpaca|ibkr|questrade) ;;
-  *)
-    echo "Unknown broker '$BROKER' - must be alpaca, ibkr, or questrade." >&2
-    exit 1
-    ;;
-esac
-
-# Passed as a flag to load_config() rather than an env var, so a plain `ps` doesn't need
-# to guess what a running process was launched with.
-RUN_ARGS=(--broker "$BROKER")
-
-# The backend (uvicorn) can't be handed the same CLI flag - it's not our entrypoint, so
-# there's nowhere to pass --broker through to. Its load_config(argv=[]) only ever reads
-# the environment/.env, so without this export it would silently keep whatever broker
-# was last configured there - completely ignoring the selection above - and the
-# dashboard would show a different broker/account than the trading loop and research
-# run actually use.
-export BROKER="$BROKER"
-
-echo "About to (re)start backend, dashboard, trading loop (broker=$BROKER), and a research run."
+echo "About to (re)start backend, dashboard, trading loop, and a research run${LIVE_WARNING}."
 read -r -p "Continue? [y/N] " reply
 case "$reply" in
   [yY]|[yY][eE][sS]) ;;
@@ -81,27 +54,26 @@ echo "Starting dashboard..."
 nohup bash -c 'cd frontend && exec npm run dev' >> "$LOG" 2>&1 &
 disown
 
-echo "Starting trading loop (${RUN_ARGS[*]}, $RUN_SCRIPT)..."
-nohup "$PYTHON" "$RUN_SCRIPT" "${RUN_ARGS[@]}" >> "$LOG" 2>&1 &
+echo "Starting trading loop (run_engine.py, every active account)..."
+nohup "$PYTHON" run_engine.py >> "$LOG" 2>&1 &
 RUN_PID=$!
 disown
 
 echo "Running research once..."
-nohup "$PYTHON" run_research.py "${RUN_ARGS[@]}" >> "$LOG" 2>&1 &
+nohup "$PYTHON" run_research.py >> "$LOG" 2>&1 &
 RESEARCH_PID=$!
 disown
 
 # `nohup ... &` never surfaces the child's exit code - without this check, a trading
-# loop that crashes on startup (e.g. .env has ALPACA_PAPER=false with no live keys
-# configured, see engine/config.py) would still print as a successful restart below.
-# run_portfolio.py
-# and run.py never legitimately exit on their own (they block forever in a scheduler)
+# loop that crashes on startup (e.g. an account configured for live trading with no
+# live keys, see engine/config.py) would still print as a successful restart below.
+# run_engine.py never legitimately exits on its own (it blocks forever in a scheduler)
 # and a real research pass takes several seconds minimum (one HTTP round-trip per
 # symbol), so either process being dead already means it crashed on startup.
 sleep 2
 FAILED=0
 if ! kill -0 "$RUN_PID" 2>/dev/null; then
-  echo "ERROR: trading loop ($RUN_SCRIPT) exited immediately - check $LOG:" >&2
+  echo "ERROR: trading loop (run_engine.py) exited immediately - check $LOG:" >&2
   tail -n 20 "$LOG" >&2
   FAILED=1
 fi

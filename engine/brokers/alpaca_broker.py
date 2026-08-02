@@ -15,7 +15,7 @@ from alpaca.trading.stream import TradingStream
 
 from db.models import OrderSide, SignalAction
 from engine.brokers.base import AccountSnapshot, BrokerOrder, ClockSnapshot, OrderResult, PositionSnapshot, Timeframe
-from engine.config import Config
+from engine.config import AccountCredentials
 
 _TIMEFRAME_MAP = {
     Timeframe.MINUTE: AlpacaTimeFrame.Minute,
@@ -47,10 +47,10 @@ class AlpacaBroker:
 
     name = "alpaca"
 
-    def __init__(self, config: Config):
-        self._config = config
-        self._trading = TradingClient(config.alpaca_api_key, config.alpaca_secret_key, paper=config.alpaca_paper)
-        self._data = StockHistoricalDataClient(config.alpaca_api_key, config.alpaca_secret_key)
+    def __init__(self, credentials: AccountCredentials):
+        self._credentials = credentials
+        self._trading = TradingClient(credentials.alpaca_api_key, credentials.alpaca_secret_key, paper=credentials.alpaca_paper)
+        self._data = StockHistoricalDataClient(credentials.alpaca_api_key, credentials.alpaca_secret_key)
 
     def get_account(self) -> AccountSnapshot:
         account = self._trading.get_account()
@@ -143,7 +143,7 @@ class AlpacaBroker:
         _run_forever is not part of alpaca-py's public API - revisit this on an alpaca-py
         upgrade in case its name or behavior changes.
         """
-        stream = TradingStream(self._config.alpaca_api_key, self._config.alpaca_secret_key, paper=self._config.alpaca_paper)
+        stream = TradingStream(self._credentials.alpaca_api_key, self._credentials.alpaca_secret_key, paper=self._credentials.alpaca_paper)
 
         async def _handler(data: object) -> None:
             await on_change()

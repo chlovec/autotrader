@@ -1,5 +1,6 @@
 """Screens a fixed universe of symbols and persists the results (db.models.ResearchResult)
-for engine/runner.py to trade from - see db.queries.get_watchlist_symbols.
+for engine/multi_runner.py's signal-strategy accounts to trade from - see
+db.queries.get_watchlist_symbols.
 
 Scheduling lives in backend/app/main.py, not here: it runs research_once() nightly via
 its own BackgroundScheduler (gated by the dashboard's ResearchSchedule toggle) and exposes
@@ -9,9 +10,11 @@ dashboard is in use. main() below is a one-shot entrypoint for run_research.py -
 a manual run, or OS-level cron on a box that doesn't run the backend persistently - not a
 second scheduler.
 
-Requires a live broker connection for get_bars even though it never places an order (same
-as scripts/common.py's backtest fetch path) - if BROKER=ibkr/questrade, a run depends on
-TWS/Gateway being reachable or a valid Questrade token.
+Research is global (one screen shared by every signal-strategy account, not scoped to any
+one account - see ARCHITECTURE.md), but get_bars still needs *a* live broker connection.
+research_once takes one in rather than building it, since with multiple accounts there's no
+single "the broker" anymore - both the backend and run_research.py's main() resolve it as
+the first active account's broker, sorted by id (engine.accounts.get_active_accounts).
 """
 
 import datetime as dt
@@ -20,9 +23,10 @@ import time
 
 from db.models import ResearchResult
 from db.session import get_session, init_db
+from engine.accounts import get_research_account, sync_accounts_from_env
 from engine.brokers import make_broker
-from engine.brokers.base import Timeframe
-from engine.config import Config, load_config
+from engine.brokers.base import BrokerClient, Timeframe
+from engine.config import Config, load_account_credentials, load_config
 from engine.notifications import log_and_notify, make_notifier
 from engine.research import combine, fetch_universe_news, make_news_client, score_news, score_technical
 
@@ -50,14 +54,14 @@ _INTER_SYMBOL_DELAY_SECONDS = 0.2
 
 
 def research_once(
-    universe: list[str], top_n: int, technical_weight: float = 0.5, news_weight: float = 0.5, config: Config | None = None
+    universe: list[str], top_n: int, broker: BrokerClient, technical_weight: float = 0.5, news_weight: float = 0.5,
+    config: Config | None = None,
 ) -> None:
     deduped = list(dict.fromkeys(universe))  # preserves order, drops duplicate tickers
     if top_n > len(deduped):
         raise ValueError(f"top_n ({top_n}) exceeds universe size ({len(deduped)})")
 
     config = config or load_config(argv=[])
-    broker = make_broker(config)
     news_client = make_news_client(config)
     notifier = make_notifier(config)
 
@@ -120,5 +124,13 @@ def main(
     to the dashboard's toggle and "Run research now" button, run the backend
     (backend/app/main.py owns that scheduler) - don't run both unattended against the same
     database, since neither is aware of the other's runs."""
+    config = config or load_config(argv=[])
     init_db()
-    research_once(universe, top_n, technical_weight, news_weight, config=config)
+    with get_session() as session:
+        sync_accounts_from_env(session, config)
+        account = get_research_account(session)
+    if account is None:
+        raise RuntimeError("no active accounts configured (ACCOUNT_IDS) - research needs at least one active account's broker connection")
+
+    broker = make_broker(account.id, load_account_credentials(account.id))
+    research_once(universe, top_n, broker, technical_weight, news_weight, config=config)

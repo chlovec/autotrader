@@ -29,6 +29,39 @@ class EventLevel(str, enum.Enum):
     critical = "critical"
 
 
+class Account(Base):
+    """One tradeable account: a broker connection plus the dashboard-editable state that
+    controls it (active flag, strategy assignment, risk limits, kill switch).
+
+    `id` is a stable slug taken from the `ACCOUNT_IDS` .env var (e.g. "alpaca_paper") - it's
+    also the foreign key every other table scopes its rows by. `broker`/`display_name` are
+    synced from .env on every backend/engine startup (see engine/accounts.py's
+    sync_accounts_from_env) and aren't dashboard-editable. Everything else here - `active`,
+    `strategy_name`/`strategy_params`, the two limits, and the kill switch - is seeded from
+    .env the first time an id is seen and owned by the dashboard from then on; a later env
+    change to those values is deliberately ignored so a dashboard edit can't be silently
+    reverted by a restart.
+    """
+
+    __tablename__ = "accounts"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    broker: Mapped[str] = mapped_column(String, index=True)
+    display_name: Mapped[str] = mapped_column(String)
+    active: Mapped[bool] = mapped_column(default=True)
+    strategy_name: Mapped[str] = mapped_column(String)
+    strategy_params: Mapped[str] = mapped_column(Text, default="{}")
+    max_position_size_usd: Mapped[float] = mapped_column(Float)
+    max_daily_loss_usd: Mapped[float] = mapped_column(Float)
+    kill_switch_engaged: Mapped[bool] = mapped_column(default=False)
+    kill_switch_reason: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+    signals: Mapped[list["Signal"]] = relationship(back_populates="account")
+    trades: Mapped[list["Trade"]] = relationship(back_populates="account")
+
+
 class Signal(Base):
     """A decision the strategy engine produced, whether or not it resulted in a trade."""
 
@@ -36,11 +69,13 @@ class Signal(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     timestamp: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow, index=True)
+    account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"), index=True)
     symbol: Mapped[str] = mapped_column(String, index=True)
     strategy_name: Mapped[str] = mapped_column(String)
     action: Mapped[SignalAction] = mapped_column(Enum(SignalAction))
     reason: Mapped[str] = mapped_column(Text, default="")
 
+    account: Mapped[Account] = relationship(back_populates="signals")
     trades: Mapped[list["Trade"]] = relationship(back_populates="signal")
 
 
@@ -50,14 +85,18 @@ class Trade(Base):
     __tablename__ = "trades"
     # broker_order_id is only unique within a given broker's own ID space (Alpaca uses
     # UUIDs, Questrade its own numeric IDs, but IBKR's orderId is a small sequential
-    # integer scoped to a client session) - a single-column unique constraint would
-    # wrongly reject a legitimate insert once multiple brokers/accounts share this table.
-    __table_args__ = (UniqueConstraint("broker", "account_id", "broker_order_id", name="uq_trades_broker_account_order"),)
+    # integer scoped to a client session). Scoping by our own account_id rather than
+    # (broker, broker_account_id) is simpler and still correct - one internal account maps
+    # to exactly one broker connection.
+    __table_args__ = (UniqueConstraint("account_id", "broker_order_id", name="uq_trades_account_order"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     signal_id: Mapped[int | None] = mapped_column(ForeignKey("signals.id"), nullable=True)
+    account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"), index=True)
     broker: Mapped[str] = mapped_column(String, index=True)
-    account_id: Mapped[str] = mapped_column(String, index=True)
+    # The broker's own account identifier (an Alpaca account UUID, etc.) - kept for
+    # display/audit, distinct from account_id above which is our internal, dashboard-facing id.
+    broker_account_id: Mapped[str] = mapped_column(String, index=True)
     broker_order_id: Mapped[str] = mapped_column(String, index=True)
     symbol: Mapped[str] = mapped_column(String, index=True)
     side: Mapped[OrderSide] = mapped_column(Enum(OrderSide))
@@ -68,6 +107,7 @@ class Trade(Base):
     submitted_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
     filled_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
+    account: Mapped[Account] = relationship(back_populates="trades")
     signal: Mapped[Signal | None] = relationship(back_populates="trades")
 
 
@@ -78,20 +118,26 @@ class EquitySnapshot(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     timestamp: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow, index=True)
+    account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"), index=True)
     broker: Mapped[str] = mapped_column(String, index=True)
-    account_id: Mapped[str] = mapped_column(String, index=True)
+    broker_account_id: Mapped[str] = mapped_column(String, index=True)
     equity: Mapped[float] = mapped_column(Float)
     cash: Mapped[float] = mapped_column(Float)
     buying_power: Mapped[float] = mapped_column(Float)
 
 
 class SystemEvent(Base):
-    """Errors, risk-limit trips, kill-switch activations, and other operational events."""
+    """Errors, risk-limit trips, kill-switch activations, and other operational events.
+
+    account_id is nullable - some events (a CORS misconfiguration, a research run) aren't
+    about any one account.
+    """
 
     __tablename__ = "system_events"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     timestamp: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow, index=True)
+    account_id: Mapped[str | None] = mapped_column(ForeignKey("accounts.id"), nullable=True, index=True)
     level: Mapped[EventLevel] = mapped_column(Enum(EventLevel))
     source: Mapped[str] = mapped_column(String)
     message: Mapped[str] = mapped_column(Text)
@@ -120,17 +166,6 @@ class ResearchResult(Base):
     combined_score: Mapped[float] = mapped_column(Float, index=True)
     rationale: Mapped[str] = mapped_column(Text, default="")
     selected: Mapped[bool] = mapped_column(default=False)
-
-
-class KillSwitch(Base):
-    """Single-row table the trading loop polls each cycle; flipped by the dashboard."""
-
-    __tablename__ = "kill_switch"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
-    engaged: Mapped[bool] = mapped_column(default=False)
-    reason: Mapped[str] = mapped_column(Text, default="")
-    updated_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
 
 
 class ResearchSchedule(Base):

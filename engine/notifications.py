@@ -88,7 +88,7 @@ def make_notifier(config: Config) -> Notifier:
     return CompositeNotifier(notifiers)
 
 
-def log_and_notify(session: Session, notifier: Notifier, level: str, source: str, message: str) -> None:
-    session.add(SystemEvent(level=level, source=source, message=message))
+def log_and_notify(session: Session, notifier: Notifier, level: str, source: str, message: str, account_id: str | None = None) -> None:
+    session.add(SystemEvent(level=level, source=source, message=message, account_id=account_id))
     session.commit()
     notifier.notify(level, source, message)

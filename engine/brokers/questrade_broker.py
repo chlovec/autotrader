@@ -9,10 +9,9 @@ import requests
 
 from db.models import OrderSide, SignalAction
 from engine.brokers.base import AccountSnapshot, BrokerOrder, ClockSnapshot, OrderResult, PositionSnapshot, Timeframe
-from engine.config import Config
+from engine.config import AccountCredentials
 
 _AUTH_URL = "https://login.questrade.com/oauth2/token"
-_TOKEN_CACHE_PATH = Path("questrade_token.json")
 
 _INTERVAL = {
     Timeframe.MINUTE: "OneMinute",
@@ -43,17 +42,22 @@ class QuestradeBroker:
 
     name = "questrade"
 
-    def __init__(self, config: Config):
-        self._config = config
+    def __init__(self, credentials: AccountCredentials, account_id: str = "default"):
+        """account_id scopes the on-disk token cache file (questrade_token_<account_id>.json)
+        so multiple Questrade accounts in one deployment never clobber each other's rotated
+        refresh token - each QuestradeBroker instance is one account's credentials, so one
+        instance's cache must never leak into another's."""
+        self._credentials = credentials
+        self._token_cache_path = Path(f"questrade_token_{account_id}.json")
         self._access_token: str | None = None
         self._api_server: str | None = None
         self._account_id: str | None = None
         self._symbol_id_cache: dict[str, int] = {}
 
     def _current_refresh_token(self) -> str:
-        if _TOKEN_CACHE_PATH.exists():
-            return json.loads(_TOKEN_CACHE_PATH.read_text())["refresh_token"]
-        return self._config.questrade_refresh_token
+        if self._token_cache_path.exists():
+            return json.loads(self._token_cache_path.read_text())["refresh_token"]
+        return self._credentials.questrade_refresh_token
 
     def _authenticate(self) -> None:
         response = requests.get(
@@ -65,7 +69,7 @@ class QuestradeBroker:
         data = response.json()
         self._access_token = data["access_token"]
         self._api_server = data["api_server"].rstrip("/")
-        _TOKEN_CACHE_PATH.write_text(json.dumps({"refresh_token": data["refresh_token"]}))
+        self._token_cache_path.write_text(json.dumps({"refresh_token": data["refresh_token"]}))
 
     def _request(self, method: str, path: str, **kwargs) -> dict:
         if self._access_token is None:
@@ -204,4 +208,4 @@ class QuestradeBroker:
         anything, changed since the last tick."""
         while True:
             await on_change()
-            await asyncio.sleep(self._config.questrade_poll_interval_seconds)
+            await asyncio.sleep(self._credentials.questrade_poll_interval_seconds)

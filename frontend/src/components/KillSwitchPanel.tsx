@@ -2,7 +2,15 @@ import { useState } from 'react'
 import type { KillSwitchState } from '../api'
 import { api } from '../api'
 
-export function KillSwitchPanel({ state, onChange }: { state: KillSwitchState | null; onChange: (next: KillSwitchState) => void }) {
+export function KillSwitchPanel({
+  accountId,
+  state,
+  onChange,
+}: {
+  accountId: string
+  state: KillSwitchState | null
+  onChange: (next: KillSwitchState) => void
+}) {
   const [busy, setBusy] = useState(false)
   const [reasonInput, setReasonInput] = useState('')
 
@@ -13,7 +21,9 @@ export function KillSwitchPanel({ state, onChange }: { state: KillSwitchState | 
   async function toggle() {
     setBusy(true)
     try {
-      const next = await api.setKillSwitch(!state!.engaged, state!.engaged ? '' : reasonInput || 'manually engaged from dashboard')
+      const next = await api.setAccountKillSwitch(
+        accountId, !state!.engaged, state!.engaged ? '' : reasonInput || 'manually engaged from dashboard'
+      )
       onChange(next)
       setReasonInput('')
     } finally {

@@ -1,6 +1,9 @@
 .env
+.env.bak-*
 questrade_token.json
+questrade_token_*.json
 *.db
+*.db.bak-*
 __pycache__/
 *.pyc
 .venv/

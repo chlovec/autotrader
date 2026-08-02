@@ -118,10 +118,10 @@ def make_news_client(config: Config) -> NewsClient:
     """Alpaca News API client. All alpaca-py news usage is confined to this file, the way
     broker SDK usage is confined to engine/brokers/*_broker.py.
 
-    Uses config.alpaca_api_key/alpaca_secret_key, which load unconditionally regardless of
-    config.broker (see engine/config.py) - so this works even when BROKER=ibkr/questrade,
-    as long as an Alpaca key pair (even a free paper one) is set for market data."""
-    return NewsClient(config.alpaca_api_key, config.alpaca_secret_key)
+    Uses config.alpaca_news_api_key/alpaca_news_secret_key - a global key pair independent
+    of any account's own broker credentials (see engine/config.py), since research screens
+    one shared universe regardless of which broker(s) any account actually trades through."""
+    return NewsClient(config.alpaca_news_api_key, config.alpaca_news_secret_key)
 
 
 def fetch_universe_news(client: NewsClient, universe: list[str], lookback_days: int = 14) -> dict[str, list[News]]:

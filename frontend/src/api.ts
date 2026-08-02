@@ -36,6 +36,7 @@ export interface Signal {
 
 export interface SystemEvent {
   id: number
+  account_id: string | null
   level: 'info' | 'warning' | 'error' | 'critical'
   source: string
   message: string
@@ -68,32 +69,58 @@ export interface ResearchStatus {
 
 export type TriggerResearchResult = { status: 'started' } | { status: 'already-running' }
 
+export interface AccountSummary {
+  id: string
+  display_name: string
+  broker: string
+  active: boolean
+  strategy_name: string
+  equity: number | null
+  cash: number | null
+  unrealized_pl: number | null
+}
+
+export interface AccountDetail {
+  id: string
+  display_name: string
+  broker: string
+  active: boolean
+  strategy_name: string
+  strategy_params: Record<string, unknown>
+  max_position_size_usd: number
+  max_daily_loss_usd: number
+  kill_switch_engaged: boolean
+  kill_switch_reason: string
+}
+
+export interface TradingLimits {
+  max_position_size_usd: number
+  max_daily_loss_usd: number
+}
+
 async function getJSON<T>(path: string): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`)
   if (!res.ok) throw new Error(`${path} failed: ${res.status}`)
   return res.json()
 }
 
+async function postJSON<T>(path: string, params: Record<string, string | number | boolean> = {}, method: string = 'POST'): Promise<T> {
+  const query = new URLSearchParams(Object.entries(params).map(([k, v]) => [k, String(v)])).toString()
+  const res = await fetch(`${API_BASE}${path}${query ? `?${query}` : ''}`, { method })
+  if (!res.ok) throw new Error(`${path} failed: ${res.status}`)
+  return res.json()
+}
+
+export function accountWsUrl(accountId: string): string {
+  return `${API_BASE.replace(/^http/, 'ws')}/ws/accounts/${accountId}`
+}
+
 export const api = {
   health: () => getJSON<{ status: string }>('/health'),
-  positions: () => getJSON<Position[]>('/positions'),
-  equity: () => getJSON<EquityPoint[]>('/equity'),
-  trades: () => getJSON<Trade[]>('/trades'),
-  signals: () => getJSON<Signal[]>('/signals'),
   events: () => getJSON<SystemEvent[]>('/events'),
-  killSwitch: () => getJSON<KillSwitchState>('/kill-switch'),
-  setKillSwitch: async (engaged: boolean, reason: string): Promise<KillSwitchState> => {
-    const res = await fetch(`${API_BASE}/kill-switch?engaged=${engaged}&reason=${encodeURIComponent(reason)}`, { method: 'POST' })
-    if (!res.ok) throw new Error(`kill-switch update failed: ${res.status}`)
-    return res.json()
-  },
   research: () => getJSON<ResearchResult[]>('/research'),
   researchSchedule: () => getJSON<ResearchScheduleState>('/research/schedule'),
-  setResearchSchedule: async (enabled: boolean): Promise<ResearchScheduleState> => {
-    const res = await fetch(`${API_BASE}/research/schedule?enabled=${enabled}`, { method: 'POST' })
-    if (!res.ok) throw new Error(`research schedule update failed: ${res.status}`)
-    return res.json()
-  },
+  setResearchSchedule: (enabled: boolean) => postJSON<ResearchScheduleState>('/research/schedule', { enabled }),
   researchStatus: () => getJSON<ResearchStatus>('/research/status'),
   triggerResearch: async (): Promise<TriggerResearchResult> => {
     const res = await fetch(`${API_BASE}/research/run`, { method: 'POST' })
@@ -101,4 +128,18 @@ export const api = {
     if (!res.ok) throw new Error(`research trigger failed: ${res.status}`)
     return res.json()
   },
+
+  accounts: () => getJSON<AccountSummary[]>('/accounts'),
+  account: (id: string) => getJSON<AccountDetail>(`/accounts/${id}`),
+  activateAccount: (id: string) => postJSON<{ active: boolean }>(`/accounts/${id}/activate`),
+  deactivateAccount: (id: string) => postJSON<{ active: boolean }>(`/accounts/${id}/deactivate`),
+  setAccountLimits: (id: string, limits: TradingLimits) =>
+    postJSON<TradingLimits>(`/accounts/${id}/limits`, { ...limits }, 'PATCH'),
+  accountKillSwitch: (id: string) => getJSON<KillSwitchState>(`/accounts/${id}/kill-switch`),
+  setAccountKillSwitch: (id: string, engaged: boolean, reason: string) =>
+    postJSON<KillSwitchState>(`/accounts/${id}/kill-switch`, { engaged, reason }),
+  accountPositions: (id: string) => getJSON<Position[]>(`/accounts/${id}/positions`),
+  accountEquity: (id: string) => getJSON<EquityPoint[]>(`/accounts/${id}/equity`),
+  accountTrades: (id: string) => getJSON<Trade[]>(`/accounts/${id}/trades`),
+  accountSignals: (id: string) => getJSON<Signal[]>(`/accounts/${id}/signals`),
 }

@@ -1,26 +1,24 @@
 #!/bin/bash
 # Stops every autotrader process this repo can start: the FastAPI backend, the Vite
-# dashboard dev server, the trading loop (run_portfolio.py / run.py), and a one-shot
-# research run if still in flight. Matches by command line (pgrep -f) rather than
-# tracking PIDs, so it works no matter how the processes were started (restart.sh, run
-# by hand, an old `make run-alpaca-sim` from before these scripts existed, ...) -
-# independent of the Makefile, but still catches Makefile-launched processes since
-# `make` execs into these same underlying commands.
+# dashboard dev server, the trading loop (run_engine.py), and a one-shot research run
+# if still in flight. Matches by command line (pgrep -f) rather than tracking PIDs, so
+# it works no matter how the processes were started (restart.sh, run by hand, `make
+# run-engine`, ...) - independent of the Makefile, but still catches Makefile-launched
+# processes since `make` execs into these same underlying commands.
 #
 # Usage: ./bin/stop.sh (from anywhere - resolves the project root itself)
 
 set -euo pipefail
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
-# Not anchored to this repo's absolute path - RUN_SCRIPT/run_portfolio.py are commonly
-# launched with a relative path (cwd already at the project root), which wouldn't
-# match an absolute-path pattern.
+# Not anchored to this repo's absolute path - run_engine.py is commonly launched with a
+# relative path (cwd already at the project root), which wouldn't match an
+# absolute-path pattern.
 PATTERNS=(
   "uvicorn backend.app.main:app"
   "frontend/node_modules/.bin/vite"
-  "run_portfolio\.py"
+  "run_engine\.py"
   "run_research\.py"
-  "python.*/run\.py|python run\.py"  # RUN_SCRIPT=run.py override
 )
 
 collect_pids() {
