@@ -10,9 +10,11 @@ from engine.config import Config
 class RiskManager:
     """Sits between the strategy and execution. A signal only becomes an order if approved here."""
 
-    def __init__(self, config: Config, session: Session):
+    def __init__(self, config: Config, session: Session, broker: str, account_id: str):
         self.config = config
         self.session = session
+        self.broker = broker
+        self.account_id = account_id
 
     def kill_switch_engaged(self) -> tuple[bool, str]:
         switch = self.session.get(KillSwitch, 1)
@@ -20,11 +22,12 @@ class RiskManager:
 
     def daily_pnl(self) -> float:
         today_start = dt.datetime.combine(dt.date.today(), dt.time.min)
+        scope = (EquitySnapshot.broker == self.broker, EquitySnapshot.account_id == self.account_id)
         first = self.session.execute(
-            select(EquitySnapshot).where(EquitySnapshot.timestamp >= today_start).order_by(EquitySnapshot.timestamp)
+            select(EquitySnapshot).where(EquitySnapshot.timestamp >= today_start, *scope).order_by(EquitySnapshot.timestamp)
         ).scalars().first()
         latest = self.session.execute(
-            select(EquitySnapshot).order_by(EquitySnapshot.timestamp.desc())
+            select(EquitySnapshot).where(*scope).order_by(EquitySnapshot.timestamp.desc())
         ).scalars().first()
         if not first or not latest:
             return 0.0
@@ -32,7 +35,8 @@ class RiskManager:
 
     def current_exposure_usd(self, symbol: str) -> float:
         total = self.session.execute(
-            select(func.coalesce(func.sum(Trade.qty * Trade.fill_price), 0.0)).where(Trade.symbol == symbol)
+            select(func.coalesce(func.sum(Trade.qty * Trade.fill_price), 0.0))
+            .where(Trade.symbol == symbol, Trade.broker == self.broker, Trade.account_id == self.account_id)
         ).scalar_one()
         return float(total)
 

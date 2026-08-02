@@ -48,10 +48,17 @@ class Trade(Base):
     """An order placed with the broker, and its lifecycle."""
 
     __tablename__ = "trades"
+    # broker_order_id is only unique within a given broker's own ID space (Alpaca uses
+    # UUIDs, Questrade its own numeric IDs, but IBKR's orderId is a small sequential
+    # integer scoped to a client session) - a single-column unique constraint would
+    # wrongly reject a legitimate insert once multiple brokers/accounts share this table.
+    __table_args__ = (UniqueConstraint("broker", "account_id", "broker_order_id", name="uq_trades_broker_account_order"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     signal_id: Mapped[int | None] = mapped_column(ForeignKey("signals.id"), nullable=True)
-    broker_order_id: Mapped[str] = mapped_column(String, unique=True, index=True)
+    broker: Mapped[str] = mapped_column(String, index=True)
+    account_id: Mapped[str] = mapped_column(String, index=True)
+    broker_order_id: Mapped[str] = mapped_column(String, index=True)
     symbol: Mapped[str] = mapped_column(String, index=True)
     side: Mapped[OrderSide] = mapped_column(Enum(OrderSide))
     qty: Mapped[float] = mapped_column(Float)
@@ -71,6 +78,8 @@ class EquitySnapshot(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     timestamp: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow, index=True)
+    broker: Mapped[str] = mapped_column(String, index=True)
+    account_id: Mapped[str] = mapped_column(String, index=True)
     equity: Mapped[float] = mapped_column(Float)
     cash: Mapped[float] = mapped_column(Float)
     buying_power: Mapped[float] = mapped_column(Float)

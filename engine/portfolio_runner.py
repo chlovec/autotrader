@@ -10,7 +10,7 @@ from db.models import EquitySnapshot, Signal
 from db.session import get_session, init_db
 from engine.brokers import make_broker
 from engine.brokers.base import Timeframe
-from engine.config import load_config
+from engine.config import Config, load_config
 from engine.execution import ExecutionEngine
 from engine.notifications import log_and_notify, make_notifier
 from engine.portfolio import RebalancingPortfolio
@@ -30,8 +30,8 @@ def _already_rebalanced_this_month(session: Session, now: dt.datetime | None = N
     return latest is not None and latest.timestamp.year == now.year and latest.timestamp.month == now.month
 
 
-def rebalance_once(portfolio: RebalancingPortfolio) -> None:
-    config = load_config()
+def rebalance_once(portfolio: RebalancingPortfolio, config: Config | None = None) -> None:
+    config = config or load_config(argv=[])
     broker = make_broker(config)
     notifier = make_notifier(config)
 
@@ -40,7 +40,10 @@ def rebalance_once(portfolio: RebalancingPortfolio) -> None:
     # instead of only updating whenever a rebalance actually runs.
     account = broker.get_account()
     with get_session() as session:
-        session.add(EquitySnapshot(equity=account.equity, cash=account.cash, buying_power=account.buying_power))
+        session.add(EquitySnapshot(
+            equity=account.equity, cash=account.cash, buying_power=account.buying_power,
+            broker=broker.name, account_id=account.account_id,
+        ))
         session.commit()
 
     if not broker.get_clock().is_open:
@@ -48,8 +51,8 @@ def rebalance_once(portfolio: RebalancingPortfolio) -> None:
         return
 
     with get_session() as session:
-        risk = RiskManager(config, session)
-        execution = ExecutionEngine(broker, session, notifier)
+        risk = RiskManager(config, session, broker.name, account.account_id)
+        execution = ExecutionEngine(broker, account, session, notifier)
 
         engaged, reason = risk.kill_switch_engaged()
         if engaged:
@@ -87,19 +90,23 @@ def rebalance_once(portfolio: RebalancingPortfolio) -> None:
             logger.info("rebalance: %s %s qty=%s (%s)", order.action.value, order.symbol, trade.qty, order.reason)
 
 
-def main(target_weights: dict[str, float], day: str = "1-4", hour: int = 9, minute: int = 35) -> None:
+def main(target_weights: dict[str, float], config: Config | None = None, day: str = "1-4", hour: int = 9, minute: int = 35) -> None:
     """Runs once a month, on the first trading day at or after `day` (a range like "1-4"
     covers a day-1 weekend without skipping the whole month - _already_rebalanced_this_month
     then stops it firing again on day 2-4 once day 1 or the first open day after it succeeds).
     Also runs once immediately on startup, in case the account needs its initial allocation
-    before the next scheduled slot."""
+    before the next scheduled slot.
+
+    config is resolved once, here, and reused for every scheduled rebalance - see
+    engine/runner.py's main() docstring for why that matters (fail-fast at startup)."""
+    config = config or load_config(argv=[])
     init_db()
     portfolio = RebalancingPortfolio(target_weights)
 
-    rebalance_once(portfolio)
+    rebalance_once(portfolio, config=config)
 
     scheduler = BlockingScheduler()
     trigger = CronTrigger(day=day, hour=hour, minute=minute, timezone="America/New_York")
-    scheduler.add_job(rebalance_once, trigger, args=[portfolio])
+    scheduler.add_job(rebalance_once, trigger, args=[portfolio], kwargs={"config": config})
     logger.info("starting monthly rebalance loop on day %s at %02d:%02d America/New_York, weights=%s", day, hour, minute, target_weights)
     scheduler.start()

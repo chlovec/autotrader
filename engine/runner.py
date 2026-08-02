@@ -8,7 +8,7 @@ from db.queries import get_watchlist_symbols
 from db.session import get_session, init_db
 from engine.brokers import make_broker
 from engine.brokers.base import Timeframe
-from engine.config import load_config
+from engine.config import Config, load_config
 from engine.execution import ExecutionEngine
 from engine.notifications import log_and_notify, make_notifier
 from engine.risk import RiskManager
@@ -18,8 +18,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("autotrader.runner")
 
 
-def run_once(strategy: Strategy, symbols: list[str] | None = None) -> None:
-    config = load_config()
+def run_once(strategy: Strategy, symbols: list[str] | None = None, config: Config | None = None) -> None:
+    config = config or load_config(argv=[])
     broker = make_broker(config)
     notifier = make_notifier(config)
 
@@ -28,7 +28,10 @@ def run_once(strategy: Strategy, symbols: list[str] | None = None) -> None:
     # instead of only updating whenever a cycle actually trades.
     account = broker.get_account()
     with get_session() as session:
-        session.add(EquitySnapshot(equity=account.equity, cash=account.cash, buying_power=account.buying_power))
+        session.add(EquitySnapshot(
+            equity=account.equity, cash=account.cash, buying_power=account.buying_power,
+            broker=broker.name, account_id=account.account_id,
+        ))
         session.commit()
 
     if not broker.get_clock().is_open:
@@ -36,8 +39,8 @@ def run_once(strategy: Strategy, symbols: list[str] | None = None) -> None:
         return
 
     with get_session() as session:
-        risk = RiskManager(config, session)
-        execution = ExecutionEngine(broker, session, notifier)
+        risk = RiskManager(config, session, broker.name, account.account_id)
+        execution = ExecutionEngine(broker, account, session, notifier)
 
         engaged, reason = risk.kill_switch_engaged()
         if engaged:
@@ -85,17 +88,24 @@ def run_once(strategy: Strategy, symbols: list[str] | None = None) -> None:
             logger.info("submitted %s order for %s qty=%s", action.value, symbol, trade.qty)
 
 
-def main(strategy: Strategy, symbols: list[str] | None = None, hour: int = 9, minute: int = 35) -> None:
+def main(strategy: Strategy, config: Config | None = None, symbols: list[str] | None = None, hour: int = 9, minute: int = 35) -> None:
     """Runs once per weekday at hour:minute America/New_York, using the latest completed
     daily bars. Default of 9:35 gives the market a few minutes to open before trading.
 
     symbols defaults to None, meaning each cycle trades whatever engine/research_runner.py
     most recently selected (db.queries.get_watchlist_symbols) - pass an explicit list to
-    override, e.g. for tests or a one-off manual run."""
+    override, e.g. for tests or a one-off manual run.
+
+    config is resolved once, here, and reused for every scheduled cycle - not just left for
+    run_once to load fresh on the first scheduled fire. Resolving it eagerly means a bad
+    config (e.g. ALPACA_PAPER=false with no live keys) fails at startup instead of surfacing
+    only at the next weekday 9:35am, and even then only as a logged APScheduler job error
+    rather than a startup crash."""
+    config = config or load_config(argv=[])
     init_db()
     scheduler = BlockingScheduler()
     trigger = CronTrigger(day_of_week="mon-fri", hour=hour, minute=minute, timezone="America/New_York")
-    scheduler.add_job(run_once, trigger, kwargs={"strategy": strategy, "symbols": symbols})
+    scheduler.add_job(run_once, trigger, kwargs={"strategy": strategy, "symbols": symbols, "config": config})
     logger.info(
         "starting autotrader daily loop at %02d:%02d America/New_York, symbols=%s",
         hour, minute, symbols if symbols is not None else "from research watchlist",

@@ -1,6 +1,8 @@
 import datetime as dt
 
 import pandas as pd
+import pytest
+from alpaca.common.exceptions import APIError
 
 from engine.brokers.alpaca_broker import AlpacaBroker, _default_start
 from engine.brokers.base import Timeframe
@@ -18,6 +20,7 @@ def _config() -> Config:
         ibkr_port=7497,
         ibkr_client_id=1,
         questrade_refresh_token="token",
+        questrade_poll_interval_seconds=5.0,
         max_position_size_usd=1000.0,
         max_daily_loss_usd=200.0,
         smtp_host="",
@@ -72,6 +75,48 @@ def test_get_bars_without_start_ignores_alpacas_limit_and_takes_the_tail(monkeyp
     assert captured_requests[0].limit is None
     assert captured_requests[0].start is not None
     assert bars["close"].tolist() == [7, 8, 9]  # the most recent 3 of the 10 fake rows
+
+
+class _FakeResponse:
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+
+
+class _FakeHTTPError:
+    def __init__(self, status_code: int):
+        self.response = _FakeResponse(status_code)
+
+
+def _api_error(status_code: int) -> APIError:
+    return APIError('{"code": 1, "message": "boom"}', _FakeHTTPError(status_code))
+
+
+def test_get_position_qty_returns_zero_when_no_open_position(monkeypatch):
+    """A 404 from get_open_position means "no position for this symbol" - a normal,
+    expected outcome, not a failure."""
+    broker = AlpacaBroker(_config())
+
+    def fake_get_open_position(symbol):
+        raise _api_error(404)
+
+    monkeypatch.setattr(broker._trading, "get_open_position", fake_get_open_position)
+
+    assert broker.get_position_qty("AAPL") == 0.0
+
+
+def test_get_position_qty_raises_on_auth_failure(monkeypatch):
+    """A 401/403 (or anything other than "no position") must propagate, not be
+    swallowed into a false "0 shares held" - that would make the engine think it's
+    starting from a flat position when it actually has no idea what it holds."""
+    broker = AlpacaBroker(_config())
+
+    def fake_get_open_position(symbol):
+        raise _api_error(401)
+
+    monkeypatch.setattr(broker._trading, "get_open_position", fake_get_open_position)
+
+    with pytest.raises(APIError):
+        broker.get_position_qty("AAPL")
 
 
 def test_get_bars_with_explicit_start_passes_limit_through_unchanged(monkeypatch):

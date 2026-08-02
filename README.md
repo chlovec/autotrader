@@ -175,7 +175,7 @@ nohup .venv/bin/python run_portfolio.py > portfolio_runner.log 2>&1 &
 ```
 
 A `Makefile` wraps this with the broker/mode combination baked in, so you don't
-have to remember which env vars to set:
+have to remember which flags to pass:
 
 ```bash
 make run-alpaca-sim    # Alpaca, paper trading
@@ -185,8 +185,8 @@ make run-ibkr-live     # IBKR, real money (TWS port 7496) - asks you to type "ye
 make help              # list targets and current port/script settings
 ```
 
-These set `BROKER` and the paper/live flag as env vars for that one invocation —
-they don't touch `.env`, and `ALPACA_PAPER=false` automatically picks up
+These pass `--broker` and the paper/live flag as CLI args for that one invocation —
+they don't touch `.env`, and `--alpaca-paper false` automatically picks up
 `ALPACA_LIVE_API_KEY`/`ALPACA_LIVE_SECRET_KEY` instead of the paper pair (see
 [Configuration](#configuration)). Using IB Gateway instead of TWS, or non-default
 ports? `make run-ibkr-sim IBKR_SIM_PORT=4002`. Want to run one of the alternative
@@ -323,12 +323,16 @@ same commands somewhere that stays on, either directly (Options A/B) or in
 containers (Option C).
 
 Unattended deployment (`launchd`, `systemd`) should invoke `.venv/bin/python
-run_portfolio.py` directly with explicit `BROKER`/`ALPACA_PAPER`/`IBKR_PORT` env
-vars, **not** `make run-alpaca-live` / `make run-ibkr-live` — those two prompt for
-interactive confirmation on purpose, which just hangs forever with no terminal
-attached to answer it. The `make` targets are for you, running something by hand
-and meaning to; a service definition should already encode that intent explicitly
-in its own config, the way the example below does.
+run_portfolio.py` directly with explicit `--broker`/`--alpaca-paper`/`--ibkr-port`
+flags (e.g. `ProgramArguments: [".venv/bin/python", "run_portfolio.py", "--broker",
+"alpaca", "--alpaca-paper", "false"]`) — every flag not passed falls back to its
+`.env`/environment-variable value, same as `BROKER`/`ALPACA_PAPER`/`IBKR_PORT`
+worked before, but explicit in the service definition itself rather than relying on
+ambient env vars. **Not** `make run-alpaca-live` / `make run-ibkr-live` — those two
+prompt for interactive confirmation on purpose, which just hangs forever with no
+terminal attached to answer it. The `make` targets are for you, running something
+by hand and meaning to; a service definition should already encode that intent
+explicitly in its own config, the way the example below does.
 
 ### Option A: keep it on your Mac, survive reboots
 
@@ -422,6 +426,18 @@ and exposes a "run now" trigger from the dashboard. Run it on demand instead:
 ```bash
 docker compose run --rm research
 ```
+
+Bring the containers down with:
+
+```bash
+docker compose down
+```
+
+This stops and removes the `backend`/`engine`/`dashboard` containers but leaves the
+bind-mounted `autotrader.db` and `questrade_token.json` on disk, so `docker compose
+up -d --build` picks back up where you left off. Add `-v` only if you also want to
+drop any anonymous volumes Compose created — the SQLite database itself isn't one
+of those, so it's unaffected either way.
 
 Notes specific to running this way:
 

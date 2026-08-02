@@ -1,12 +1,14 @@
+import asyncio
 import datetime as dt
 import json
 from pathlib import Path
+from typing import Awaitable, Callable
 
 import pandas as pd
 import requests
 
-from db.models import SignalAction
-from engine.brokers.base import AccountSnapshot, ClockSnapshot, OrderResult, PositionSnapshot, Timeframe
+from db.models import OrderSide, SignalAction
+from engine.brokers.base import AccountSnapshot, BrokerOrder, ClockSnapshot, OrderResult, PositionSnapshot, Timeframe
 from engine.config import Config
 
 _AUTH_URL = "https://login.questrade.com/oauth2/token"
@@ -38,6 +40,8 @@ class QuestradeBroker:
     (particularly `openPnl`, `combinedBalances`) against a real account before
     trusting this with money.
     """
+
+    name = "questrade"
 
     def __init__(self, config: Config):
         self._config = config
@@ -95,6 +99,7 @@ class QuestradeBroker:
             equity=float(combined["totalEquity"]),
             cash=float(combined["cash"]),
             buying_power=float(combined["buyingPower"]),
+            account_id=account_id,
         )
 
     def get_clock(self) -> ClockSnapshot:
@@ -164,3 +169,39 @@ class QuestradeBroker:
         data = self._request("POST", f"/v1/accounts/{account_id}/orders", json=body)
         order = data["orders"][0]
         return OrderResult(broker_order_id=str(order["id"]), status=order.get("state", "submitted"))
+
+    def get_recent_orders(self, since: dt.datetime) -> list[BrokerOrder]:
+        account_id = self._get_account_id()
+        start = since if since.tzinfo else since.replace(tzinfo=dt.timezone.utc)
+        end = dt.datetime.now(dt.timezone.utc)
+        data = self._request(
+            "GET",
+            f"/v1/accounts/{account_id}/orders",
+            params={"startTime": start.isoformat(), "endTime": end.isoformat()},
+        )
+        return [
+            BrokerOrder(
+                broker_order_id=str(order["id"]),
+                symbol=order["symbol"],
+                side=OrderSide.buy if order["side"] == "Buy" else OrderSide.sell,
+                qty=float(order["totalQuantity"]),
+                status=order.get("state", "unknown"),
+                fill_price=float(order["avgExecPrice"]) if order.get("avgExecPrice") is not None else None,
+                submitted_at=dt.datetime.fromisoformat(order["creationTime"]),
+                filled_at=(
+                    dt.datetime.fromisoformat(order["updateTime"])
+                    if order.get("state") == "Filled" and order.get("updateTime")
+                    else None
+                ),
+            )
+            for order in data["orders"]
+        ]
+
+    async def stream(self, on_change: Callable[[], Awaitable[None]]) -> None:
+        """Questrade's public API has no push/webhook mechanism at all - this simulates
+        one by ticking on_change() on a fixed interval (questrade_poll_interval_seconds);
+        the backend's reconciliation routine does the actual work of detecting what, if
+        anything, changed since the last tick."""
+        while True:
+            await on_change()
+            await asyncio.sleep(self._config.questrade_poll_interval_seconds)

@@ -18,6 +18,7 @@ def _config(broker: str) -> Config:
         ibkr_port=7497,
         ibkr_client_id=1,
         questrade_refresh_token="token",
+        questrade_poll_interval_seconds=5.0,
         max_position_size_usd=1000.0,
         max_daily_loss_usd=200.0,
         smtp_host="",

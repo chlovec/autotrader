@@ -22,7 +22,7 @@ from db.models import ResearchResult
 from db.session import get_session, init_db
 from engine.brokers import make_broker
 from engine.brokers.base import Timeframe
-from engine.config import load_config
+from engine.config import Config, load_config
 from engine.notifications import log_and_notify, make_notifier
 from engine.research import combine, fetch_universe_news, make_news_client, score_news, score_technical
 
@@ -49,12 +49,14 @@ DEFAULT_TOP_N = 10
 _INTER_SYMBOL_DELAY_SECONDS = 0.2
 
 
-def research_once(universe: list[str], top_n: int, technical_weight: float = 0.5, news_weight: float = 0.5) -> None:
+def research_once(
+    universe: list[str], top_n: int, technical_weight: float = 0.5, news_weight: float = 0.5, config: Config | None = None
+) -> None:
     deduped = list(dict.fromkeys(universe))  # preserves order, drops duplicate tickers
     if top_n > len(deduped):
         raise ValueError(f"top_n ({top_n}) exceeds universe size ({len(deduped)})")
 
-    config = load_config()
+    config = config or load_config(argv=[])
     broker = make_broker(config)
     news_client = make_news_client(config)
     notifier = make_notifier(config)
@@ -111,6 +113,7 @@ def main(
     top_n: int = DEFAULT_TOP_N,
     technical_weight: float = 0.5,
     news_weight: float = 0.5,
+    config: Config | None = None,
 ) -> None:
     """One-shot manual/CLI entrypoint - python run_research.py, or an OS-level cron on a
     box that doesn't run the backend persistently. For the automatic nightly schedule tied
@@ -118,4 +121,4 @@ def main(
     (backend/app/main.py owns that scheduler) - don't run both unattended against the same
     database, since neither is aware of the other's runs."""
     init_db()
-    research_once(universe, top_n, technical_weight, news_weight)
+    research_once(universe, top_n, technical_weight, news_weight, config=config)

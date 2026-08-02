@@ -3,11 +3,11 @@ from __future__ import annotations
 import datetime as dt
 import enum
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Awaitable, Callable, Protocol
 
 import pandas as pd
 
-from db.models import SignalAction
+from db.models import OrderSide, SignalAction
 
 
 class Timeframe(enum.Enum):
@@ -20,6 +20,7 @@ class AccountSnapshot:
     equity: float
     cash: float
     buying_power: float
+    account_id: str
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,22 @@ class OrderResult:
     status: str
 
 
+@dataclass(frozen=True)
+class BrokerOrder:
+    """One order on the account, as reported by the broker - regardless of whether this
+    app or something else (the broker's own UI, another client) submitted it. Used by
+    the backend's reconciliation routine to detect trades this app didn't place itself."""
+
+    broker_order_id: str
+    symbol: str
+    side: OrderSide
+    qty: float
+    status: str
+    fill_price: float | None
+    submitted_at: dt.datetime
+    filled_at: dt.datetime | None
+
+
 class BrokerClient(Protocol):
     """Everything the engine and backend need from a broker.
 
@@ -49,6 +66,10 @@ class BrokerClient(Protocol):
     writing a new class against this interface - strategy, risk, execution, the
     backend API, and the backtest script never import a broker SDK directly.
     """
+
+    name: str
+    """One of "alpaca"/"ibkr"/"questrade" - used to tag EquitySnapshot/Trade rows so
+    data from different brokers/accounts sharing the same DB never gets mixed together."""
 
     def get_account(self) -> AccountSnapshot: ...
 
@@ -67,3 +88,18 @@ class BrokerClient(Protocol):
     def get_positions(self) -> list[PositionSnapshot]: ...
 
     def submit_market_order(self, symbol: str, action: SignalAction, qty: float) -> OrderResult: ...
+
+    def get_recent_orders(self, since: dt.datetime) -> list[BrokerOrder]:
+        """Every order on the account submitted at or after `since`, including ones this
+        app didn't place - not just ones ExecutionEngine.submit_market_order created."""
+        ...
+
+    async def stream(self, on_change: Callable[[], Awaitable[None]]) -> None:
+        """Runs until cancelled, calling on_change() whenever the broker signals that
+        something (an order, a fill, account state) may have changed. Never inspects or
+        relays the event payload itself - callers are expected to re-fetch get_account()/
+        get_positions()/get_recent_orders() for the current truth, since Alpaca, IBKR,
+        and Questrade each expose completely different event shapes (or none at all, in
+        Questrade's case - its "stream" is an internal poll loop calling on_change() on a
+        timer)."""
+        ...

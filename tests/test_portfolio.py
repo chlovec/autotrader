@@ -6,7 +6,7 @@ from engine.portfolio import RebalancingPortfolio
 
 
 def _account(equity: float) -> AccountSnapshot:
-    return AccountSnapshot(equity=equity, cash=equity, buying_power=equity)
+    return AccountSnapshot(equity=equity, cash=equity, buying_power=equity, account_id="acct-1")
 
 
 def test_rejects_weights_not_summing_to_one():

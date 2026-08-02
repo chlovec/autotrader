@@ -22,6 +22,7 @@ def _config(refresh_token: str = "seed-token") -> Config:
         ibkr_port=7497,
         ibkr_client_id=1,
         questrade_refresh_token=refresh_token,
+        questrade_poll_interval_seconds=5.0,
         max_position_size_usd=1000.0,
         max_daily_loss_usd=200.0,
         smtp_host="",
@@ -95,6 +96,7 @@ def test_get_account_parses_usd_combined_balance():
     assert account.equity == 10000.0
     assert account.cash == 4000.0
     assert account.buying_power == 16000.0
+    assert account.account_id == "123"
 
 
 def test_get_positions_translates_openpnl_field():

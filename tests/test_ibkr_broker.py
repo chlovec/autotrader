@@ -18,6 +18,7 @@ def _config() -> Config:
         ibkr_port=7497,
         ibkr_client_id=1,
         questrade_refresh_token="",
+        questrade_poll_interval_seconds=5.0,
         max_position_size_usd=1000.0,
         max_daily_loss_usd=200.0,
         smtp_host="",
@@ -115,12 +116,14 @@ def test_get_account_reads_net_liquidation_cash_and_buying_power():
             SimpleNamespace(tag="TotalCashValue", value="4000.0", currency="USD"),
             SimpleNamespace(tag="BuyingPower", value="16000.0", currency="USD"),
             SimpleNamespace(tag="NetLiquidation", value="9000.0", currency="EUR"),  # ignored, wrong currency
-        ]
+        ],
+        managedAccounts=lambda: ["DU1234567"],
     )
     account = _broker_with_fake_ib(fake_ib).get_account()
     assert account.equity == 10000.5
     assert account.cash == 4000.0
     assert account.buying_power == 16000.0
+    assert account.account_id == "DU1234567"
 
 
 def test_get_positions_translates_portfolio_items():

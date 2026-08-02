@@ -32,21 +32,21 @@ help:
 	@echo "  docker-logs      Tail logs from all running containers"
 
 run-alpaca-sim:
-	BROKER=alpaca ALPACA_PAPER=true $(PYTHON) $(RUN_SCRIPT) & \
+	$(PYTHON) $(RUN_SCRIPT) --broker alpaca --alpaca-paper true & \
 
 run-alpaca-live:
 	@echo "This will place REAL trades with REAL money on your live Alpaca account."
 	@read -p "Type 'yes' to continue: " confirm && [ "$$confirm" = "yes" ] || (echo "Aborted."; exit 1)
-	BROKER=alpaca ALPACA_PAPER=false $(PYTHON) $(RUN_SCRIPT)
+	$(PYTHON) $(RUN_SCRIPT) --broker alpaca --alpaca-paper false
 
 run-ibkr-sim:
-	BROKER=ibkr IBKR_PORT=$(IBKR_SIM_PORT) $(PYTHON) $(RUN_SCRIPT)
+	$(PYTHON) $(RUN_SCRIPT) --broker ibkr --ibkr-port $(IBKR_SIM_PORT)
 
 run-ibkr-live:
 	@echo "This will place REAL trades with REAL money on your live IBKR account."
 	@echo "Make sure TWS/Gateway is logged into your LIVE account on port $(IBKR_LIVE_PORT), not paper."
 	@read -p "Type 'yes' to continue: " confirm && [ "$$confirm" = "yes" ] || (echo "Aborted."; exit 1)
-	BROKER=ibkr IBKR_PORT=$(IBKR_LIVE_PORT) $(PYTHON) $(RUN_SCRIPT)
+	$(PYTHON) $(RUN_SCRIPT) --broker ibkr --ibkr-port $(IBKR_LIVE_PORT)
 
 research:
 	$(PYTHON) run_research.py

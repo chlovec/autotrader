@@ -62,6 +62,11 @@ function App() {
       setResearchStatus(researchStatusData)
     } catch {
       setConnected(false)
+      setPositions([])
+      setEquity([])
+      setTrades([])
+      setSignals([])
+      setEvents([])
     }
   }, [])
 
@@ -93,8 +98,25 @@ function App() {
       if (data.type === 'equity') {
         setEquity((prev) => {
           if (prev.length > 0 && prev[prev.length - 1].timestamp === data.timestamp) return prev
-          return [...prev, { timestamp: data.timestamp, equity: data.equity, cash: prev[prev.length - 1]?.cash ?? 0 }]
+          return [...prev, { timestamp: data.timestamp, equity: data.equity, cash: data.cash }]
         })
+      } else if (data.type === 'positions') {
+        setPositions(data.positions)
+      } else if (data.type === 'trades') {
+        setTrades((prev) => {
+          const byId = new Map(prev.map((t) => [t.id, t]))
+          for (const t of data.trades as Trade[]) byId.set(t.id, t)
+          return [...byId.values()].sort((a, b) => a.submitted_at.localeCompare(b.submitted_at))
+        })
+      } else if (data.type === 'snapshot') {
+        if (data.equity) {
+          setEquity((prev) => {
+            if (prev.length > 0 && prev[prev.length - 1].timestamp === data.equity.timestamp) return prev
+            return [...prev, data.equity]
+          })
+        }
+        setPositions(data.positions)
+        setTrades(data.trades)
       }
     }
     return () => ws.close()

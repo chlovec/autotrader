@@ -1,11 +1,19 @@
 import datetime as dt
+from typing import Awaitable, Callable
 
 import pandas as pd
 from ib_async import IB, MarketOrder, Stock
 
-from db.models import SignalAction
-from engine.brokers.base import AccountSnapshot, ClockSnapshot, OrderResult, PositionSnapshot, Timeframe
+from db.models import OrderSide, SignalAction
+from engine.brokers.base import AccountSnapshot, BrokerOrder, ClockSnapshot, OrderResult, PositionSnapshot, Timeframe
 from engine.config import Config
+
+
+def _as_utc(moment: dt.datetime) -> dt.datetime:
+    """ib_async's own timestamps (Fill.time, TradeLogEntry.time) are timezone-aware UTC;
+    `since` arrives from the backend's reconciliation routine as a naive UTC datetime
+    (dt.datetime.utcnow()) - normalize so comparisons between the two don't raise."""
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=dt.timezone.utc)
 
 _BAR_SIZE = {
     Timeframe.MINUTE: "1 min",
@@ -62,6 +70,8 @@ class IBKRBroker:
     needs confirming.
     """
 
+    name = "ibkr"
+
     def __init__(self, config: Config):
         self._config = config
         self._ib = IB()
@@ -82,10 +92,12 @@ class IBKRBroker:
     def get_account(self) -> AccountSnapshot:
         ib = self._ensure_connected()
         values = {v.tag: v.value for v in ib.accountSummary() if v.currency in ("USD", "BASE")}
+        managed_accounts = ib.managedAccounts()
         return AccountSnapshot(
             equity=float(values.get("NetLiquidation", 0.0)),
             cash=float(values.get("TotalCashValue", 0.0)),
             buying_power=float(values.get("BuyingPower", 0.0)),
+            account_id=managed_accounts[0] if managed_accounts else "",
         )
 
     def get_clock(self) -> ClockSnapshot:
@@ -145,3 +157,76 @@ class IBKRBroker:
         trade = ib.placeOrder(self._contract(symbol), order)
         ib.sleep(1)  # pump the event loop so the order's initial ack has arrived
         return OrderResult(broker_order_id=str(trade.order.orderId), status=trade.orderStatus.status or "submitted")
+
+    def get_recent_orders(self, since: dt.datetime) -> list[BrokerOrder]:
+        """Combines still-open orders (reqAllOpenOrders - includes orders placed by any
+        client on the account, e.g. someone trading directly in TWS) with completed fills
+        (fills - cached, no request-and-wait), keyed by IB's orderId so a fill overwrites
+        the corresponding still-open entry with its final fill_price/filled_at."""
+        ib = self._ensure_connected()
+        since = _as_utc(since)
+        orders_by_id: dict[int, BrokerOrder] = {}
+
+        for trade in ib.reqAllOpenOrders():
+            submitted_at = _as_utc(trade.log[0].time) if trade.log else dt.datetime.now(dt.timezone.utc)
+            if submitted_at < since:
+                continue
+            orders_by_id[trade.order.orderId] = BrokerOrder(
+                broker_order_id=str(trade.order.orderId),
+                symbol=trade.contract.symbol,
+                side=OrderSide.buy if trade.order.action == "BUY" else OrderSide.sell,
+                qty=float(trade.order.totalQuantity),
+                status=trade.orderStatus.status,
+                fill_price=trade.orderStatus.avgFillPrice or None,
+                submitted_at=submitted_at,
+                filled_at=None,
+            )
+
+        for fill in ib.fills():
+            filled_at = _as_utc(fill.time)
+            if filled_at < since:
+                continue
+            order_id = fill.execution.orderId
+            existing = orders_by_id.get(order_id)
+            orders_by_id[order_id] = BrokerOrder(
+                broker_order_id=str(order_id),
+                symbol=fill.contract.symbol,
+                side=OrderSide.buy if fill.execution.side == "BOT" else OrderSide.sell,
+                qty=float(fill.execution.shares),
+                status="filled",
+                fill_price=float(fill.execution.avgPrice or fill.execution.price),
+                submitted_at=existing.submitted_at if existing else filled_at,
+                filled_at=filled_at,
+            )
+
+        return list(orders_by_id.values())
+
+    async def stream(self, on_change: Callable[[], Awaitable[None]]) -> None:
+        """ib_async is asyncio-native and already maintains a persistent socket to
+        TWS/Gateway - this registers on_change against the account/order callbacks it
+        already fires, rather than opening any new connection. Payloads are never
+        inspected here; the backend re-fetches full state centrally on every signal (see
+        backend/app/broker_stream.py)."""
+        ib = self._ib
+        if not ib.isConnected():
+            await ib.connectAsync(
+                self._config.ibkr_host,
+                self._config.ibkr_port,
+                clientId=self._config.ibkr_client_id,
+                timeout=10,
+            )
+
+        async def _handler(*_args: object) -> None:
+            await on_change()
+
+        ib.orderStatusEvent += _handler
+        ib.execDetailsEvent += _handler
+        ib.positionEvent += _handler
+        ib.accountValueEvent += _handler
+        try:
+            await ib.disconnectedEvent
+        finally:
+            ib.orderStatusEvent -= _handler
+            ib.execDetailsEvent -= _handler
+            ib.positionEvent -= _handler
+            ib.accountValueEvent -= _handler

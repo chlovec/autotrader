@@ -1,4 +1,3 @@
-import asyncio
 import datetime as dt
 import logging
 import os
@@ -11,6 +10,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, WebSocket, WebSocke
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, select
 
+from backend.app import broker_stream
 from db.models import EquitySnapshot, KillSwitch, ResearchResult, ResearchSchedule, Signal, SystemEvent, Trade
 from db.session import get_session, init_db
 from engine.brokers import make_broker
@@ -72,16 +72,36 @@ def _nightly_research_job() -> None:
     _run_research()
 
 
+def _start_broker_stream() -> None:
+    """Builds the one long-lived broker connection this process holds (needed for
+    streaming - Alpaca's TradingStream, IBKR's IB(), and Questrade's cached token/account
+    id all need to persist across requests, unlike the old per-request make_broker()
+    calls) and launches its background stream/reconciliation tasks. Factored out as its
+    own function so tests can monkeypatch it to a no-op instead of touching a real
+    broker/network on every TestClient startup."""
+    app.state.broker = make_broker(load_config(argv=[]))
+    app.state.account_id = app.state.broker.get_account().account_id
+    app.state.broker_stream_handle = broker_stream.start(app.state.broker)
+
+
+async def _stop_broker_stream() -> None:
+    handle = getattr(app.state, "broker_stream_handle", None)
+    if handle is not None:
+        await handle.stop()
+
+
 @app.on_event("startup")
-def on_startup() -> None:
+async def on_startup() -> None:
     init_db()
     _scheduler.add_job(_nightly_research_job, CronTrigger(hour=2, minute=0, timezone="America/New_York"), id="nightly-research")
     _scheduler.start()
+    _start_broker_stream()
 
 
 @app.on_event("shutdown")
-def on_shutdown() -> None:
+async def on_shutdown() -> None:
     _scheduler.shutdown(wait=False)
+    await _stop_broker_stream()
 
 
 @app.get("/health")
@@ -91,21 +111,30 @@ def health() -> dict:
 
 @app.get("/positions")
 def positions() -> list[dict]:
-    broker = make_broker(load_config())
-    return [asdict(p) for p in broker.get_positions()]
+    return [asdict(p) for p in app.state.broker.get_positions()]
 
 
 @app.get("/equity")
 def equity(limit: int = 500) -> list[dict]:
     with get_session() as session:
-        rows = session.execute(select(EquitySnapshot).order_by(EquitySnapshot.timestamp.desc()).limit(limit)).scalars().all()
+        rows = session.execute(
+            select(EquitySnapshot)
+            .where(EquitySnapshot.broker == app.state.broker.name, EquitySnapshot.account_id == app.state.account_id)
+            .order_by(EquitySnapshot.timestamp.desc())
+            .limit(limit)
+        ).scalars().all()
         return [{"timestamp": r.timestamp.isoformat(), "equity": r.equity, "cash": r.cash} for r in reversed(rows)]
 
 
 @app.get("/trades")
 def trades(limit: int = 200) -> list[dict]:
     with get_session() as session:
-        rows = session.execute(select(Trade).order_by(Trade.submitted_at.desc()).limit(limit)).scalars().all()
+        rows = session.execute(
+            select(Trade)
+            .where(Trade.broker == app.state.broker.name, Trade.account_id == app.state.account_id)
+            .order_by(Trade.submitted_at.desc())
+            .limit(limit)
+        ).scalars().all()
         return [
             {
                 "id": t.id,
@@ -214,13 +243,12 @@ def trigger_research(background_tasks: BackgroundTasks) -> dict:
 
 @app.websocket("/ws")
 async def ws_updates(websocket: WebSocket) -> None:
-    await websocket.accept()
+    await broker_stream.manager.connect(websocket)
+    await broker_stream.send_snapshot(websocket, app.state.broker, app.state.account_id)
     try:
         while True:
-            with get_session() as session:
-                latest = session.execute(select(EquitySnapshot).order_by(EquitySnapshot.timestamp.desc())).scalars().first()
-                if latest:
-                    await websocket.send_json({"type": "equity", "equity": latest.equity, "timestamp": latest.timestamp.isoformat()})
-            await asyncio.sleep(5)
+            await websocket.receive_text()  # only used to detect client disconnect
     except WebSocketDisconnect:
         pass
+    finally:
+        broker_stream.manager.disconnect(websocket)

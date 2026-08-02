@@ -35,6 +35,10 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setattr(db_session, "engine", test_engine)
     monkeypatch.setattr(db_session, "SessionLocal", sessionmaker(bind=test_engine, expire_on_commit=False))
     monkeypatch.setattr(backend_main, "_scheduler", _FakeScheduler())
+    # Startup normally builds a real, long-lived broker connection and launches
+    # network-touching background tasks (see backend/app/broker_stream.py) - none of
+    # that is needed or safe to run repeatedly across many TestClient instantiations.
+    monkeypatch.setattr(backend_main, "_start_broker_stream", lambda: None)
     with TestClient(backend_main.app) as test_client:
         yield test_client
 

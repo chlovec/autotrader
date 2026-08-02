@@ -66,12 +66,27 @@ case "$MODE" in
     ;;
 esac
 
-# Build the broker-specific env for the trading loop.
-BROKER_ENV=(BROKER="$BROKER")
+# Build the broker-specific CLI args for the trading loop (and research run below) -
+# passed as flags to load_config() rather than env vars, so a plain `ps` doesn't need to
+# guess what a running process was launched with.
+RUN_ARGS=(--broker "$BROKER")
 case "$BROKER" in
-  alpaca) BROKER_ENV+=(ALPACA_PAPER=$([ "$MODE" = "sim" ] && echo true || echo false)) ;;
-  ibkr) BROKER_ENV+=(IBKR_PORT=$([ "$MODE" = "sim" ] && echo "$IBKR_SIM_PORT" || echo "$IBKR_LIVE_PORT")) ;;
+  alpaca) RUN_ARGS+=(--alpaca-paper $([ "$MODE" = "sim" ] && echo true || echo false)) ;;
+  ibkr) RUN_ARGS+=(--ibkr-port $([ "$MODE" = "sim" ] && echo "$IBKR_SIM_PORT" || echo "$IBKR_LIVE_PORT")) ;;
   questrade) ;;  # sim vs live is just which QUESTRADE_REFRESH_TOKEN is configured
+esac
+
+# The backend (uvicorn) can't be handed the same CLI flags - it's not our entrypoint, so
+# there's nowhere to pass --broker/--ibkr-port through to. Its load_config(argv=[]) only
+# ever reads the environment/.env, so without this export it would silently keep
+# whatever broker/mode was last configured there - completely ignoring the selection
+# above - and the dashboard would show a different broker/account than the trading loop
+# and research run actually use.
+export BROKER="$BROKER"
+case "$BROKER" in
+  alpaca) export ALPACA_PAPER=$([ "$MODE" = "sim" ] && echo true || echo false) ;;
+  ibkr) export IBKR_PORT=$([ "$MODE" = "sim" ] && echo "$IBKR_SIM_PORT" || echo "$IBKR_LIVE_PORT") ;;
+  questrade) ;;
 esac
 
 echo "About to (re)start backend, dashboard, trading loop (broker=$BROKER, mode=$MODE), and a research run."
@@ -97,13 +112,38 @@ echo "Starting dashboard..."
 nohup bash -c 'cd frontend && exec npm run dev' >> "$LOG" 2>&1 &
 disown
 
-echo "Starting trading loop (${BROKER_ENV[*]}, $RUN_SCRIPT)..."
-nohup env "${BROKER_ENV[@]}" "$PYTHON" "$RUN_SCRIPT" >> "$LOG" 2>&1 &
+echo "Starting trading loop (${RUN_ARGS[*]}, $RUN_SCRIPT)..."
+nohup "$PYTHON" "$RUN_SCRIPT" "${RUN_ARGS[@]}" >> "$LOG" 2>&1 &
+RUN_PID=$!
 disown
 
 echo "Running research once..."
-nohup "$PYTHON" run_research.py >> "$LOG" 2>&1 &
+nohup "$PYTHON" run_research.py "${RUN_ARGS[@]}" >> "$LOG" 2>&1 &
+RESEARCH_PID=$!
 disown
+
+# `nohup ... &` never surfaces the child's exit code - without this check, a trading
+# loop that crashes on startup (e.g. live mode with no live keys configured, see
+# engine/config.py) would still print as a successful restart below. run_portfolio.py
+# and run.py never legitimately exit on their own (they block forever in a scheduler)
+# and a real research pass takes several seconds minimum (one HTTP round-trip per
+# symbol), so either process being dead already means it crashed on startup.
+sleep 2
+FAILED=0
+if ! kill -0 "$RUN_PID" 2>/dev/null; then
+  echo "ERROR: trading loop ($RUN_SCRIPT) exited immediately - check $LOG:" >&2
+  tail -n 20 "$LOG" >&2
+  FAILED=1
+fi
+if ! kill -0 "$RESEARCH_PID" 2>/dev/null; then
+  echo "ERROR: research run exited immediately - check $LOG:" >&2
+  tail -n 20 "$LOG" >&2
+  FAILED=1
+fi
+if [ "$FAILED" -eq 1 ]; then
+  echo "Backend/dashboard are still running - ./bin/stop.sh to tear everything down." >&2
+  exit 1
+fi
 
 echo "--- listening ports ---"
 for _ in 1 2 3 4 5 6 7 8 9 10; do
