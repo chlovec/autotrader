@@ -13,7 +13,6 @@ def _credentials(broker: str) -> AccountCredentials:
         alpaca_api_key="key",
         alpaca_secret_key="secret",
         alpaca_base_url="https://paper-api.alpaca.markets",
-        alpaca_paper=True,
         ibkr_host="127.0.0.1",
         ibkr_port=7497,
         ibkr_client_id=1,

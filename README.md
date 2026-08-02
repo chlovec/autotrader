@@ -63,8 +63,16 @@ The most complete integration, and the only one verified end-to-end (real paper
 trades placed, confirmed via the dashboard). Sign up at
 [alpaca.markets](https://alpaca.markets), grab paper-trading API keys from the
 [paper dashboard](https://app.alpaca.markets/paper/dashboard/overview), and set that
-account's `ACCOUNT_<id>_ALPACA_API_KEY` / `ACCOUNT_<id>_ALPACA_SECRET_KEY` in `.env`.
-No local software needed — it's a pure REST/WebSocket API.
+account's `ACCOUNT_<id>_ALPACA_API_KEY` / `ACCOUNT_<id>_ALPACA_SECRET_KEY` /
+`ACCOUNT_<id>_ALPACA_BASE_URL` in `.env`. No local software needed — it's a pure
+REST/WebSocket API.
+
+There's no separate paper/live setting — Alpaca's paper and live environments are just
+different hosts (`paper-api.alpaca.markets` vs `api.alpaca.markets`), each with their own
+key pair, so whichever credentials + base URL you give an account *is* which environment
+it trades in (same idea as IBKR's port number or Questrade's token below). Want one
+account paper and another live? Give them different ids in `ACCOUNT_IDS`, each with its
+own key pair.
 
 ### Interactive Brokers (`ACCOUNT_<id>_BROKER=ibkr`)
 
@@ -272,7 +280,7 @@ and a repeated `ACCOUNT_<id>_*` block per account.
 | `ACCOUNT_IDS` | Comma-separated list of account ids this deployment trades — every id needs a matching `ACCOUNT_<id>_*` block below |
 | `ACCOUNT_<id>_BROKER` | `alpaca`, `ibkr`, or `questrade` for that account — see [Brokers](#brokers). Implementation details in [ARCHITECTURE.md](ARCHITECTURE.md) |
 | `ACCOUNT_<id>_DISPLAY_NAME` | Shown on the dashboard for that account (defaults to the id itself) |
-| `ACCOUNT_<id>_ALPACA_API_KEY` / `_ALPACA_SECRET_KEY` / `_ALPACA_BASE_URL` / `_ALPACA_PAPER` | That account's Alpaca paper credentials/endpoint, plus `_ALPACA_LIVE_API_KEY`/`_ALPACA_LIVE_SECRET_KEY`/`_ALPACA_LIVE_BASE_URL` for live (only read when `_ALPACA_PAPER=false`) |
+| `ACCOUNT_<id>_ALPACA_API_KEY` / `_ALPACA_SECRET_KEY` / `_ALPACA_BASE_URL` | That account's Alpaca credentials and endpoint — no separate paper/live flag; whichever key pair + base URL you put here (paper or live) is the environment that account trades in |
 | `ACCOUNT_<id>_IBKR_HOST` / `_IBKR_PORT` / `_IBKR_CLIENT_ID` | Connection details for that account's TWS/Gateway — `_IBKR_CLIENT_ID` must be unique per account sharing a TWS/Gateway instance |
 | `ACCOUNT_<id>_QUESTRADE_REFRESH_TOKEN` / `_QUESTRADE_POLL_INTERVAL_SECONDS` | Seed OAuth token (only until that account's first run — see [Brokers](#brokers)) and polling cadence for that account's simulated stream |
 | `ACCOUNT_<id>_STRATEGY` / `_STRATEGY_PARAMS` | Only read the first time that id appears — after that, the assigned strategy is dashboard/database state, not `.env`. One of `ma_crossover`, `mean_reversion`, `regime_switching`, `rebalancing_portfolio`; `_STRATEGY_PARAMS` is JSON constructor kwargs (e.g. `{"target_weights": {...}}` for the rebalancer) |
@@ -479,37 +487,36 @@ wrap the equivalent `docker compose` commands.
 ### Going live (real money)
 
 This is the actual destination — paper trading is validation, not the end state.
-Flipping one account to live trading is a small config change to that account's
-`.env` block; the judgment call of *when* is the part that matters:
+There's no paper/live toggle to flip (see [Brokers](#brokers)) — going live means
+pointing an account's credentials at the live environment, which this project
+recommends doing as a **new account** rather than editing a working paper one in
+place, so the two never get mixed up and the paper account stays around (active or
+not) as a reference. The judgment call of *when* is the part that matters:
 
-1. **Open (or upgrade to) a live account** with that account's broker. For Alpaca,
-   this is a separate account from the paper one, requires identity verification
-   and funding, and is a distinct set of API keys from `app.alpaca.markets` (not
-   the paper dashboard).
-2. **Watch that account's paper-trading results for a meaningful stretch first** —
-   weeks, not days, and ideally through at least one real rebalance cycle so you've
-   seen the full loop (signal → order → fill → dashboard update) work unattended,
-   not just in a one-off test.
-3. **Add the live keys to that account's `.env` block**, alongside the paper ones
-   already there — don't replace them:
-
-   ```bash
-   ACCOUNT_<id>_ALPACA_LIVE_API_KEY=<your live key>
-   ACCOUNT_<id>_ALPACA_LIVE_SECRET_KEY=<your live secret>
-   ```
-
+1. **Open (or upgrade to) a live account** with that broker. For Alpaca, this is a
+   separate account from the paper one, requires identity verification and
+   funding, and is a distinct set of API keys from `app.alpaca.markets` (not the
+   paper dashboard).
+2. **Watch the paper account's results for a meaningful stretch first** — weeks,
+   not days, and ideally through at least one real rebalance cycle so you've seen
+   the full loop (signal → order → fill → dashboard update) work unattended, not
+   just in a one-off test.
+3. **Add a new account id to `ACCOUNT_IDS`** with its own `ACCOUNT_<new-id>_*`
+   block using the live credentials and `ACCOUNT_<new-id>_ALPACA_BASE_URL=https://api.alpaca.markets`
+   — give it the same strategy (`ACCOUNT_<new-id>_STRATEGY`/`_STRATEGY_PARAMS`) as
+   the paper account it's replacing, if you want matching behavior.
 4. **Start small.** Fund the live account with less than you're ultimately willing
-   to allocate, and/or lower that account's `max_position_size_usd` from its
-   dashboard page, so a bug costs a bounded amount to discover rather than the
-   full account.
-5. **Set that account's `ACCOUNT_<id>_ALPACA_PAPER=false`** and restart the
-   engine/backend when you actually mean to go live — that one account starts
-   using its live keys from step 3; every other account keeps running unaffected,
-   paper or live, whatever it was already set to.
+   to allocate, and/or set a conservative `MAX_POSITION_SIZE_USD`/`MAX_DAILY_LOSS_USD`
+   before it's first seeded (or lower them from its dashboard page right after), so
+   a bug costs a bounded amount to discover rather than the full account.
+5. **Restart the engine/backend** so the new account gets picked up, then
+   deactivate the paper account from the dashboard once you're confident (or leave
+   both running — activate/deactivate is exactly the tool for stepping one down
+   without touching the other).
 6. **Everything else keeps working the same way** — the kill switch, the daily loss
-   halt, the alerts, the dashboard. They're the same code paths regardless of
-   `ALPACA_PAPER`; nothing extra to configure for them to apply to the live account.
+   halt, the alerts, the dashboard. They're the same code paths for every account
+   regardless of which broker/environment its credentials point at.
 
-Nothing in this codebase enforces steps 1–4 for you — flipping `ALPACA_PAPER=false`
-in `.env` is enough to start placing real orders on that account, so the caution
+Nothing in this codebase enforces steps 1–4 for you — adding a live key pair
+to `.env` is enough to start placing real orders on that account, so the caution
 has to come from you, not from the software.

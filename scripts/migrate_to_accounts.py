@@ -61,19 +61,35 @@ _GLOBAL_KEYS = [
 ]
 
 # Old top-level key -> new ACCOUNT_<id>_ suffix, for whichever broker was configured.
+# Alpaca isn't here - see _resolve_alpaca_pair, since the old paper/live pair-plus-flag
+# shape resolves down to a single pair rather than a 1:1 key rename.
 _ACCOUNT_KEY_SUFFIXES = {
-    "ALPACA_API_KEY": "ALPACA_API_KEY",
-    "ALPACA_SECRET_KEY": "ALPACA_SECRET_KEY",
-    "ALPACA_BASE_URL": "ALPACA_BASE_URL",
-    "ALPACA_LIVE_API_KEY": "ALPACA_LIVE_API_KEY",
-    "ALPACA_LIVE_SECRET_KEY": "ALPACA_LIVE_SECRET_KEY",
-    "ALPACA_LIVE_BASE_URL": "ALPACA_LIVE_BASE_URL",
-    "ALPACA_PAPER": "ALPACA_PAPER",
     "IBKR_HOST": "IBKR_HOST",
     "IBKR_PORT": "IBKR_PORT",
     "IBKR_CLIENT_ID": "IBKR_CLIENT_ID",
     "QUESTRADE_REFRESH_TOKEN": "QUESTRADE_REFRESH_TOKEN",
 }
+
+
+def _resolve_alpaca_pair(values: dict) -> tuple[str, str, str]:
+    """The pre-multi-account .env had a paper key pair, a live key pair, and an
+    ALPACA_PAPER flag picking between them - the same redundant shape the new per-account
+    AccountCredentials dropped (see engine/config.py's docstring: which environment an
+    account hits is just whatever alpaca_base_url it's given, no separate flag). Resolves
+    down to whichever one pair was actually active, since the new scheme only has room
+    for one."""
+    is_paper = values.get("ALPACA_PAPER", "true").lower() == "true"
+    if is_paper:
+        return (
+            values.get("ALPACA_API_KEY", ""),
+            values.get("ALPACA_SECRET_KEY", ""),
+            values.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets"),
+        )
+    return (
+        values.get("ALPACA_LIVE_API_KEY", ""),
+        values.get("ALPACA_LIVE_SECRET_KEY", ""),
+        values.get("ALPACA_LIVE_BASE_URL", "https://api.alpaca.markets"),
+    )
 
 
 def _sqlite_path(database_url: str) -> Path:
@@ -211,7 +227,18 @@ def _rewrite_env(env_path: Path, account_id: str, dry_run: bool) -> None:
         print(".env already has ACCOUNT_IDS set - already migrated, skipping.")
         return
 
-    lines = [f"ACCOUNT_IDS={account_id}", "", f"ACCOUNT_{account_id}_BROKER={values.get('BROKER', 'alpaca')}"]
+    broker = values.get("BROKER", "alpaca")
+    lines = [f"ACCOUNT_IDS={account_id}", "", f"ACCOUNT_{account_id}_BROKER={broker}"]
+
+    if broker == "alpaca":
+        api_key, secret_key, base_url = _resolve_alpaca_pair(values)
+        if api_key:
+            lines.append(f"ACCOUNT_{account_id}_ALPACA_API_KEY={api_key}")
+        if secret_key:
+            lines.append(f"ACCOUNT_{account_id}_ALPACA_SECRET_KEY={secret_key}")
+        if base_url:
+            lines.append(f"ACCOUNT_{account_id}_ALPACA_BASE_URL={base_url}")
+
     for old_key, suffix in _ACCOUNT_KEY_SUFFIXES.items():
         if values.get(old_key):
             lines.append(f"ACCOUNT_{account_id}_{suffix}={values[old_key]}")

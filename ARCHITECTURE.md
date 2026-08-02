@@ -89,13 +89,17 @@ a local socket connection with no key at all, an OAuth refresh token), not one
 generic `broker_api_key` field with per-broker interpretation. Adding a fourth
 broker means adding its own `<name>_*` fields, not fitting it into an existing shape.
 
-`load_account_credentials()` does one piece of resolution rather than a straight env-var
-copy: Alpaca paper and live are separate accounts with separate keys, so an account's
-`.env` block holds both pairs (`ACCOUNT_<id>_ALPACA_API_KEY`/`_ALPACA_SECRET_KEY` and
-`ACCOUNT_<id>_ALPACA_LIVE_API_KEY`/`_ALPACA_LIVE_SECRET_KEY`), and the function picks the
-pair matching that account's own `_ALPACA_PAPER` value - by the time `AlpacaBroker` sees
-`credentials.alpaca_api_key`, it's already the right one, and flipping one account to
-live never touches another account's keys.
+No separate paper/live flag anywhere in `AccountCredentials`, for any broker - which
+environment an account trades in is just whatever `alpaca_base_url`/`ibkr_port`/
+`questrade_refresh_token` value it was given, the same way IBKR (port 7497 vs 7496) and
+Questrade (a practice-portal token vs a real one) already worked. An earlier version of
+this had a separate `alpaca_paper` bool plus a second `alpaca_live_*` key pair per
+account to flip between - redundant with `alpaca_base_url` already saying which Alpaca
+host to hit (paper-api.alpaca.markets vs api.alpaca.markets are different hosts with
+different key pairs; there's nothing else for a "paper" flag to actually decide). See
+`alpaca_broker.py`'s `_is_paper_endpoint` below for where that's derived from instead.
+Two accounts that want one paper and one live just get two different ids in
+`ACCOUNT_IDS`, each with its own credentials - same as any other two accounts.
 
 ### `brokers/` — the only place that talks to a broker's SDK/API
 
@@ -107,6 +111,12 @@ live never touches another account's keys.
 - **`alpaca_broker.py`** implements `BrokerClient` using the `alpaca-py` SDK — the
   only file that imports `alpaca-py`. **Verified working**: connected to a real
   paper account, placed real (paper) trades, confirmed via the dashboard.
+
+  `_is_paper_endpoint(base_url)` is the one place "paper vs live" gets decided -
+  `"paper" in base_url.lower()` - derived from the account's own `alpaca_base_url`
+  rather than a separate flag (see `engine/config.py`'s `AccountCredentials` docstring
+  above), and passed as `TradingClient`/`TradingStream`'s `paper=` argument, which is
+  what alpaca-py itself actually needs to know which host to hit.
 
   `get_bars(symbol, timeframe, limit)` (no explicit `start`, the shape every caller
   in this codebase actually uses) does *not* pass `limit` straight through to
@@ -618,17 +628,17 @@ any of them:
   all against a `db.models.Account` row rather than a global config.
 - `test_notifications.py` — `Notifier` composition and that failures (a bad SMTP
   host, a failing `osascript` call) are swallowed rather than crashing the runner.
-- `test_config.py` — `load_account_credentials()` picks the paper vs. live Alpaca key
-  pair correctly per account, and that two accounts' fields (including two IBKR
-  accounts' client ids) never leak into each other.
+- `test_config.py` — `load_account_credentials()` reads one Alpaca key pair per
+  account (no paper/live branching), and that two accounts' fields (including two
+  IBKR accounts' client ids) never leak into each other.
 - `test_brokers.py` — `make_broker()` returns the right class per account's `broker`
   value, raises clearly on an unsupported one, and scopes Questrade's token cache path
   by `account_id`.
-- `test_alpaca_broker.py` — `_default_start`'s calendar-day math, and that
-  `get_bars()` fetches an unbounded window and takes the tail itself when `start`
-  is omitted rather than trusting Alpaca's own `limit` (see `alpaca_broker.py`'s
-  entry under `brokers/` above) - plus that an explicit `start` (the backtest
-  path) is untouched.
+- `test_alpaca_broker.py` — `_default_start`'s calendar-day math, `_is_paper_endpoint`
+  correctly reading paper vs. live off `alpaca_base_url`, and that `get_bars()` fetches
+  an unbounded window and takes the tail itself when `start` is omitted rather than
+  trusting Alpaca's own `limit` (see `alpaca_broker.py`'s entry under `brokers/` above)
+  - plus that an explicit `start` (the backtest path) is untouched.
 - `test_ibkr_broker.py` — the `_parse_trading_hours` / `_duration_string` pure
   helpers, plus response-translation logic against a mocked `IB` connection
   (`SimpleNamespace` fakes shaped like `ib_async`'s real objects, not a live TWS).

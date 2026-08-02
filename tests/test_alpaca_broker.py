@@ -4,19 +4,50 @@ import pandas as pd
 import pytest
 from alpaca.common.exceptions import APIError
 
-from engine.brokers.alpaca_broker import AlpacaBroker, _default_start
+from engine.brokers.alpaca_broker import AlpacaBroker, _default_start, _is_paper_endpoint
 from engine.brokers.base import Timeframe
 from engine.config import AccountCredentials
 
 
-def _config() -> AccountCredentials:
+def _config(base_url: str = "https://paper-api.alpaca.markets") -> AccountCredentials:
     return AccountCredentials(
         broker="alpaca",
         alpaca_api_key="key",
         alpaca_secret_key="secret",
-        alpaca_base_url="https://paper-api.alpaca.markets",
-        alpaca_paper=True,
+        alpaca_base_url=base_url,
     )
+
+
+def test_is_paper_endpoint_true_for_paper_host():
+    assert _is_paper_endpoint("https://paper-api.alpaca.markets") is True
+
+
+def test_is_paper_endpoint_false_for_live_host():
+    assert _is_paper_endpoint("https://api.alpaca.markets") is False
+
+
+def test_broker_passes_paper_true_to_sdk_for_paper_base_url(monkeypatch):
+    captured = {}
+
+    def fake_trading_client(api_key, secret_key, paper):
+        captured["paper"] = paper
+        return None
+
+    monkeypatch.setattr("engine.brokers.alpaca_broker.TradingClient", fake_trading_client)
+    AlpacaBroker(_config("https://paper-api.alpaca.markets"))
+    assert captured["paper"] is True
+
+
+def test_broker_passes_paper_false_to_sdk_for_live_base_url(monkeypatch):
+    captured = {}
+
+    def fake_trading_client(api_key, secret_key, paper):
+        captured["paper"] = paper
+        return None
+
+    monkeypatch.setattr("engine.brokers.alpaca_broker.TradingClient", fake_trading_client)
+    AlpacaBroker(_config("https://api.alpaca.markets"))
+    assert captured["paper"] is False
 
 
 def test_default_start_day_timeframe_covers_limit_trading_days():

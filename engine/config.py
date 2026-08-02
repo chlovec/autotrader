@@ -46,13 +46,21 @@ class AccountCredentials:
     load_account_credentials). Same three broker-specific shapes as before multi-account
     support (Alpaca api-key/secret, IBKR's socket connection, Questrade's OAuth refresh
     token) - they didn't get more similar just because there can now be several of them.
+
+    No separate "paper vs live" flag anywhere in here, for any broker - which environment
+    an account trades in is just whatever alpaca_base_url/ibkr_port/questrade_refresh_token
+    value the account was given, the same way IBKR (port 7497 vs 7496) and Questrade
+    (a practice-portal token vs a real one) already worked. Alpaca used to be the odd one
+    out - a separate alpaca_paper bool plus a second alpaca_live_* key pair to flip between
+    - which was redundant with alpaca_base_url already saying which Alpaca host to hit;
+    see engine/brokers/alpaca_broker.py's _is_paper_endpoint for where that's derived from
+    now instead.
     """
 
     broker: str
     alpaca_api_key: str = ""
     alpaca_secret_key: str = ""
     alpaca_base_url: str = ""
-    alpaca_paper: bool = True
     ibkr_host: str = ""
     ibkr_port: int = 0
     ibkr_client_id: int = 0
@@ -135,7 +143,12 @@ def load_account_credentials(account_id: str) -> AccountCredentials:
     """Reads the ACCOUNT_<account_id>_* env vars for one account. Mirrors the old
     top-level BROKER/ALPACA_*/IBKR_*/QUESTRADE_* vars, just namespaced per account so
     multiple accounts (even multiple accounts on the same broker) can coexist in one
-    .env file."""
+    .env file.
+
+    Exactly one ALPACA_API_KEY/ALPACA_SECRET_KEY/ALPACA_BASE_URL triple per account - no
+    paper/live branching here (see AccountCredentials' docstring). Defaults to Alpaca's
+    paper endpoint when ALPACA_BASE_URL is unset, so an account with nothing configured
+    can't accidentally resolve to the live one."""
     prefix = f"ACCOUNT_{account_id}_"
 
     def env(suffix: str, default: str = "") -> str:
@@ -143,27 +156,20 @@ def load_account_credentials(account_id: str) -> AccountCredentials:
 
     broker = env("BROKER")
 
-    alpaca_paper = env("ALPACA_PAPER", "true").lower() == "true"
-    if alpaca_paper:
-        alpaca_api_key = env("ALPACA_API_KEY")
-        alpaca_secret_key = env("ALPACA_SECRET_KEY")
-        alpaca_base_url = env("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-    else:
-        alpaca_api_key = env("ALPACA_LIVE_API_KEY")
-        alpaca_secret_key = env("ALPACA_LIVE_SECRET_KEY")
-        alpaca_base_url = env("ALPACA_LIVE_BASE_URL", "https://api.alpaca.markets")
-        if broker == "alpaca" and (not alpaca_api_key or not alpaca_secret_key):
-            raise RuntimeError(
-                f"{prefix}ALPACA_PAPER=false but {prefix}ALPACA_LIVE_API_KEY/{prefix}ALPACA_LIVE_SECRET_KEY are not "
-                "set - refusing to start rather than silently trading on paper credentials instead."
-            )
+    alpaca_api_key = env("ALPACA_API_KEY")
+    alpaca_secret_key = env("ALPACA_SECRET_KEY")
+    alpaca_base_url = env("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+    if broker == "alpaca" and (not alpaca_api_key or not alpaca_secret_key):
+        raise RuntimeError(
+            f"{prefix}ALPACA_API_KEY/{prefix}ALPACA_SECRET_KEY are not set - refusing to start rather than "
+            "connecting with empty credentials."
+        )
 
     return AccountCredentials(
         broker=broker,
         alpaca_api_key=alpaca_api_key,
         alpaca_secret_key=alpaca_secret_key,
         alpaca_base_url=alpaca_base_url,
-        alpaca_paper=alpaca_paper,
         ibkr_host=env("IBKR_HOST", "127.0.0.1"),
         ibkr_port=int(env("IBKR_PORT", "7497")),
         ibkr_client_id=int(env("IBKR_CLIENT_ID", "1")),

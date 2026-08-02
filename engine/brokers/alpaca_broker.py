@@ -27,6 +27,15 @@ _HOLIDAY_BUFFER_DAYS = 15  # slack for market holidays and "today"'s bar not bei
 _MINUTES_PER_TRADING_DAY = 390
 
 
+def _is_paper_endpoint(base_url: str) -> bool:
+    """Alpaca's own distinction between paper and live is which host you're talking to
+    (paper-api.alpaca.markets vs api.alpaca.markets) - not a separate config flag. This
+    account's alpaca_base_url is what actually determines which environment
+    TradingClient/TradingStream hit; there's no other "paper" setting to keep in sync
+    with it."""
+    return "paper" in base_url.lower()
+
+
 def _default_start(timeframe: Timeframe, limit: int) -> dt.datetime:
     """Alpaca's /v2/stocks/bars defaults `start` to ~today when omitted - not "the last
     `limit` bars" - so on a day the latest bar isn't published yet (e.g. a weekend), a
@@ -49,7 +58,8 @@ class AlpacaBroker:
 
     def __init__(self, credentials: AccountCredentials):
         self._credentials = credentials
-        self._trading = TradingClient(credentials.alpaca_api_key, credentials.alpaca_secret_key, paper=credentials.alpaca_paper)
+        paper = _is_paper_endpoint(credentials.alpaca_base_url)
+        self._trading = TradingClient(credentials.alpaca_api_key, credentials.alpaca_secret_key, paper=paper)
         self._data = StockHistoricalDataClient(credentials.alpaca_api_key, credentials.alpaca_secret_key)
 
     def get_account(self) -> AccountSnapshot:
@@ -143,7 +153,9 @@ class AlpacaBroker:
         _run_forever is not part of alpaca-py's public API - revisit this on an alpaca-py
         upgrade in case its name or behavior changes.
         """
-        stream = TradingStream(self._credentials.alpaca_api_key, self._credentials.alpaca_secret_key, paper=self._credentials.alpaca_paper)
+        stream = TradingStream(
+            self._credentials.alpaca_api_key, self._credentials.alpaca_secret_key, paper=_is_paper_endpoint(self._credentials.alpaca_base_url)
+        )
 
         async def _handler(data: object) -> None:
             await on_change()

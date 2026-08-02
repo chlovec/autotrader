@@ -23,11 +23,13 @@ BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
 DASHBOARD_PORT="${DASHBOARD_PORT:-5173}"
 
-# A blanket warning rather than a per-broker one: any configured account could be live
-# (ACCOUNT_<id>_ALPACA_PAPER=false, etc.) - grep .env rather than trying to evaluate
-# every account's config in bash.
+# A blanket warning rather than a per-broker one: any configured account could be live -
+# for Alpaca that's just whichever ALPACA_BASE_URL the account was given (paper vs live
+# are different hosts, see engine/brokers/alpaca_broker.py's _is_paper_endpoint; no
+# separate paper/live flag to check). Grep .env rather than trying to evaluate every
+# account's config in bash.
 LIVE_WARNING=""
-if grep -qE '_ALPACA_PAPER=false' .env 2>/dev/null; then
+if grep -qE '_ALPACA_BASE_URL=https://api\.alpaca\.markets' .env 2>/dev/null; then
   LIVE_WARNING=" - at least one account looks configured for LIVE trading"
 fi
 
