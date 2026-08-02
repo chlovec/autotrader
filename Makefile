@@ -24,7 +24,7 @@ help:
 	@echo "  research         Screen run_research.py's symbol universe and update the watchlist (no trades placed)"
 	@echo "  backend          Start the FastAPI backend API on $(BACKEND_HOST):$(BACKEND_PORT)"
 	@echo "  dashboard        Start the React dashboard (UI) dev server - needs 'backend' running in another terminal"
-	@echo "  restart          Background backend+dashboard+trading loop+research (bin/restart.sh); BROKER=/MODE= or interactive"
+	@echo "  restart          Background backend+dashboard+trading loop+research (bin/restart.sh); BROKER= or interactive"
 	@echo "  stop             Kill whatever 'restart' (or a previous manual run) started (bin/stop.sh)"
 	@echo "  docker-build     Build the backend/engine and dashboard images"
 	@echo "  docker-up        Start backend+engine+dashboard in containers (see docker-compose.yml)"
@@ -57,10 +57,11 @@ backend:
 dashboard:
 	cd frontend && npm run dev
 
-# BROKER/MODE deliberately have no default here (unlike RUN_SCRIPT etc. above) - leaving
-# either unset lets bin/restart.sh fall through to its own interactive prompt.
+# BROKER deliberately has no default here (unlike RUN_SCRIPT etc. above) - leaving it
+# unset lets bin/restart.sh fall through to its own interactive prompt. Paper vs live
+# isn't a restart.sh concept at all - it comes entirely from .env (ALPACA_PAPER, etc).
 restart:
-	@bin/restart.sh $(BROKER) $(MODE)
+	@bin/restart.sh $(BROKER)
 
 stop:
 	@bin/stop.sh

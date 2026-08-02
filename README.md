@@ -113,14 +113,14 @@ research run for you — the backend, the dashboard, the trading loop, and
 terminals:
 
 ```bash
-make restart                       # prompts for broker, then live/sim
-make restart BROKER=alpaca MODE=sim
-make restart BROKER=ibkr MODE=sim
+make restart                       # prompts for broker
+make restart BROKER=alpaca
+make restart BROKER=ibkr
 ```
 
-Live modes are always refused here — real-money trading needs the "type yes to
-continue" confirmation that `run-alpaca-live`/`run-ibkr-live` provide (see below),
-which a backgrounded script has no terminal to answer. Output goes to
+Paper vs live isn't a choice this makes - it comes entirely from `.env`
+(`ALPACA_PAPER`, `IBKR_PORT`, ...), same as any other `engine/config.py` value, and
+applies to the backend, trading loop, and research run alike. Output goes to
 `services.log`; stop everything it started with:
 
 ```bash
