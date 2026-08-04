@@ -55,6 +55,9 @@ def _add_column_if_missing(table: str, column: str, ddl_type: str) -> None:
 def init_db() -> None:
     _create_all_with_retry()
     _add_column_if_missing("accounts", "max_total_exposure_usd", "FLOAT DEFAULT 0.0")
+    _add_column_if_missing("accounts", "pending_strategy_name", "VARCHAR")
+    _add_column_if_missing("accounts", "pending_strategy_params", "TEXT")
+    _add_column_if_missing("research_schedule", "selected_count", "INTEGER DEFAULT 10")
     with SessionLocal() as session:
         if session.get(ResearchSchedule, 1) is None:
             session.add(ResearchSchedule(id=1, enabled=True))

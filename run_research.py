@@ -1,5 +1,10 @@
+from db.models import ResearchSchedule
+from db.session import get_session, init_db
 from engine.config import load_config
-from engine.research_runner import DEFAULT_TOP_N, DEFAULT_UNIVERSE, main
+from engine.research_runner import main
 
 if __name__ == "__main__":
-    main(universe=DEFAULT_UNIVERSE, top_n=DEFAULT_TOP_N, config=load_config())
+    init_db()
+    with get_session() as session:
+        selected_count = session.get(ResearchSchedule, 1).selected_count
+    main(selected_count=selected_count, config=load_config())

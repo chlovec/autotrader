@@ -59,8 +59,22 @@ export interface ResearchResult {
   selected: boolean
 }
 
+export interface PaginatedResearchResults {
+  items: ResearchResult[]
+  total: number
+  selected_total: number
+  page: number
+  page_size: number
+}
+
 export interface ResearchScheduleState {
   enabled: boolean
+  selected_count: number
+}
+
+export interface BlocklistedSymbol {
+  symbol: string
+  blocklisted_at: string
 }
 
 export interface ResearchStatus {
@@ -75,6 +89,7 @@ export interface AccountSummary {
   broker: string
   active: boolean
   strategy_name: string
+  pending_strategy_name: string | null
   equity: number | null
   cash: number | null
   unrealized_pl: number | null
@@ -87,6 +102,8 @@ export interface AccountDetail {
   active: boolean
   strategy_name: string
   strategy_params: Record<string, unknown>
+  pending_strategy_name: string | null
+  pending_strategy_params: Record<string, unknown> | null
   max_position_size_usd: number
   max_daily_loss_usd: number
   max_total_exposure_usd: number
@@ -133,9 +150,9 @@ export const api = {
       '/events',
       scope?.unassigned ? { unassigned: true } : scope?.accountId ? { account_id: scope.accountId } : {},
     ),
-  research: () => getJSON<ResearchResult[]>('/research'),
+  research: (page: number, pageSize: number) => getJSON<PaginatedResearchResults>(`/research?page=${page}&page_size=${pageSize}`),
   researchSchedule: () => getJSON<ResearchScheduleState>('/research/schedule'),
-  setResearchSchedule: (enabled: boolean) => postJSON<ResearchScheduleState>('/research/schedule', { enabled }),
+  setResearchSchedule: (next: ResearchScheduleState) => postJSON<ResearchScheduleState>('/research/schedule', { ...next }),
   researchStatus: () => getJSON<ResearchStatus>('/research/status'),
   triggerResearch: async (): Promise<TriggerResearchResult> => {
     const res = await fetch(`${API_BASE}/research/run`, { method: 'POST' })
@@ -144,12 +161,24 @@ export const api = {
     return res.json()
   },
 
+  researchUniverse: () => getJSON<string[]>('/research/universe'),
+  blocklist: () => getJSON<BlocklistedSymbol[]>('/blocklist'),
+  addToBlocklist: (symbol: string) => postJSON<BlocklistedSymbol>('/blocklist', { symbol }),
+  removeFromBlocklist: (symbol: string) => deleteJSON<{ removed: string }>(`/blocklist/${encodeURIComponent(symbol)}`),
+
   accounts: () => getJSON<AccountSummary[]>('/accounts'),
   account: (id: string) => getJSON<AccountDetail>(`/accounts/${id}`),
   activateAccount: (id: string) => postJSON<{ active: boolean }>(`/accounts/${id}/activate`),
   deactivateAccount: (id: string) => postJSON<{ active: boolean }>(`/accounts/${id}/deactivate`),
   setAccountLimits: (id: string, limits: TradingLimits) =>
     postJSON<TradingLimits>(`/accounts/${id}/limits`, { ...limits }, 'PATCH'),
+  setAccountStrategy: (id: string, strategyName: string, strategyParams: Record<string, unknown>, immediate: boolean) =>
+    postJSON<AccountDetail>(
+      `/accounts/${id}/strategy`,
+      { strategy_name: strategyName, strategy_params: JSON.stringify(strategyParams), immediate },
+      'PATCH',
+    ),
+  cancelPendingAccountStrategy: (id: string) => deleteJSON<AccountDetail>(`/accounts/${id}/strategy/pending`),
   accountKillSwitch: (id: string) => getJSON<KillSwitchState>(`/accounts/${id}/kill-switch`),
   setAccountKillSwitch: (id: string, engaged: boolean, reason: string) =>
     postJSON<KillSwitchState>(`/accounts/${id}/kill-switch`, { engaged, reason }),

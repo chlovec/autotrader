@@ -46,6 +46,14 @@ class Account(Base):
     once (as opposed to max_position_size_usd, which caps one symbol) - 0 means no cap,
     which is also the backfilled value for any account that existed before this column
     did, so adding it never silently starts throttling an account that hasn't opted in.
+
+    pending_strategy_name/pending_strategy_params hold a queued strategy change (see
+    backend/app/main.py's PATCH /accounts/{id}/strategy) that hasn't taken effect yet -
+    both null when nothing is queued. engine/multi_runner.py's run_all_accounts_once
+    applies and clears them at the start of its next cycle, which is what "takes effect
+    the next day" means in practice (see its _apply_pending_strategy_change docstring).
+    The dashboard can also write strategy_name/strategy_params directly for an immediate
+    change, bypassing the pending fields entirely.
     """
 
     __tablename__ = "accounts"
@@ -56,6 +64,8 @@ class Account(Base):
     active: Mapped[bool] = mapped_column(default=True)
     strategy_name: Mapped[str] = mapped_column(String)
     strategy_params: Mapped[str] = mapped_column(Text, default="{}")
+    pending_strategy_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    pending_strategy_params: Mapped[str | None] = mapped_column(Text, nullable=True)
     max_position_size_usd: Mapped[float] = mapped_column(Float)
     max_daily_loss_usd: Mapped[float] = mapped_column(Float)
     max_total_exposure_usd: Mapped[float] = mapped_column(Float, default=0.0)
@@ -174,14 +184,56 @@ class ResearchResult(Base):
     selected: Mapped[bool] = mapped_column(default=False)
 
 
+class BlocklistedSymbol(Base):
+    """A symbol the user has opted out of trading entirely, regardless of what research
+    scores it. Checked by db.queries.get_watchlist_symbols so a blocklisted symbol never
+    reaches the trading engine even if it's selected on the latest research run, and
+    served to the dashboard so a blocklisted symbol appearing in the research table can
+    be shown as deselected instead of trusting its stored `selected` value."""
+
+    __tablename__ = "blocklisted_symbols"
+
+    symbol: Mapped[str] = mapped_column(String, primary_key=True)
+    blocklisted_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+
+class UniverseSymbol(Base):
+    """The full tradable stock/ETF universe, last synced from Alpaca's asset-listing API
+    (see engine/universe_sync.py). Deliberately not a foreign key target for
+    ResearchResult/BlocklistedSymbol - both store `symbol` as a plain string - so a symbol
+    going untradable or delisted never orphans historical rows; it just stops being picked
+    into future research batches (see `tradable` below).
+
+    `dollar_volume` is a liquidity proxy (latest daily volume * close, from Alpaca's
+    snapshot endpoint) used to order which symbols research screens first each run -
+    Alpaca's asset objects carry no market-cap field, so this is the closest available
+    stand-in. It's refreshed on a slower cadence than `synced_at` (see
+    engine.universe_sync.ensure_universe_fresh) since relative liquidity rank doesn't
+    shift day to day the way asset metadata (tradable/name/exchange) can."""
+
+    __tablename__ = "universe_symbols"
+
+    symbol: Mapped[str] = mapped_column(String, primary_key=True)
+    name: Mapped[str] = mapped_column(String, default="")
+    exchange: Mapped[str] = mapped_column(String, default="")
+    tradable: Mapped[bool] = mapped_column(default=True, index=True)
+    dollar_volume: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)
+    liquidity_updated_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    synced_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+
 class ResearchSchedule(Base):
-    """Single-row toggle for the backend's automatic nightly research job (see
-    backend/app/main.py's BackgroundScheduler). The dashboard's "Run research now"
-    button bypasses this - it's a deliberate one-off action, not something the
-    auto-schedule toggle should block."""
+    """Single-row settings for the research job: `enabled` gates the backend's automatic
+    nightly run (see backend/app/main.py's BackgroundScheduler) - the dashboard's "Run
+    research now" button bypasses it, a deliberate one-off action, not something the
+    auto-schedule toggle should block. `selected_count` is how many of the universe's
+    highest-`combined_score` symbols get flagged `selected=True` (and therefore become
+    the trading watchlist, via db.queries.get_watchlist_symbols) at the end of a run -
+    dashboard-editable the same way `enabled` is."""
 
     __tablename__ = "research_schedule"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     enabled: Mapped[bool] = mapped_column(default=True)
+    selected_count: Mapped[int] = mapped_column(Integer, default=10)
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)

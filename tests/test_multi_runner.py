@@ -4,7 +4,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from db.models import Base, Signal, SignalAction
+from db.models import Account, Base, Signal, SignalAction
 from engine.multi_runner import REBALANCE_STRATEGY_NAME, _already_rebalanced_this_month, main, run_all_accounts_once
 
 
@@ -72,6 +72,7 @@ def test_run_all_accounts_once_continues_after_one_accounts_exception(monkeypatc
             self.id = id
             self.strategy_name = strategy_name
             self.strategy_params = "{}"
+            self.pending_strategy_name = None
 
     accounts = [_FakeAccount("bad-acct", "ma_crossover"), _FakeAccount("good-acct", "ma_crossover")]
 
@@ -92,3 +93,49 @@ def test_run_all_accounts_once_continues_after_one_accounts_exception(monkeypatc
     run_all_accounts_once(config=object())
 
     assert ran_for == ["good-acct"]
+
+
+def test_run_all_accounts_once_applies_pending_strategy_change(monkeypatch):
+    """A queued strategy change (backend/app/main.py's PATCH .../strategy, immediate=False)
+    must be applied - and its pending fields cleared - before that cycle builds the
+    account's strategy, matching what "takes effect the next trading cycle" promises."""
+    test_engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(test_engine)
+    # expire_on_commit=False matches db/session.py's real SessionLocal - production code
+    # (e.g. get_active_accounts' detached rows) relies on attributes staying readable after
+    # the session that fetched them closes, so this test needs the same behavior to be faithful.
+    SessionLocal = sessionmaker(bind=test_engine, expire_on_commit=False)
+
+    with SessionLocal() as session:
+        session.add(
+            Account(
+                id="acct-1", broker="alpaca", display_name="Test", active=True,
+                strategy_name="ma_crossover", strategy_params='{"short_window": 20, "long_window": 50}',
+                pending_strategy_name="mean_reversion", pending_strategy_params='{"period": 14, "oversold": 30, "overbought": 70}',
+                max_position_size_usd=1000.0, max_daily_loss_usd=200.0,
+            )
+        )
+        session.commit()
+        account = session.get(Account, "acct-1")
+        session.expunge(account)  # detach - mirrors get_active_accounts returning rows from an already-closed session
+
+    monkeypatch.setattr("engine.multi_runner.sync_accounts_from_env", lambda session, config: None)
+    monkeypatch.setattr("engine.multi_runner.get_active_accounts", lambda session: [account])
+    monkeypatch.setattr("engine.multi_runner.load_config", lambda argv=None: object())
+    monkeypatch.setattr("engine.multi_runner.get_session", SessionLocal)
+
+    used_strategy_names = []
+    monkeypatch.setattr(
+        "engine.multi_runner._run_signal_account_once",
+        lambda account, strategy, config: used_strategy_names.append(account.strategy_name),
+    )
+
+    run_all_accounts_once(config=object())
+
+    assert used_strategy_names == ["mean_reversion"]
+    with SessionLocal() as session:
+        fresh = session.get(Account, "acct-1")
+        assert fresh.strategy_name == "mean_reversion"
+        assert fresh.strategy_params == '{"period": 14, "oversold": 30, "overbought": 70}'
+        assert fresh.pending_strategy_name is None
+        assert fresh.pending_strategy_params is None

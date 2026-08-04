@@ -52,7 +52,10 @@ export function AccountsTable({ accounts, onChange }: { accounts: AccountSummary
           >
             <td className="emphasis">{a.display_name}</td>
             <td>{a.broker}</td>
-            <td>{a.strategy_name}</td>
+            <td>
+              {a.strategy_name}
+              {a.pending_strategy_name && <span className="badge badge-pending"> → {a.pending_strategy_name}</span>}
+            </td>
             <td>{formatCurrency(a.equity)}</td>
             <td>{formatCurrency(a.cash)}</td>
             <td className={a.unrealized_pl !== null ? (a.unrealized_pl >= 0 ? 'positive' : 'negative') : undefined}>

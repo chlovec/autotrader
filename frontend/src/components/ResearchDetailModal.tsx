@@ -1,7 +1,15 @@
 import { useEffect } from 'react'
 import type { ResearchResult } from '../api'
 
-export function ResearchDetailModal({ result, onClose }: { result: ResearchResult; onClose: () => void }) {
+export function ResearchDetailModal({
+  result,
+  blocklisted,
+  onClose,
+}: {
+  result: ResearchResult
+  blocklisted: boolean
+  onClose: () => void
+}) {
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       if (e.key === 'Escape') onClose()
@@ -41,9 +49,13 @@ export function ResearchDetailModal({ result, onClose }: { result: ResearchResul
           </div>
         </dl>
 
-        <p className="modal-status">
-          {result.selected ? 'Selected for the trading watchlist' : 'Not selected this run'} · as of{' '}
-          {new Date(result.run_at).toLocaleString()}
+        <p className={`modal-status${blocklisted ? ' blocklisted' : ''}`}>
+          {blocklisted
+            ? 'Blocklisted — excluded from the trading watchlist'
+            : result.selected
+              ? 'Selected for the trading watchlist'
+              : 'Not selected this run'}{' '}
+          · as of {new Date(result.run_at).toLocaleString()}
         </p>
 
         <p className="modal-rationale">{result.rationale}</p>

@@ -198,6 +198,32 @@ def _rebalance_account_once(account: Account, portfolio: RebalancingPortfolio, c
             logger.info("[%s] rebalance: %s %s qty=%s (%s)", account.id, order.action.value, order.symbol, trade.qty, order.reason)
 
 
+def _apply_pending_strategy_change(account: Account) -> Account:
+    """Applies a queued strategy change (see backend/app/main.py's
+    PATCH /accounts/{id}/strategy, immediate=False path) and clears the pending fields.
+    Called once per run_all_accounts_once cycle - since that's the engine's only unit of
+    "a trading day" (once at process startup, then once per weekday at 9:35am - see
+    main()'s docstring), this is what "takes effect the next day" means in practice:
+    whichever run_all_accounts_once invocation comes next, which could be sooner than a
+    full calendar day if the engine process happens to restart in between - an accepted
+    edge case, not a bug.
+
+    `account` here is detached (fetched by get_active_accounts in an already-closed
+    session - see db/session.py's expire_on_commit=False) so this re-fetches inside its
+    own session to mutate and commit, then returns the fresh, live row."""
+    if account.pending_strategy_name is None:
+        return account
+    with get_session() as session:
+        fresh = session.get(Account, account.id)
+        fresh.strategy_name = fresh.pending_strategy_name
+        fresh.strategy_params = fresh.pending_strategy_params
+        fresh.pending_strategy_name = None
+        fresh.pending_strategy_params = None
+        fresh.updated_at = dt.datetime.utcnow()
+        session.commit()
+        return fresh
+
+
 def run_all_accounts_once(config: Config | None = None) -> None:
     config = config or load_config(argv=[])
     with get_session() as session:
@@ -206,6 +232,7 @@ def run_all_accounts_once(config: Config | None = None) -> None:
 
     for account in accounts:
         try:
+            account = _apply_pending_strategy_change(account)
             strategy_or_portfolio = build_strategy(account.strategy_name, json.loads(account.strategy_params))
             if account.strategy_name == REBALANCE_STRATEGY_NAME:
                 _rebalance_account_once(account, strategy_or_portfolio, config)

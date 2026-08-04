@@ -6,6 +6,7 @@ import { KillSwitchPanel } from './components/KillSwitchPanel'
 import { PositionsTable } from './components/PositionsTable'
 import { SignalsTable } from './components/SignalsTable'
 import { StatTiles } from './components/StatTiles'
+import { StrategyPanel } from './components/StrategyPanel'
 import { TradesTable } from './components/TradesTable'
 import { TradingLimitsPanel } from './components/TradingLimitsPanel'
 import { navigate } from './router'
@@ -138,6 +139,11 @@ export function AccountDashboard({ accountId }: { accountId: string }) {
           <h2>Trading limits</h2>
           <TradingLimitsPanel account={account} onChange={setAccount} />
         </div>
+      </div>
+
+      <div className="card">
+        <h2>Strategy</h2>
+        <StrategyPanel account={account} onChange={setAccount} />
       </div>
 
       <div className="card">

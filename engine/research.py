@@ -124,20 +124,25 @@ def make_news_client(config: Config) -> NewsClient:
     return NewsClient(config.alpaca_news_api_key, config.alpaca_news_secret_key)
 
 
-def fetch_universe_news(client: NewsClient, universe: list[str], lookback_days: int = 14) -> dict[str, list[News]]:
-    """Fetches recent news for an entire universe in one call and buckets it per symbol.
+def fetch_universe_news(client: NewsClient, symbols: list[str], lookback_days: int = 14) -> dict[str, list[News]]:
+    """Fetches recent news for a batch of symbols in one call and buckets it per symbol.
     NewsClient.get_news() auto-paginates internally, and NewsRequest.symbols takes a
-    comma-joined string - so this is one API round trip regardless of universe size, not
-    one call per symbol. A single article commonly tags multiple tickers, so bucketing
-    checks membership in article.symbols rather than assuming a 1:1 grouping."""
+    comma-joined string - so this is one API round trip regardless of batch size, not one
+    call per symbol. A single article commonly tags multiple tickers, so bucketing checks
+    membership in article.symbols rather than assuming a 1:1 grouping.
+
+    Called once per research_runner.research_once() batch (research_runner.BATCH_SIZE
+    symbols at a time), not once for the whole universe - the stored universe is commonly
+    thousands of symbols (see engine/universe_sync.py), and a single comma-joined request
+    for all of them at once wouldn't be a reasonably-sized API call."""
     request = NewsRequest(
-        symbols=",".join(universe),
+        symbols=",".join(symbols),
         start=dt.datetime.utcnow() - dt.timedelta(days=lookback_days),
         limit=200,
     )
     articles = client.get_news(request).data.get("news", [])
 
-    by_symbol: dict[str, list[News]] = {symbol: [] for symbol in universe}
+    by_symbol: dict[str, list[News]] = {symbol: [] for symbol in symbols}
     for article in articles:
         for symbol in article.symbols:
             if symbol in by_symbol:

@@ -25,10 +25,11 @@ class Config:
     max_daily_loss_usd: float
     max_total_exposure_usd: float
     questrade_poll_interval_seconds: float
-    # Research (engine/research.py's fetch_universe_news) always uses Alpaca's News API,
-    # independent of which broker(s) any account actually trades through - it's a global
-    # screen, not scoped to one account. A free Alpaca paper key pair works fine here even
-    # if no account trades through Alpaca at all.
+    # Research always uses this Alpaca key pair, independent of which broker(s) any account
+    # actually trades through - it's a global screen, not scoped to one account. A free
+    # Alpaca paper key pair works fine here even if no account trades through Alpaca at all.
+    # Used by engine/research.py's fetch_universe_news (Alpaca's News API) and by
+    # engine/universe_sync.py (Alpaca's asset-listing/snapshot APIs, for the same reason).
     alpaca_news_api_key: str
     alpaca_news_secret_key: str
     smtp_host: str

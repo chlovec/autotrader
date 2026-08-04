@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 import threading
 
 import pytest
@@ -9,7 +10,7 @@ from sqlalchemy.orm import sessionmaker
 import backend.app.main as backend_main
 import db.session as db_session
 from backend.app.main import AccountRuntime
-from db.models import Account, EquitySnapshot, ResearchResult, SystemEvent
+from db.models import Account, EquitySnapshot, ResearchResult, SystemEvent, UniverseSymbol
 from engine.brokers.base import AccountSnapshot, PositionSnapshot
 
 
@@ -58,6 +59,9 @@ def client(monkeypatch, tmp_path):
     # backend/app/broker_stream.py) - none of that is needed or safe to run repeatedly
     # across many TestClient instantiations.
     monkeypatch.setattr(backend_main, "_start_broker_streams", lambda: None)
+    # Startup also does a best-effort Alpaca asset-list sync (see on_startup) - stub it
+    # out rather than hitting a real API (or failing on missing credentials) on every test.
+    monkeypatch.setattr(backend_main, "sync_universe_assets", lambda session, trading_client: 0)
     with TestClient(backend_main.app) as test_client:
         yield test_client
 
@@ -75,16 +79,22 @@ def _add_account(account_id: str = "acct-1", **overrides) -> None:
 
 
 def test_research_schedule_defaults_enabled(client):
-    assert client.get("/research/schedule").json() == {"enabled": True}
+    assert client.get("/research/schedule").json() == {"enabled": True, "selected_count": 10}
 
 
 def test_research_schedule_round_trip(client):
-    assert client.post("/research/schedule", params={"enabled": False}).json() == {"enabled": False}
-    assert client.get("/research/schedule").json() == {"enabled": False}
+    params = {"enabled": False, "selected_count": 25}
+    assert client.post("/research/schedule", params=params).json() == {"enabled": False, "selected_count": 25}
+    assert client.get("/research/schedule").json() == {"enabled": False, "selected_count": 25}
+
+
+def test_research_schedule_rejects_non_positive_selected_count(client):
+    response = client.post("/research/schedule", params={"enabled": True, "selected_count": 0})
+    assert response.status_code == 400
 
 
 def test_research_empty_with_no_runs(client):
-    assert client.get("/research").json() == []
+    assert client.get("/research").json() == {"items": [], "total": 0, "selected_total": 0, "page": 1, "page_size": 30}
 
 
 def test_research_returns_latest_run_ordered_by_score(client):
@@ -98,10 +108,56 @@ def test_research_returns_latest_run_ordered_by_score(client):
         )
         session.commit()
 
-    rows = client.get("/research").json()
-    assert [r["symbol"] for r in rows] == ["HIGH", "LOW"]
-    assert rows[0]["selected"] is True
-    assert rows[1]["selected"] is False
+    body = client.get("/research").json()
+    assert [r["symbol"] for r in body["items"]] == ["HIGH", "LOW"]
+    assert body["items"][0]["selected"] is True
+    assert body["total"] == 2
+    assert body["selected_total"] == 1
+
+
+def test_research_pagination(client):
+    with db_session.get_session() as session:
+        run_at = dt.datetime(2026, 8, 1)
+        session.add_all(
+            [
+                ResearchResult(run_at=run_at, symbol=f"S{i:02d}", technical_score=50, news_score=50, combined_score=100 - i, selected=i < 3)
+                for i in range(25)
+            ]
+        )
+        session.commit()
+
+    page1 = client.get("/research", params={"page": 1, "page_size": 10}).json()
+    assert [r["symbol"] for r in page1["items"]] == [f"S{i:02d}" for i in range(10)]
+    assert page1["total"] == 25
+    assert page1["selected_total"] == 3
+    assert page1["page"] == 1
+    assert page1["page_size"] == 10
+
+    page3 = client.get("/research", params={"page": 3, "page_size": 10}).json()
+    assert [r["symbol"] for r in page3["items"]] == [f"S{i:02d}" for i in range(20, 25)]
+
+    # page 99 doesn't exist for only 25 rows / 10 per page (3 pages) - clamps to the last valid page.
+    clamped = client.get("/research", params={"page": 99, "page_size": 10}).json()
+    assert clamped["page"] == 3
+    assert [r["symbol"] for r in clamped["items"]] == [f"S{i:02d}" for i in range(20, 25)]
+
+
+def test_research_selected_total_excludes_blocklisted(client):
+    with db_session.get_session() as session:
+        run_at = dt.datetime(2026, 8, 1)
+        session.add_all(
+            [
+                ResearchResult(run_at=run_at, symbol="AAPL", technical_score=90, news_score=90, combined_score=90, selected=True),
+                ResearchResult(run_at=run_at, symbol="MSFT", technical_score=80, news_score=80, combined_score=80, selected=True),
+            ]
+        )
+        session.add(UniverseSymbol(symbol="AAPL", tradable=True))
+        session.commit()
+
+    client.post("/blocklist", params={"symbol": "AAPL"})
+
+    body = client.get("/research").json()
+    assert body["selected_total"] == 1
 
 
 def test_research_status_reflects_lock(client):
@@ -230,6 +286,67 @@ def test_kill_switch_round_trip(client):
     response = client.post("/accounts/acct-1/kill-switch", params={"engaged": True, "reason": "manual stop"})
     assert response.json() == {"engaged": True, "reason": "manual stop"}
     assert client.get("/accounts/acct-1/kill-switch").json() == {"engaged": True, "reason": "manual stop"}
+
+
+def test_deferred_strategy_change_is_pending_not_live(client):
+    _add_account("acct-1", strategy_name="ma_crossover", strategy_params=json.dumps({"short_window": 20, "long_window": 50}))
+
+    params = {"strategy_name": "mean_reversion", "strategy_params": json.dumps({"period": 14, "oversold": 30, "overbought": 70})}
+    response = client.patch("/accounts/acct-1/strategy", params=params)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["strategy_name"] == "ma_crossover"  # unchanged - not immediate
+    assert body["pending_strategy_name"] == "mean_reversion"
+    assert body["pending_strategy_params"] == {"period": 14, "oversold": 30, "overbought": 70}
+
+
+def test_immediate_strategy_change_applies_now_and_clears_pending(client):
+    _add_account("acct-1", strategy_name="ma_crossover", strategy_params=json.dumps({"short_window": 20, "long_window": 50}))
+    client.patch(
+        "/accounts/acct-1/strategy",
+        params={"strategy_name": "mean_reversion", "strategy_params": json.dumps({"period": 14, "oversold": 30, "overbought": 70})},
+    )
+
+    params = {
+        "strategy_name": "regime_switching",
+        "strategy_params": json.dumps({}),
+        "immediate": True,
+    }
+    response = client.patch("/accounts/acct-1/strategy", params=params)
+    body = response.json()
+    assert body["strategy_name"] == "regime_switching"
+    assert body["pending_strategy_name"] is None
+    assert body["pending_strategy_params"] is None
+
+
+def test_strategy_change_rejects_invalid_params(client):
+    _add_account("acct-1")
+
+    response = client.patch(
+        "/accounts/acct-1/strategy",
+        params={"strategy_name": "ma_crossover", "strategy_params": json.dumps({"short_window": 50, "long_window": 20})},
+    )
+    assert response.status_code == 400
+
+    response = client.patch(
+        "/accounts/acct-1/strategy",
+        params={"strategy_name": "not_a_real_strategy", "strategy_params": json.dumps({})},
+    )
+    assert response.status_code == 400
+
+
+def test_cancel_pending_strategy_change(client):
+    _add_account("acct-1", strategy_name="ma_crossover", strategy_params=json.dumps({"short_window": 20, "long_window": 50}))
+    client.patch(
+        "/accounts/acct-1/strategy",
+        params={"strategy_name": "mean_reversion", "strategy_params": json.dumps({"period": 14, "oversold": 30, "overbought": 70})},
+    )
+
+    response = client.delete("/accounts/acct-1/strategy/pending")
+    body = response.json()
+    assert body["strategy_name"] == "ma_crossover"  # untouched
+    assert body["pending_strategy_name"] is None
+    assert body["pending_strategy_params"] is None
 
 
 def _add_event(**overrides) -> int:
