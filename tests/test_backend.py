@@ -349,6 +349,34 @@ def test_cancel_pending_strategy_change(client):
     assert body["pending_strategy_params"] is None
 
 
+def test_trigger_rebalance_returns_404_for_unknown_account(client):
+    assert client.post("/accounts/does-not-exist/rebalance").status_code == 404
+
+
+def test_trigger_rebalance_returns_409_for_inactive_account(client):
+    _add_account("acct-1", active=False)
+    assert client.post("/accounts/acct-1/rebalance").status_code == 409
+
+
+def test_trigger_rebalance_translates_value_error_to_400(client, monkeypatch):
+    _add_account("acct-1")
+
+    def boom(account_id):
+        raise ValueError(f"account {account_id!r} is not running 'rebalancing_portfolio'")
+
+    monkeypatch.setattr(backend_main, "rebalance_account_now", boom)
+    assert client.post("/accounts/acct-1/rebalance").status_code == 400
+
+
+def test_trigger_rebalance_returns_outcome(client, monkeypatch):
+    _add_account("acct-1")
+    monkeypatch.setattr(backend_main, "rebalance_account_now", lambda account_id: "rebalanced")
+
+    response = client.post("/accounts/acct-1/rebalance")
+    assert response.status_code == 200
+    assert response.json() == {"outcome": "rebalanced"}
+
+
 def _add_event(**overrides) -> int:
     defaults = dict(level="info", source="test", message="something happened", account_id=None)
     defaults.update(overrides)

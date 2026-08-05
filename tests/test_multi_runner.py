@@ -1,11 +1,13 @@
 import datetime as dt
 
+import pandas as pd
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from db.models import Account, Base, Signal, SignalAction
-from engine.multi_runner import REBALANCE_STRATEGY_NAME, _already_rebalanced_this_month, main, run_all_accounts_once
+from engine.brokers.base import AccountSnapshot, ClockSnapshot, OrderResult
+from engine.multi_runner import REBALANCE_STRATEGY_NAME, _already_rebalanced_this_month, main, rebalance_account_now, run_all_accounts_once
 
 
 def _session():
@@ -139,3 +141,86 @@ def test_run_all_accounts_once_applies_pending_strategy_change(monkeypatch):
         assert fresh.strategy_params == '{"period": 14, "oversold": 30, "overbought": 70}'
         assert fresh.pending_strategy_name is None
         assert fresh.pending_strategy_params is None
+
+
+def test_rebalance_account_now_rejects_unknown_account(monkeypatch):
+    test_engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(test_engine)
+    SessionLocal = sessionmaker(bind=test_engine, expire_on_commit=False)
+    monkeypatch.setattr("engine.multi_runner.get_session", SessionLocal)
+
+    with pytest.raises(ValueError, match="unknown account"):
+        rebalance_account_now("nope", config=object())
+
+
+def test_rebalance_account_now_rejects_non_rebalance_strategy(monkeypatch):
+    test_engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(test_engine)
+    SessionLocal = sessionmaker(bind=test_engine, expire_on_commit=False)
+    monkeypatch.setattr("engine.multi_runner.get_session", SessionLocal)
+
+    with SessionLocal() as session:
+        session.add(
+            Account(
+                id="acct-1", broker="alpaca", display_name="Test", active=True,
+                strategy_name="ma_crossover", strategy_params='{"short_window": 20, "long_window": 50}',
+                max_position_size_usd=1000.0, max_daily_loss_usd=200.0,
+            )
+        )
+        session.commit()
+
+    with pytest.raises(ValueError, match="not running"):
+        rebalance_account_now("acct-1", config=object())
+
+
+def test_rebalance_account_now_forces_past_monthly_guard(monkeypatch):
+    """The manual "Rebalance now" trigger must still act even if the account already
+    rebalanced this month - that's the whole point of force=True (see
+    backend/app/main.py's POST /accounts/{id}/rebalance)."""
+    test_engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(test_engine)
+    SessionLocal = sessionmaker(bind=test_engine, expire_on_commit=False)
+    monkeypatch.setattr("engine.multi_runner.get_session", SessionLocal)
+
+    with SessionLocal() as session:
+        session.add(
+            Account(
+                id="acct-1", broker="alpaca", display_name="Test", active=True,
+                strategy_name=REBALANCE_STRATEGY_NAME, strategy_params='{"target_weights": {"SPY": 1.0}}',
+                max_position_size_usd=100_000.0, max_daily_loss_usd=100_000.0, max_total_exposure_usd=0.0,
+            )
+        )
+        # A rebalance signal already logged this month - simulates "already rebalanced".
+        session.add(
+            Signal(account_id="acct-1", symbol="SPY", strategy_name=REBALANCE_STRATEGY_NAME, action=SignalAction.buy, timestamp=dt.datetime.utcnow())
+        )
+        session.commit()
+
+    class FakeBroker:
+        name = "alpaca"
+
+        def get_account(self):
+            return AccountSnapshot(equity=10_000.0, cash=10_000.0, buying_power=10_000.0, account_id="broker-acct-1")
+
+        def get_clock(self):
+            return ClockSnapshot(is_open=True)
+
+        def get_positions(self):
+            return []
+
+        def get_bars(self, symbol, timeframe, limit=None, start=None):
+            return pd.DataFrame({"close": [100.0]})
+
+        def submit_market_order(self, symbol, action, qty):
+            return OrderResult(broker_order_id="fake-order-1", status="filled")
+
+    monkeypatch.setattr("engine.multi_runner.make_broker", lambda account_id, creds: FakeBroker())
+    monkeypatch.setattr("engine.multi_runner.load_account_credentials", lambda account_id: object())
+    monkeypatch.setattr("engine.multi_runner.make_notifier", lambda config: object())
+
+    outcome = rebalance_account_now("acct-1", config=object())
+
+    assert outcome == "rebalanced"
+    with SessionLocal() as session:
+        signals = session.execute(select(Signal).where(Signal.account_id == "acct-1")).scalars().all()
+        assert len(signals) == 2  # the pre-existing "already rebalanced this month" one, plus the new forced one

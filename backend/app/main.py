@@ -20,6 +20,7 @@ from engine.accounts import build_strategy, get_active_accounts, get_all_account
 from engine.brokers import make_broker
 from engine.brokers.base import BrokerClient
 from engine.config import load_account_credentials, load_config
+from engine.multi_runner import rebalance_account_now
 from engine.research_runner import research_once
 from engine.universe_sync import make_universe_trading_client, sync_universe_assets
 
@@ -308,6 +309,24 @@ def cancel_pending_account_strategy(account_id: str) -> dict:
         account.updated_at = dt.datetime.utcnow()
         session.commit()
         return _account_detail_dict(account)
+
+
+@app.post("/accounts/{account_id}/rebalance")
+def trigger_rebalance(account_id: str) -> dict:
+    """Manually forces a rebalancing_portfolio account to rebalance right now, bypassing
+    the once-a-month idempotency guard (kill switch/daily-loss-limit still apply - see
+    engine.multi_runner.rebalance_account_now). Exists for accounts that drifted from
+    target weights outside the bot's control (e.g. a manual trade after this month's
+    automatic rebalance already ran) and would otherwise sit stale until next month."""
+    with get_session() as session:
+        account = _get_account_or_404(session, account_id)
+        if not account.active:
+            raise HTTPException(status_code=409, detail=f"account {account_id!r} is inactive - no live broker connection")
+    try:
+        outcome = rebalance_account_now(account_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    return {"outcome": outcome}
 
 
 @app.get("/accounts/{account_id}/kill-switch")

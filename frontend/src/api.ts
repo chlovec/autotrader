@@ -179,6 +179,7 @@ export const api = {
       'PATCH',
     ),
   cancelPendingAccountStrategy: (id: string) => deleteJSON<AccountDetail>(`/accounts/${id}/strategy/pending`),
+  rebalanceAccountNow: (id: string) => postJSON<{ outcome: string }>(`/accounts/${id}/rebalance`),
   accountKillSwitch: (id: string) => getJSON<KillSwitchState>(`/accounts/${id}/kill-switch`),
   setAccountKillSwitch: (id: string, engaged: boolean, reason: string) =>
     postJSON<KillSwitchState>(`/accounts/${id}/kill-switch`, { engaged, reason }),

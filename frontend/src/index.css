@@ -855,6 +855,18 @@ tr.blocklisted td.emphasis {
   width: 100%;
 }
 
+.strategy-rebalance-now {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.strategy-rebalance-outcome {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
 .strategy-field {
   display: flex;
   flex-direction: column;

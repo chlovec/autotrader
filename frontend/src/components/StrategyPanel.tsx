@@ -44,6 +44,19 @@ const REBALANCE_DEFAULT_WEIGHTS: Record<string, number> = { SPY: 1 / 3, TLT: 1 /
 
 const WEIGHT_TOLERANCE = 0.001
 
+// Mirrors the outcome strings _rebalance_account_once/rebalance_account_now return
+// (engine/multi_runner.py) - "already_rebalanced_this_month" is included for
+// completeness even though the manual trigger always forces past that guard, so it
+// should never actually come back from this button.
+const REBALANCE_OUTCOME_LABELS: Record<string, string> = {
+  rebalanced: 'Rebalanced successfully.',
+  market_closed: 'Market is closed — try again during market hours.',
+  kill_switch_engaged: 'Kill switch is engaged — disengage it first.',
+  daily_loss_limit_breached: 'Daily loss limit breached — blocked for today.',
+  already_rebalanced_this_month: 'Already rebalanced this month.',
+  no_orders_needed: 'Already at target weights — nothing to do.',
+}
+
 interface WeightRow {
   symbol: string
   weight: string
@@ -87,6 +100,8 @@ export function StrategyPanel({ account, onChange }: { account: AccountDetail; o
   const [busy, setBusy] = useState(false)
   const [saved, setSaved] = useState(false)
   const [cancelBusy, setCancelBusy] = useState(false)
+  const [rebalanceBusy, setRebalanceBusy] = useState(false)
+  const [rebalanceOutcome, setRebalanceOutcome] = useState<string | null>(null)
 
   const paramsKey = stableStringify(account.strategy_params)
   useEffect(() => {
@@ -174,6 +189,17 @@ export function StrategyPanel({ account, onChange }: { account: AccountDetail; o
     }
   }
 
+  async function rebalanceNow() {
+    setRebalanceBusy(true)
+    setRebalanceOutcome(null)
+    try {
+      const { outcome } = await api.rebalanceAccountNow(account.id)
+      setRebalanceOutcome(outcome)
+    } finally {
+      setRebalanceBusy(false)
+    }
+  }
+
   return (
     <div className="strategy-panel">
       {account.pending_strategy_name && (
@@ -183,6 +209,17 @@ export function StrategyPanel({ account, onChange }: { account: AccountDetail; o
             {cancelBusy ? 'Canceling…' : 'Cancel pending change'}
           </button>
         </p>
+      )}
+
+      {account.strategy_name === REBALANCE_STRATEGY_NAME && (
+        <div className="strategy-rebalance-now">
+          <button type="button" className="btn-small" disabled={rebalanceBusy} onClick={rebalanceNow}>
+            {rebalanceBusy ? 'Rebalancing…' : 'Rebalance now'}
+          </button>
+          {rebalanceOutcome && (
+            <span className="strategy-rebalance-outcome">{REBALANCE_OUTCOME_LABELS[rebalanceOutcome] ?? rebalanceOutcome}</span>
+          )}
+        </div>
       )}
 
       <label className="strategy-field">

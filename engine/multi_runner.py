@@ -136,7 +136,15 @@ def _run_signal_account_once(account: Account, strategy: Strategy, config: Confi
                 running_total_exposure -= current_positions[symbol].market_value if symbol in current_positions else qty * last_price
 
 
-def _rebalance_account_once(account: Account, portfolio: RebalancingPortfolio, config: Config) -> None:
+def _rebalance_account_once(account: Account, portfolio: RebalancingPortfolio, config: Config, force: bool = False) -> str:
+    """Returns one of: "rebalanced", "market_closed", "kill_switch_engaged",
+    "already_rebalanced_this_month", "daily_loss_limit_breached", "no_orders_needed" -
+    so callers (both the automatic monthly cycle and the dashboard's manual "Rebalance
+    now" trigger, see engine.multi_runner.rebalance_account_now) can tell what actually
+    happened rather than just that nothing was logged.
+
+    `force` skips only the once-a-month idempotency check - kill switch and daily-loss-
+    limit are real safety guards and stay enforced even for a manual, forced rebalance."""
     broker = make_broker(account.id, load_account_credentials(account.id))
     notifier = make_notifier(config)
 
@@ -150,7 +158,7 @@ def _rebalance_account_once(account: Account, portfolio: RebalancingPortfolio, c
 
     if not broker.get_clock().is_open:
         logger.info("[%s] market closed, skipping rebalance", account.id)
-        return
+        return "market_closed"
 
     with get_session() as session:
         db_account = session.get(Account, account.id)
@@ -162,11 +170,11 @@ def _rebalance_account_once(account: Account, portfolio: RebalancingPortfolio, c
             log_and_notify(
                 session, notifier, "warning", "multi_runner", f"kill switch engaged, skipping rebalance: {reason}", account_id=account.id
             )
-            return
+            return "kill_switch_engaged"
 
-        if _already_rebalanced_this_month(session, account.id):
+        if not force and _already_rebalanced_this_month(session, account.id):
             logger.info("[%s] already rebalanced this month, skipping", account.id)
-            return
+            return "already_rebalanced_this_month"
 
         if risk.daily_loss_limit_breached():
             log_and_notify(
@@ -174,7 +182,7 @@ def _rebalance_account_once(account: Account, portfolio: RebalancingPortfolio, c
                 f"daily loss limit breached (limit=${db_account.max_daily_loss_usd}), skipping this month's rebalance",
                 account_id=account.id,
             )
-            return
+            return "daily_loss_limit_breached"
 
         positions = {p.symbol: p for p in broker.get_positions()}
         prices = {
@@ -185,7 +193,7 @@ def _rebalance_account_once(account: Account, portfolio: RebalancingPortfolio, c
         orders = portfolio.compute_rebalance_orders(account_snapshot, positions, prices, db_account.max_total_exposure_usd)
         if not orders:
             logger.info("[%s] portfolio already within target weights, nothing to rebalance", account.id)
-            return
+            return "no_orders_needed"
 
         for order in orders:
             signal = Signal(
@@ -196,6 +204,31 @@ def _rebalance_account_once(account: Account, portfolio: RebalancingPortfolio, c
 
             trade = execution.submit_market_order(order.symbol, order.action, order.qty, signal_id=signal.id)
             logger.info("[%s] rebalance: %s %s qty=%s (%s)", account.id, order.action.value, order.symbol, trade.qty, order.reason)
+
+        return "rebalanced"
+
+
+def rebalance_account_now(account_id: str, config: Config | None = None) -> str:
+    """Public, on-demand entrypoint for the dashboard's "Rebalance now" button
+    (backend/app/main.py) - forces a rebalance for one account immediately, bypassing
+    the once-a-month idempotency guard (kill switch/daily-loss-limit still apply, see
+    _rebalance_account_once). For an account that's drifted from target weights outside
+    the bot's control (e.g. a manual trade after this month's automatic rebalance already
+    ran), this is the only way to get it to act again before the calendar rolls over.
+
+    Raises ValueError (not HTTPException - this is a plain engine function, kept free of
+    any web-framework dependency) if the account doesn't exist or isn't running
+    rebalancing_portfolio; the backend endpoint translates that to a 400/404."""
+    config = config or load_config(argv=[])
+    with get_session() as session:
+        account = session.get(Account, account_id)
+        if account is None:
+            raise ValueError(f"unknown account {account_id!r}")
+        if account.strategy_name != REBALANCE_STRATEGY_NAME:
+            raise ValueError(f"account {account_id!r} is not running {REBALANCE_STRATEGY_NAME!r}")
+        portfolio = build_strategy(account.strategy_name, json.loads(account.strategy_params))
+
+    return _rebalance_account_once(account, portfolio, config, force=True)
 
 
 def _apply_pending_strategy_change(account: Account) -> Account:
