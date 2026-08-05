@@ -6,6 +6,8 @@ questrade_token_*.json
 *.db.bak-*
 __pycache__/
 *.pyc
+.pytest_cache/
+*.egg-info/
 .venv/
 venv/
 backtest_result.html
