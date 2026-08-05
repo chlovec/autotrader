@@ -103,7 +103,8 @@ export function ResearchPanel({
   const { items, total, selected_total: selectedTotal, page, page_size: pageSize } = research
   const lastRunAt = items[0]?.run_at
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
-  const progress = running && universeSize > 0 ? ` of ${universeSize.toLocaleString()} (${Math.round((total / universeSize) * 100)}%)` : ''
+  const showProgress = running && universeSize > 0
+  const percentComplete = showProgress ? Math.min(100, Math.round((total / universeSize) * 100)) : 0
 
   function commitPageInput() {
     const parsed = Math.round(Number(pageInput))
@@ -141,10 +142,19 @@ export function ResearchPanel({
       {lastRunAt ? (
         <p className="empty-note">
           Last run {formatRelativeTime(lastRunAt)} · {total.toLocaleString()}
-          {progress} scored · {selectedTotal.toLocaleString()} selected for the watchlist
+          {showProgress && ` of ${universeSize.toLocaleString()}`} scored · {selectedTotal.toLocaleString()} selected for the watchlist
         </p>
       ) : (
         <p className="empty-note">No research runs yet — click "Run research now" or wait for the nightly run.</p>
+      )}
+
+      {showProgress && (
+        <div className="research-progress" role="progressbar" aria-valuenow={percentComplete} aria-valuemin={0} aria-valuemax={100}>
+          <div className="research-progress-track">
+            <div className="research-progress-fill" style={{ width: `${percentComplete}%` }} />
+          </div>
+          <span className="research-progress-label">{percentComplete}%</span>
+        </div>
       )}
 
       {items.length > 0 && (

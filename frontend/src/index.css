@@ -534,6 +534,36 @@ td.emphasis {
   margin-bottom: 8px;
 }
 
+.research-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 4px 0 12px;
+}
+
+.research-progress-track {
+  flex: 1;
+  height: 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--status-good) 18%, transparent);
+  overflow: hidden;
+}
+
+.research-progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--status-good);
+  transition: width 0.3s ease;
+}
+
+.research-progress-label {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  min-width: 32px;
+  text-align: right;
+}
+
 .research-toggle {
   display: flex;
   align-items: center;
