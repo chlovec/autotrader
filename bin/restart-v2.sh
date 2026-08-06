@@ -20,6 +20,9 @@
 #
 # Env overrides: DASHBOARD_V2_PORT (must match frontend-v2/vite.config.ts's
 # strictPort - default 5174, distinct from v1's 5173 so both can run side by side).
+# BACKEND_V2_PORT (must match backend-v2/.env's BACKEND_V2_PORT - default 8001, distinct
+# from v1's BACKEND_PORT 8000) - run_jobs.py now serves a FastAPI app (job config/
+# trigger endpoints for the dashboard's Jobs page) on this port, not just the scheduler.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -27,6 +30,7 @@ cd "$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PYTHON="$(pwd)/.venv/bin/python"
 DASHBOARD_V2_PORT="${DASHBOARD_V2_PORT:-5174}"
+BACKEND_V2_PORT="${BACKEND_V2_PORT:-8001}"
 
 SKIP_BACKEND=0; BACKEND_SET=0
 SKIP_DASHBOARD=0; DASHBOARD_SET=0
@@ -119,8 +123,23 @@ if [ -n "$JOBS_PID" ]; then
   fi
 fi
 
-if [ "$SKIP_DASHBOARD" -eq 0 ]; then
+if [ "$SKIP_BACKEND" -eq 0 ] || [ "$SKIP_DASHBOARD" -eq 0 ]; then
   echo "--- listening ports ---"
+fi
+if [ "$SKIP_BACKEND" -eq 0 ]; then
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    backend_ports="$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | grep -E ":$BACKEND_V2_PORT " || true)"
+    [ -n "$backend_ports" ] && break
+    sleep 1
+  done
+  if [ -n "$backend_ports" ]; then
+    echo "$backend_ports"
+  else
+    echo "  backend-v2 still not listening on $BACKEND_V2_PORT - check $LOG"
+  fi
+  echo "Backend-v2 API (Jobs page, etc.): http://localhost:$BACKEND_V2_PORT"
+fi
+if [ "$SKIP_DASHBOARD" -eq 0 ]; then
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     ports="$(lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | grep -E ":$DASHBOARD_V2_PORT " || true)"
     [ -n "$ports" ] && break

@@ -8,6 +8,8 @@ dependencies = [
     "sqlalchemy>=2.0",
     "apscheduler>=3.10",
     "python-dotenv>=1.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
 ]
 
 [project.optional-dependencies]
@@ -22,7 +24,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["data*", "db*", "jobs*"]
+include = ["data*", "db*", "jobs*", "app*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

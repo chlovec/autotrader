@@ -49,6 +49,9 @@ body {
   color: var(--text-primary);
   font: 15px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif;
   -webkit-font-smoothing: antialiased;
+  /* The side menu overlay sits off-screen via transform on mobile (see below); this
+     keeps that from ever registering as horizontal document overflow. */
+  overflow-x: hidden;
 }
 
 #root {
@@ -137,6 +140,18 @@ body {
   height: 20px;
 }
 
+.auth-button {
+  width: auto;
+  padding: 0 10px;
+  gap: 6px;
+}
+
+.auth-button-label {
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
 .notification-badge {
   position: absolute;
   top: 2px;
@@ -187,17 +202,29 @@ body {
 
 .side-menu-item {
   display: block;
+  width: 100%;
   padding: 8px 12px;
+  border: none;
   border-radius: 6px;
+  background: none;
   color: var(--text-secondary);
+  font: inherit;
   font-size: 14px;
+  text-align: left;
   text-decoration: none;
   white-space: nowrap;
+  cursor: pointer;
 }
 
 .side-menu-item:hover {
   background: var(--page);
   color: var(--text-primary);
+}
+
+.side-menu-item.active {
+  background: var(--page);
+  color: var(--text-primary);
+  font-weight: 600;
 }
 
 .app-content {
@@ -209,4 +236,659 @@ body {
 .placeholder-note {
   color: var(--text-muted);
   font-size: 13px;
+}
+
+/* Backdrop behind the side menu when it's an overlay - hidden entirely above the
+   mobile breakpoint since the side menu is inline there and has nothing to sit over. */
+.side-menu-backdrop {
+  display: none;
+}
+
+/* Mobile: side menu becomes a fixed-position overlay drawer instead of an inline
+   column, so it no longer permanently steals width from app-content. Closed by
+   default (see App.tsx's DESKTOP_MENU_QUERY initial state). */
+@media (max-width: 768px) {
+  .side-menu {
+    position: fixed;
+    top: 56px; /* below .app-header, which is a fixed 56px tall */
+    left: 0;
+    bottom: 0;
+    width: 240px;
+    max-width: 80vw;
+    transform: translateX(-100%);
+    transition: transform 0.2s ease;
+    z-index: 20;
+    box-shadow: 2px 0 16px rgba(0, 0, 0, 0.2);
+  }
+
+  .side-menu:not(.collapsed) {
+    transform: translateX(0);
+  }
+
+  /* Overrides the desktop collapsed rule (width: 0) - width stays fixed and
+     transform handles hiding instead, so the drawer can slide instead of resize. */
+  .side-menu.collapsed {
+    width: 240px;
+    max-width: 80vw;
+    border-right: 1px solid var(--border);
+  }
+
+  .side-menu-backdrop {
+    display: block;
+    position: fixed;
+    top: 56px;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.4);
+    z-index: 15;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease;
+  }
+
+  .side-menu-backdrop.visible {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .app-content {
+    padding: 16px;
+  }
+}
+
+/* Header: drop the app name first once space gets tight, since the search box and
+   the now-labeled auth button are more important to keep readable than the wordmark. */
+@media (max-width: 480px) {
+  .app-name {
+    display: none;
+  }
+}
+
+/* Jobs page */
+
+.jobs-page-title {
+  margin: 0 0 4px;
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.jobs-page-subtitle {
+  margin: 0 0 20px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.jobs-error {
+  margin: 0 0 16px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(208, 59, 59, 0.1);
+  color: var(--status-critical);
+  font-size: 13px;
+}
+
+.jobs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.job-card {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-1);
+  padding: 20px;
+}
+
+.job-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.job-card-header-left {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.job-card-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.job-card-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.job-card-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.job-collapse-button {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+}
+
+.job-collapse-button .icon {
+  width: 16px;
+  height: 16px;
+  transition: transform 0.15s ease;
+}
+
+.job-collapse-icon-collapsed {
+  transform: rotate(-90deg);
+}
+
+.job-play-button {
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--border);
+  background: var(--page);
+}
+
+.job-play-button .icon {
+  width: 16px;
+  height: 16px;
+}
+
+/* Hover-triggered tooltip, shared by the job-info span and the play button - see
+   JobCard's tooltip-anchor/tooltip-bubble usage. */
+.job-info {
+  color: var(--text-muted);
+  cursor: help;
+}
+
+.job-info-icon {
+  width: 15px;
+  height: 15px;
+}
+
+.tooltip-anchor {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.tooltip-bubble {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 10;
+  margin-top: 6px;
+  width: max-content;
+  max-width: 280px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-1);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.4;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-2px);
+  transition: opacity 0.12s ease, transform 0.12s ease;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+}
+
+/* Right-aligned variant for anchors near the card's right edge (e.g. the play
+   button), so the bubble opens inward instead of overflowing the viewport. */
+.tooltip-bubble-right {
+  left: auto;
+  right: 0;
+}
+
+.tooltip-anchor:hover .tooltip-bubble,
+.tooltip-anchor:focus-within .tooltip-bubble {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
+}
+
+.job-status-badge {
+  flex-shrink: 0;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.job-status-badge.idle {
+  background: var(--page);
+  color: var(--text-muted);
+}
+
+.job-status-badge.running {
+  background: rgba(42, 120, 214, 0.15);
+  color: var(--series-1);
+}
+
+.job-status-badge.succeeded {
+  background: rgba(43, 158, 92, 0.15);
+  color: #2b9e5c;
+}
+
+.job-status-badge.failed {
+  background: rgba(208, 59, 59, 0.12);
+  color: var(--status-critical);
+}
+
+.job-last-run-grid {
+  margin: 14px 0 0;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: var(--page);
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px;
+}
+
+.job-last-run-item dt {
+  margin: 0 0 2px;
+  color: var(--text-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.job-last-run-item dd {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.job-last-run {
+  margin: 8px 0 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.job-last-run-error {
+  margin: 8px 0 0;
+  color: var(--status-critical);
+  font-size: 13px;
+}
+
+.job-card-form {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* Groups the run-type/interval fields separately from the job-specific run
+   parameters (ticker types, tickers, multiplier, ...) - see JobCard's two
+   job-form-section blocks. */
+.job-form-section {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.job-form-section + .job-form-section {
+  margin-top: 4px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+
+.job-form-section-title {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.job-field {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.job-field input,
+.job-field select {
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--page);
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.job-field input:focus,
+.job-field select:focus {
+  outline: 2px solid var(--series-1);
+  outline-offset: -1px;
+}
+
+.job-field input:disabled,
+.job-field select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.job-field-checkbox {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.job-field-checkbox input {
+  width: 16px;
+  height: 16px;
+}
+
+.job-field-label {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.job-run-type-options {
+  display: flex;
+  gap: 16px;
+}
+
+.job-run-type-option {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.job-run-type-option input {
+  width: 16px;
+  height: 16px;
+}
+
+.job-field-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.job-field-hint {
+  margin: -6px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.job-field-error {
+  margin: 0;
+  color: var(--status-critical);
+  font-size: 13px;
+}
+
+/* Searchable multi/single-select - see components/SearchableSelect.tsx. */
+.combobox {
+  position: relative;
+  width: 100%;
+}
+
+.combobox-control {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 34px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--page);
+}
+
+.combobox-control:focus-within {
+  outline: 2px solid var(--series-1);
+  outline-offset: -1px;
+}
+
+.combobox-disabled .combobox-control {
+  opacity: 0.5;
+}
+
+.combobox-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: var(--gridline);
+  color: var(--text-primary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.combobox-chip-remove {
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--text-muted);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.combobox-chip-remove:hover {
+  color: var(--status-critical);
+}
+
+/* Higher specificity than .job-field input so the raw input inside the combobox
+   loses that rule's border/height/background instead of double-boxing. */
+.job-field .combobox input.combobox-input {
+  flex: 1;
+  min-width: 60px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.job-field .combobox input.combobox-input:focus {
+  outline: none;
+}
+
+.combobox-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 15;
+  margin: 4px 0 0;
+  padding: 4px;
+  list-style: none;
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-1);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+}
+
+.combobox-option {
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.combobox-option:hover {
+  background: var(--page);
+}
+
+/* Selected options stay in the list (see SearchableSelect's toggle()) rather than
+   disappearing, so they need their own visual marker instead. */
+.combobox-option-selected {
+  color: var(--series-1);
+  font-weight: 600;
+}
+
+.combobox-option-selected::before {
+  content: '✓ ';
+}
+
+.combobox-empty {
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.job-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.job-button {
+  height: 34px;
+  padding: 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--page);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.job-button:hover:not(:disabled) {
+  background: var(--gridline);
+}
+
+.job-button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.job-button-primary {
+  border-color: var(--series-1);
+  background: var(--series-1);
+  color: #ffffff;
+}
+
+.job-button-primary:hover:not(:disabled) {
+  background: var(--series-1);
+  opacity: 0.9;
+}
+
+.job-button-ghost {
+  border-color: transparent;
+  background: none;
+}
+
+.job-button-ghost:hover:not(:disabled) {
+  background: var(--page);
+}
+
+.job-history {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+  overflow-x: auto;
+}
+
+.job-history-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.job-history-table th {
+  padding: 6px 10px;
+  text-align: left;
+  color: var(--text-muted);
+  font-weight: 500;
+  border-bottom: 1px solid var(--border);
+}
+
+.job-history-table td {
+  padding: 6px 10px;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--border);
+  white-space: normal;
+}
+
+@media (max-width: 480px) {
+  .job-field-row {
+    flex-direction: column;
+  }
+
+  .job-card {
+    padding: 16px;
+  }
+
+  .job-last-run-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+/* Job setup modal placeholder - see components/JobSetupModal.tsx */
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(0, 0, 0, 0.4);
+}
+
+.modal {
+  width: 100%;
+  max-width: 360px;
+  padding: 20px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface-1);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.25);
+}
+
+.modal-title {
+  margin: 0 0 8px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.modal-body {
+  margin: 0 0 18px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
 }

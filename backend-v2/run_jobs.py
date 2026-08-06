@@ -1,41 +1,26 @@
-"""Standalone process for backend-v2's scheduled jobs. Mirrors engine/multi_runner.py's
-shape at the repo root: run once immediately on startup (so a freshly-provisioned db
-doesn't sit empty until the next scheduled slot), then keep running it on a cron
-schedule.
+"""Launcher for backend-v2's API + scheduled-jobs process. The actual app - job
+endpoints, CORS, and the lifespan handler that runs sync-tickers/sync-bars-nightly once
+on startup then keeps them on a cron schedule - lives in app/main.py. Kept as a
+separate script (rather than invoking `uvicorn app.main:app` directly) so
+bin/restart-v2.sh's `python run_jobs.py` invocation doesn't need to change.
+
+Usage (from backend-v2/, matching how bin/restart-v2.sh runs it):
+    python run_jobs.py
+
+Env: BACKEND_V2_HOST (default 127.0.0.1), BACKEND_V2_PORT (default 8001), plus
+everything app/main.py itself reads (CORS_ORIGINS, MASSIVE_API_KEY, ...).
 """
 
-import asyncio
 import logging
+import os
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
+import uvicorn
+from dotenv import load_dotenv
 
-from jobs.sync_bars import run_nightly as run_bars_nightly
-from jobs.sync_tickers import run_once as run_tickers_once
-
+load_dotenv()
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("backend_v2.run_jobs")
-
-
-async def main(tickers_hour: int = 1, tickers_minute: int = 0, bars_hour: int = 2, bars_minute: int = 0) -> None:
-    # Sequential, not parallel: the bars job selects tickers out of the tickers table,
-    # so a startup run needs tickers synced first, not racing it.
-    await run_tickers_once()
-    await run_bars_nightly()
-
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(
-        run_tickers_once, CronTrigger(hour=tickers_hour, minute=tickers_minute, timezone="UTC"), id="sync-tickers"
-    )
-    scheduler.add_job(
-        run_bars_nightly, CronTrigger(hour=bars_hour, minute=bars_minute, timezone="UTC"), id="sync-bars-nightly"
-    )
-    scheduler.start()
-    logger.info("scheduled tickers sync daily at %02d:%02d UTC", tickers_hour, tickers_minute)
-    logger.info("scheduled nightly bars sync daily at %02d:%02d UTC", bars_hour, bars_minute)
-
-    await asyncio.Event().wait()
-
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    host = os.environ.get("BACKEND_V2_HOST", "127.0.0.1")
+    port = int(os.environ.get("BACKEND_V2_PORT", "8001"))
+    uvicorn.run("app.main:app", host=host, port=port, log_level="info")

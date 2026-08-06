@@ -34,13 +34,9 @@ export function Header({
         <input type="search" placeholder="Search" aria-label="Search" />
       </div>
 
-      <button
-        type="button"
-        className="icon-button"
-        aria-label={authenticated ? 'Log out' : 'Log in'}
-        onClick={onToggleAuth}
-      >
+      <button type="button" className="icon-button auth-button" onClick={onToggleAuth}>
         {authenticated ? <LogoutIcon className="icon" /> : <LoginIcon className="icon" />}
+        <span className="auth-button-label">{authenticated ? 'Log out' : 'Log in'}</span>
       </button>
 
       <button type="button" className="icon-button notification-button" aria-label="Notifications">

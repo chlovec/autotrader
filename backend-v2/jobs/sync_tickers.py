@@ -47,7 +47,7 @@ def _upsert_ticker(session: Session, result: dict[str, Any]) -> None:
     session.execute(stmt)
 
 
-async def sync_tickers(client: DataClient, session: Session) -> int:
+async def sync_tickers(client: DataClient, session: Session, ticker_type: str | None = None) -> int:
     """Fetches every page of /v3/reference/tickers, upserting each result into the
     tickers table, then records this run's start time as the new sync cutoff.
 
@@ -55,6 +55,10 @@ async def sync_tickers(client: DataClient, session: Session) -> int:
     time would miss any ticker massive.com updates while this run was still paging
     through results, since the next run would only ask for updates after that later
     point.
+
+    `ticker_type` restricts the sync to one upstream `type` (e.g. "CS") - set from the
+    dashboard's Jobs page (JobConfig.ticker_types for this job is a single value, unlike
+    the bars job's multi-select use of the same column); None syncs every type.
     """
     # Naive but always UTC - matches SyncState.last_synced_at, which sqlite would hand
     # back naive on the next read regardless of what tzinfo went in.
@@ -63,6 +67,8 @@ async def sync_tickers(client: DataClient, session: Session) -> int:
     is_first_run = state is None
 
     params: dict[str, Any] = {"limit": PAGE_LIMIT, "sort": "ticker", "order": "asc"}
+    if ticker_type:
+        params["type"] = ticker_type
     if state is not None:
         params["updated_since"] = f"{state.last_synced_at.isoformat()}Z"
 
