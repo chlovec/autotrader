@@ -853,7 +853,7 @@ body {
   }
 }
 
-/* Job setup modal placeholder - see components/JobSetupModal.tsx */
+/* Run-job confirmation modal - see components/RunJobModal.tsx */
 
 .modal-backdrop {
   position: fixed;
@@ -891,4 +891,5 @@ body {
 .modal-actions {
   display: flex;
   justify-content: flex-end;
+  gap: 8px;
 }

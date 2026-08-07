@@ -42,6 +42,10 @@ export function JobsPage() {
     setJobs((prev) => prev?.map((job) => (job.name === updated.name ? updated : job)) ?? prev)
   }
 
+  const handleRun = () => {
+    loadJobs()
+  }
+
   return (
     <div className="jobs-page">
       <h1 className="jobs-page-title">Jobs</h1>
@@ -56,7 +60,7 @@ export function JobsPage() {
       {jobs && (
         <div className="jobs-list">
           {jobs.map((job) => (
-            <JobCard key={job.name} job={job} onSaved={handleSaved} tickerTypeOptions={tickerTypeOptions} />
+            <JobCard key={job.name} job={job} onSaved={handleSaved} onRun={handleRun} tickerTypeOptions={tickerTypeOptions} />
           ))}
         </div>
       )}

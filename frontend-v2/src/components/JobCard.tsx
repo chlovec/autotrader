@@ -1,12 +1,13 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { api, type Job, type JobRun, type RunType, type ScheduleIntervalUnit } from '../api'
 import { ChevronIcon, InfoIcon, PlayIcon } from './icons'
-import { JobSetupModal } from './JobSetupModal'
+import { RunJobModal } from './RunJobModal'
 import { SearchableSelect, type SelectOption } from './SearchableSelect'
 
 type JobCardProps = {
   job: Job
   onSaved: (job: Job) => void
+  onRun: () => void
   tickerTypeOptions: SelectOption[]
 }
 
@@ -59,7 +60,7 @@ function StatusBadge({ job }: { job: Job }) {
   return <span className="job-status-badge succeeded">Succeeded</span>
 }
 
-export function JobCard({ job, onSaved, tickerTypeOptions }: JobCardProps) {
+export function JobCard({ job, onSaved, onRun, tickerTypeOptions }: JobCardProps) {
   const [runType, setRunType] = useState<RunType>(job.run_type)
   const [scheduleIntervalUnit, setScheduleIntervalUnit] = useState<ScheduleIntervalUnit>(job.schedule_interval_unit)
   const [scheduleIntervalValue, setScheduleIntervalValue] = useState(job.schedule_interval_value)
@@ -74,7 +75,7 @@ export function JobCard({ job, onSaved, tickerTypeOptions }: JobCardProps) {
   const [showHistory, setShowHistory] = useState(false)
   const [history, setHistory] = useState<JobRun[] | null>(null)
   const [historyLoading, setHistoryLoading] = useState(false)
-  const [setupOpen, setSetupOpen] = useState(false)
+  const [runModalOpen, setRunModalOpen] = useState(false)
   const [collapsed, setCollapsed] = useState(true)
 
   // Discards the cached run history once a new run finishes, so re-expanding shows it
@@ -154,13 +155,13 @@ export function JobCard({ job, onSaved, tickerTypeOptions }: JobCardProps) {
             <button
               type="button"
               className="icon-button job-play-button"
-              aria-label={`Configure and run ${job.label} job.`}
-              onClick={() => setSetupOpen(true)}
+              aria-label={`Run ${job.label} job now.`}
+              onClick={() => setRunModalOpen(true)}
             >
               <PlayIcon className="icon" />
             </button>
             <span className="tooltip-bubble tooltip-bubble-right" role="tooltip">
-              Configure and run {job.label} job.
+              Run {job.label} job now.
             </span>
           </span>
         </div>
@@ -390,7 +391,7 @@ export function JobCard({ job, onSaved, tickerTypeOptions }: JobCardProps) {
         </>
       )}
 
-      {setupOpen && <JobSetupModal job={job} onClose={() => setSetupOpen(false)} />}
+      {runModalOpen && <RunJobModal job={job} onClose={() => setRunModalOpen(false)} onRun={onRun} />}
     </section>
   )
 }
