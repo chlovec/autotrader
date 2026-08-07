@@ -29,8 +29,9 @@ from sqlalchemy.orm import Session
 from data.client import DataClient
 from db.models import JobConfig, JobRun, Ticker
 from db.session import SessionLocal, init_db
-from jobs.registry import BARS_JOB, DEFAULT_SCHEDULES, JOB_DEFINITIONS, TICKERS_JOB
+from jobs.registry import BARS_JOB, DEFAULT_SCHEDULES, JOB_DEFINITIONS, TICKER_TYPES_JOB, TICKERS_JOB
 from jobs.sync_bars import DEFAULT_BACKFILL_DAYS, DEFAULT_MULTIPLIER, DEFAULT_TIMESPAN, sync_bars_nightly
+from jobs.sync_ticker_types import sync_ticker_types
 from jobs.sync_tickers import sync_tickers
 
 logger = logging.getLogger("backend_v2.app")
@@ -65,7 +66,7 @@ def _get_or_create_config(session: Session, job_name: str) -> JobConfig:
     unit, value = DEFAULT_SCHEDULES[job_name]
     config = JobConfig(
         job_name=job_name,
-        run_type="auto",
+        run_type=JOB_DEFINITIONS[job_name].default_run_type,
         schedule_interval_unit=unit,
         schedule_interval_value=value,
         multiplier=DEFAULT_MULTIPLIER if job_name == BARS_JOB else None,
@@ -104,6 +105,9 @@ async def _run_job(job_name: str, trigger: str) -> None:
             if job_name == TICKERS_JOB:
                 count = await sync_tickers(client, session, ticker_type=config.ticker_types or None)
                 summary = f"{count} ticker(s) synced"
+            elif job_name == TICKER_TYPES_JOB:
+                count = await sync_ticker_types(client, session)
+                summary = f"{count} ticker type(s) synced"
             else:
                 results = await sync_bars_nightly(
                     client,
@@ -155,8 +159,11 @@ async def lifespan(app: FastAPI):
         schedules = {name: _get_or_create_config(session, name) for name in JOB_DEFINITIONS}
 
     # Sequential, not parallel: the bars job selects tickers out of the tickers table,
-    # so a startup run needs tickers synced first, not racing it. Each call also
-    # respects that job's `run_type`, same as a scheduled cron fire would.
+    # so a startup run needs tickers synced first, not racing it. ticker-types has no
+    # such dependency. Each call also respects that job's `run_type`, same as a
+    # scheduled cron fire would - ticker-types defaults to manual, so this is normally
+    # a no-op at startup.
+    await _scheduled_job(TICKER_TYPES_JOB)
     await _scheduled_job(TICKERS_JOB)
     await _scheduled_job(BARS_JOB)
 
@@ -227,6 +234,7 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         "label": definition.label,
         "description": definition.description,
         "has_bars_fields": definition.has_bars_fields,
+        "has_ticker_type_filter": definition.has_ticker_type_filter,
         "run_type": config.run_type,
         "schedule_interval_unit": config.schedule_interval_unit,
         "schedule_interval_value": config.schedule_interval_value,
@@ -317,10 +325,12 @@ def update_job_config(job_name: str, body: JobConfigIn) -> dict:
         config.run_type = body.run_type
         config.schedule_interval_unit = body.schedule_interval_unit
         config.schedule_interval_value = body.schedule_interval_value
-        # ticker_types applies to both jobs - a single type filter for the tickers job
-        # (see sync_tickers's ticker_type param), a multi-select filter for the bars
-        # job. tickers/multiplier/timespan/backfill_days stay bars-only.
-        config.ticker_types = body.ticker_types
+        # ticker_types applies to jobs with has_ticker_type_filter - a single type
+        # filter for the tickers job (see sync_tickers's ticker_type param), a
+        # multi-select filter for the bars job. Dropped for a job like ticker-types
+        # sync that takes no run parameters at all, even if the caller sent one.
+        # tickers/multiplier/timespan/backfill_days stay bars-only.
+        config.ticker_types = body.ticker_types if JOB_DEFINITIONS[job_name].has_ticker_type_filter else None
         if JOB_DEFINITIONS[job_name].has_bars_fields:
             config.tickers = body.tickers
             config.multiplier = body.multiplier

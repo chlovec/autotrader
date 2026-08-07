@@ -92,7 +92,7 @@ export function JobCard({ job, onSaved, tickerTypeOptions }: JobCardProps) {
         run_type: runType,
         schedule_interval_unit: scheduleIntervalUnit,
         schedule_interval_value: scheduleIntervalValue,
-        ticker_types: toCsv(tickerTypes),
+        ...(job.has_ticker_type_filter ? { ticker_types: toCsv(tickerTypes) } : {}),
         ...(job.has_bars_fields
           ? {
               tickers: toCsv(tickers),
@@ -257,7 +257,7 @@ export function JobCard({ job, onSaved, tickerTypeOptions }: JobCardProps) {
             <div className="job-form-section">
               <h3 className="job-form-section-title">Run parameters</h3>
 
-              {!job.has_bars_fields && (
+              {!job.has_bars_fields && job.has_ticker_type_filter && (
                 // A plain div, not <label> - a native <label> forwards clicks on any
                 // non-form-control descendant (like a dropdown <li>) to the first
                 // labelable element inside it (button, input, ...) in DOM order. Once
@@ -274,6 +274,10 @@ export function JobCard({ job, onSaved, tickerTypeOptions }: JobCardProps) {
                     placeholder="Any type"
                   />
                 </div>
+              )}
+
+              {!job.has_bars_fields && !job.has_ticker_type_filter && (
+                <p className="job-field-hint">This job has no run parameters to configure.</p>
               )}
 
               {job.has_bars_fields && (

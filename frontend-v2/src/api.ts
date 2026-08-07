@@ -21,6 +21,7 @@ export interface Job {
   label: string
   description: string
   has_bars_fields: boolean
+  has_ticker_type_filter: boolean
   run_type: RunType
   schedule_interval_unit: ScheduleIntervalUnit
   schedule_interval_value: number

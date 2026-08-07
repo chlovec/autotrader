@@ -31,6 +31,21 @@ class Ticker(Base):
     last_updated_utc: Mapped[str | None] = mapped_column(String)
 
 
+class TickerType(Base):
+    """One row per code/asset_class/locale combination returned by GET
+    /v3/reference/tickers/types, describing what a Ticker.type value means (e.g. "CS" ->
+    "Common Stock"). Upserted by jobs/sync_ticker_types.py - unlike Ticker, this is a
+    short, mostly-static reference list re-fetched in full on every run rather than
+    incrementally."""
+
+    __tablename__ = "ticker_types"
+
+    code: Mapped[str] = mapped_column(String, primary_key=True)
+    asset_class: Mapped[str] = mapped_column(String, primary_key=True)
+    locale: Mapped[str] = mapped_column(String, primary_key=True)
+    description: Mapped[str | None] = mapped_column(String)
+
+
 class SyncState(Base):
     """One row per job name, tracking when that job last completed successfully so the
     next run can ask the upstream API for only what changed since then. See
