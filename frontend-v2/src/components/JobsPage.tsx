@@ -1,16 +1,12 @@
 import { useEffect, useState } from 'react'
 import { api, type Job } from '../api'
 import { JobCard } from './JobCard'
-import type { SelectOption } from './SearchableSelect'
 
 const POLL_INTERVAL_MS = 2000
 
 export function JobsPage() {
   const [jobs, setJobs] = useState<Job[] | null>(null)
   const [error, setError] = useState<string | null>(null)
-  // Fetched once here rather than per-card - both jobs' Ticker type select(s) share
-  // the same small, slow-changing list.
-  const [tickerTypeOptions, setTickerTypeOptions] = useState<SelectOption[]>([])
 
   const loadJobs = async () => {
     try {
@@ -24,10 +20,6 @@ export function JobsPage() {
 
   useEffect(() => {
     loadJobs()
-    api
-      .tickerTypes()
-      .then((types) => setTickerTypeOptions(types.map((type) => ({ value: type, label: type }))))
-      .catch(() => setTickerTypeOptions([]))
   }, [])
 
   // While any job is running, poll so status/last-run update without a manual refresh.
@@ -60,7 +52,7 @@ export function JobsPage() {
       {jobs && (
         <div className="jobs-list">
           {jobs.map((job) => (
-            <JobCard key={job.name} job={job} onSaved={handleSaved} onRun={handleRun} tickerTypeOptions={tickerTypeOptions} />
+            <JobCard key={job.name} job={job} onSaved={handleSaved} onRun={handleRun} />
           ))}
         </div>
       )}

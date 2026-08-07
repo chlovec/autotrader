@@ -51,6 +51,12 @@ export interface TickerOption {
   name: string | null
 }
 
+export interface TickerTypeOption {
+  code: string
+  asset_class: string
+  description: string | null
+}
+
 async function getJSON<T>(path: string): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`)
   if (!res.ok) throw new Error(`${path} failed: ${res.status}`)
@@ -83,7 +89,8 @@ export const api = {
     if (!res.ok) throw new Error(`trigger ${name} failed: ${res.status}`)
     return res.json()
   },
-  tickerTypes: () => getJSON<string[]>('/ticker-types'),
   searchTickers: (q: string, limit = 20) =>
     getJSON<TickerOption[]>(`/tickers/search?q=${encodeURIComponent(q)}&limit=${limit}`),
+  searchTickerTypes: (q: string, limit = 20) =>
+    getJSON<TickerTypeOption[]>(`/ticker-types/search?q=${encodeURIComponent(q)}&limit=${limit}`),
 }

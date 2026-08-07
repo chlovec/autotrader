@@ -27,7 +27,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from data.client import DataClient
-from db.models import JobConfig, JobRun, Ticker
+from db.models import JobConfig, JobRun, Ticker, TickerType
 from db.session import SessionLocal, init_db
 from jobs.registry import BARS_JOB, DEFAULT_SCHEDULES, JOB_DEFINITIONS, TICKER_TYPES_JOB, TICKERS_JOB
 from jobs.sync_bars import DEFAULT_BACKFILL_DAYS, DEFAULT_MULTIPLIER, DEFAULT_TIMESPAN, sync_bars_nightly
@@ -270,16 +270,28 @@ def health() -> dict:
     return {"status": "ok"}
 
 
-@app.get("/ticker-types")
-def list_ticker_types() -> list[str]:
+@app.get("/ticker-types/search")
+def search_ticker_types(q: str = "", limit: int = 20) -> list[dict]:
     """Backs the Jobs page's searchable ticker-type selects (JobCard's TickerType
-    combobox) - the distinct types actually seen in the tickers table, rather than a
-    hardcoded guess at what the upstream API's `type` field can be."""
+    combobox(es)) - looks up the ticker_types reference table itself (synced by
+    sync-ticker-types), matching against code, asset_class, or description rather than
+    just the codes actually in use on the tickers table."""
+    limit = max(1, min(limit, 50))
     with SessionLocal() as session:
-        rows = session.execute(
-            select(Ticker.type).where(Ticker.type.isnot(None)).distinct().order_by(Ticker.type)
-        ).scalars()
-        return list(rows)
+        query = select(TickerType.code, TickerType.asset_class, TickerType.description)
+        term = q.strip()
+        if term:
+            pattern = f"%{term}%"
+            query = query.where(
+                or_(
+                    TickerType.code.like(pattern),
+                    TickerType.asset_class.like(pattern),
+                    TickerType.description.like(pattern),
+                )
+            )
+        query = query.distinct().order_by(TickerType.code).limit(limit)
+        rows = session.execute(query).all()
+        return [{"code": row.code, "asset_class": row.asset_class, "description": row.description} for row in rows]
 
 
 @app.get("/tickers/search")

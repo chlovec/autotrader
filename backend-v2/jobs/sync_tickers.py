@@ -11,11 +11,12 @@ import datetime as dt
 import logging
 from typing import Any
 
+from sqlalchemy import delete
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from data.client import DataClient
-from db.models import SyncState, Ticker
+from db.models import SyncProgress, SyncState, Ticker
 from db.session import SessionLocal, init_db
 
 logger = logging.getLogger("backend_v2.jobs.sync_tickers")
@@ -59,20 +60,35 @@ async def sync_tickers(client: DataClient, session: Session, ticker_type: str | 
     `ticker_type` restricts the sync to one upstream `type` (e.g. "CS") - set from the
     dashboard's Jobs page (JobConfig.ticker_types for this job is a single value, unlike
     the bars job's multi-select use of the same column); None syncs every type.
+
+    Progress is checkpointed to sync_progress after every page - if the job dies
+    partway (e.g. DataClient exhausts its 429 retries), the *next* call to sync_tickers
+    resumes from the failed page's cursor instead of re-paging everything already
+    fetched. A checkpoint left behind by a different ticker_type filter is discarded
+    rather than resumed, since massive.com bakes the filter into the cursor itself.
     """
-    # Naive but always UTC - matches SyncState.last_synced_at, which sqlite would hand
-    # back naive on the next read regardless of what tzinfo went in.
-    run_started_at = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
     state = session.get(SyncState, JOB_NAME)
     is_first_run = state is None
+    progress = session.get(SyncProgress, JOB_NAME)
 
-    params: dict[str, Any] = {"limit": PAGE_LIMIT, "sort": "ticker", "order": "asc"}
-    if ticker_type:
-        params["type"] = ticker_type
-    if state is not None:
-        params["updated_since"] = f"{state.last_synced_at.isoformat()}Z"
+    if progress is not None and progress.ticker_type == ticker_type:
+        run_started_at = progress.run_started_at
+        next_url: str | None = progress.next_url
+        params: dict[str, Any] = {}
+    else:
+        # A stale checkpoint (different ticker_type) is left in place rather than
+        # deleted here - the next page fetched under the current filter overwrites it
+        # via the merge() below, or the final cleanup clears it once this run completes.
+        # Naive but always UTC - matches SyncState.last_synced_at, which sqlite would
+        # hand back naive on the next read regardless of what tzinfo went in.
+        run_started_at = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+        next_url = None
+        params = {"limit": PAGE_LIMIT, "sort": "ticker", "order": "asc"}
+        if ticker_type:
+            params["type"] = ticker_type
+        if state is not None:
+            params["updated_since"] = f"{state.last_synced_at.isoformat()}Z"
 
-    next_url: str | None = None
     fetched = 0
     while True:
         payload = await (client.get(next_url) if next_url else client.get(TICKERS_PATH, params=params))
@@ -82,6 +98,13 @@ async def sync_tickers(client: DataClient, session: Session, ticker_type: str | 
         fetched += len(results)
 
         next_url = payload.get("next_url")
+        if next_url:
+            session.merge(
+                SyncProgress(
+                    job_name=JOB_NAME, next_url=next_url, run_started_at=run_started_at, ticker_type=ticker_type
+                )
+            )
+        session.commit()
         if not next_url:
             break
 
@@ -89,6 +112,7 @@ async def sync_tickers(client: DataClient, session: Session, ticker_type: str | 
         session.add(SyncState(job_name=JOB_NAME, last_synced_at=run_started_at))
     else:
         state.last_synced_at = run_started_at
+    session.execute(delete(SyncProgress).where(SyncProgress.job_name == JOB_NAME))
 
     session.commit()
     logger.info("synced %d ticker(s) (%s)", fetched, "full" if is_first_run else "incremental")

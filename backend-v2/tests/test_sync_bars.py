@@ -1,19 +1,12 @@
-import os
-import tempfile
+import datetime as dt
 
-_db_fd, _db_path = tempfile.mkstemp(suffix=".db")
-os.close(_db_fd)
-os.environ.setdefault("BACKEND_V2_DATABASE_URL", f"sqlite:///{_db_path}")
+import httpx
+import pytest
 
-import datetime as dt  # noqa: E402
-
-import httpx  # noqa: E402
-import pytest  # noqa: E402
-
-from data.client import DataClient  # noqa: E402
-from db.models import OhlcBar, Ticker, TickerBarSyncState  # noqa: E402
-from db.session import SessionLocal, init_db  # noqa: E402
-from jobs.sync_bars import fetch_and_store_bars, sync_bars_manual, sync_bars_nightly  # noqa: E402
+from data.client import DataClient
+from db.models import OhlcBar, Ticker, TickerBarSyncState
+from db.session import SessionLocal, init_db
+from jobs.sync_bars import fetch_and_store_bars, sync_bars_manual, sync_bars_nightly
 
 
 @pytest.fixture(autouse=True)

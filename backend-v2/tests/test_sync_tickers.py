@@ -1,19 +1,12 @@
-import os
-import tempfile
+import datetime as dt
 
-_db_fd, _db_path = tempfile.mkstemp(suffix=".db")
-os.close(_db_fd)
-os.environ["BACKEND_V2_DATABASE_URL"] = f"sqlite:///{_db_path}"
+import httpx
+import pytest
 
-import datetime as dt  # noqa: E402
-
-import httpx  # noqa: E402
-import pytest  # noqa: E402
-
-from data.client import DataClient  # noqa: E402
-from db.models import SyncState, Ticker  # noqa: E402
-from db.session import SessionLocal, init_db  # noqa: E402
-from jobs.sync_tickers import TICKERS_PATH, sync_tickers  # noqa: E402
+from data.client import DataClient
+from db.models import SyncProgress, SyncState, Ticker
+from db.session import SessionLocal, init_db
+from jobs.sync_tickers import TICKERS_PATH, sync_tickers
 
 
 @pytest.fixture(autouse=True)
@@ -22,6 +15,7 @@ def _clean_db():
     session = SessionLocal()
     session.query(Ticker).delete()
     session.query(SyncState).delete()
+    session.query(SyncProgress).delete()
     session.commit()
     session.close()
     yield
@@ -106,3 +100,88 @@ async def test_second_run_requests_only_updates_since_last_sync():
             session.close()
 
     assert requests[0].url.params["updated_since"] == f"{last_synced_at.isoformat()}Z"
+
+
+async def test_resumes_from_checkpoint_after_page_failure():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == TICKERS_PATH and "cursor" not in request.url.params:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [{"ticker": "AAA", "name": "Alpha"}],
+                    "next_url": "https://api.massive.com/v3/reference/tickers?cursor=page2",
+                },
+            )
+        return httpx.Response(500, json={"error": "boom"})  # page 2 always fails
+
+    async with _client_with_handler(handler) as client:
+        session = SessionLocal()
+        try:
+            with pytest.raises(httpx.HTTPStatusError):
+                await sync_tickers(client, session)
+
+            # Page 1's ticker survives even though the run as a whole failed.
+            assert session.get(Ticker, "AAA") is not None
+            # The run never finished, so no cutoff was recorded yet...
+            assert session.get(SyncState, "tickers") is None
+            # ...but the failed page's cursor was checkpointed.
+            progress = session.get(SyncProgress, "tickers")
+            assert progress is not None
+            assert progress.next_url == "https://api.massive.com/v3/reference/tickers?cursor=page2"
+        finally:
+            session.close()
+
+    requests: list[httpx.Request] = []
+
+    def resumed_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"results": [{"ticker": "BBB", "name": "Beta"}]})
+
+    async with _client_with_handler(resumed_handler) as client:
+        session = SessionLocal()
+        try:
+            fetched = await sync_tickers(client, session)
+
+            # Only page 2's result - page 1 wasn't re-fetched.
+            assert fetched == 1
+            assert session.get(Ticker, "BBB") is not None
+            assert session.get(SyncState, "tickers") is not None
+            assert session.get(SyncProgress, "tickers") is None
+        finally:
+            session.close()
+
+    assert len(requests) == 1
+    assert requests[0].url.params["cursor"] == "page2"
+
+
+async def test_stale_checkpoint_from_different_ticker_type_is_discarded():
+    session = SessionLocal()
+    session.add(
+        SyncProgress(
+            job_name="tickers",
+            next_url="https://api.massive.com/v3/reference/tickers?cursor=stale&type=ETF",
+            run_started_at=dt.datetime(2026, 1, 1),
+            ticker_type="ETF",
+        )
+    )
+    session.commit()
+    session.close()
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"results": [{"ticker": "AAA", "name": "Alpha"}]})
+
+    async with _client_with_handler(handler) as client:
+        session = SessionLocal()
+        try:
+            fetched = await sync_tickers(client, session, ticker_type="CS")
+            assert fetched == 1
+        finally:
+            session.close()
+
+    # Started a fresh full request for the new filter, not the stale ETF cursor.
+    assert requests[0].url.path == TICKERS_PATH
+    assert "cursor" not in requests[0].url.params
+    assert requests[0].url.params["type"] == "CS"

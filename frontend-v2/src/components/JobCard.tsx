@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from 'react'
-import { api, type Job, type JobRun, type RunType, type ScheduleIntervalUnit } from '../api'
+import { api, type Job, type JobRun, type RunType, type ScheduleIntervalUnit, type TickerTypeOption } from '../api'
 import { ChevronIcon, InfoIcon, PlayIcon } from './icons'
 import { RunJobModal } from './RunJobModal'
 import { SearchableSelect, type SelectOption } from './SearchableSelect'
@@ -8,7 +8,15 @@ type JobCardProps = {
   job: Job
   onSaved: (job: Job) => void
   onRun: () => void
-  tickerTypeOptions: SelectOption[]
+}
+
+function tickerTypeLabel(t: TickerTypeOption): string {
+  const detail = [t.asset_class, t.description].filter(Boolean).join(': ')
+  return detail ? `${t.code} — ${detail}` : t.code
+}
+
+function searchTickerTypeOptions(q: string): Promise<SelectOption[]> {
+  return api.searchTickerTypes(q).then((matches) => matches.map((t) => ({ value: t.code, label: tickerTypeLabel(t) })))
 }
 
 function parseCsv(value: string | null): string[] {
@@ -60,7 +68,7 @@ function StatusBadge({ job }: { job: Job }) {
   return <span className="job-status-badge succeeded">Succeeded</span>
 }
 
-export function JobCard({ job, onSaved, onRun, tickerTypeOptions }: JobCardProps) {
+export function JobCard({ job, onSaved, onRun }: JobCardProps) {
   const [runType, setRunType] = useState<RunType>(job.run_type)
   const [scheduleIntervalUnit, setScheduleIntervalUnit] = useState<ScheduleIntervalUnit>(job.schedule_interval_unit)
   const [scheduleIntervalValue, setScheduleIntervalValue] = useState(job.schedule_interval_value)
@@ -271,8 +279,8 @@ export function JobCard({ job, onSaved, onRun, tickerTypeOptions }: JobCardProps
                     multiple={false}
                     selected={tickerTypes}
                     onChange={setTickerTypes}
-                    options={tickerTypeOptions}
-                    placeholder="Any type"
+                    onSearch={searchTickerTypeOptions}
+                    placeholder="Search ticker types..."
                   />
                 </div>
               )}
@@ -290,8 +298,8 @@ export function JobCard({ job, onSaved, onRun, tickerTypeOptions }: JobCardProps
                         multiple
                         selected={tickerTypes}
                         onChange={setTickerTypes}
-                        options={tickerTypeOptions}
-                        placeholder="Any type"
+                        onSearch={searchTickerTypeOptions}
+                        placeholder="Search ticker types..."
                       />
                     </div>
                     <div className="job-field">

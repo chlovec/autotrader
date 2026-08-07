@@ -147,6 +147,12 @@ export function SearchableSelect({
               <li
                 key={opt.value}
                 className={`combobox-option${isSelected(opt.value) ? ' combobox-option-selected' : ''}`}
+                // Without this, mousedown on the (non-focusable) <li> blurs the input
+                // before the click fires, which schedules handleBlur's dropdown-close
+                // timeout. toggle() never refocuses the input, so ~120ms after picking
+                // the first item the dropdown would close and the input stay unfocused -
+                // silently swallowing any further typing for a second search.
+                onMouseDown={(e) => e.preventDefault()}
                 onClick={() => toggle(opt.value)}
               >
                 {opt.label}

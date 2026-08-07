@@ -61,6 +61,25 @@ class SyncState(Base):
     last_synced_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
 
 
+class SyncProgress(Base):
+    """Cursor checkpoint for a sync_tickers run that's still in flight, so a run
+    interrupted mid-page (e.g. DataClient exhausts its 429 retries) resumes from the
+    failed page's cursor on the next call instead of re-paging everything already
+    fetched. Written after every successful page, deleted once the run finishes and
+    SyncState.last_synced_at is written - see jobs/sync_tickers.py's sync_tickers.
+
+    ticker_type records which type filter the checkpointed cursor was issued under -
+    massive.com bakes query filters into the opaque cursor itself, so a checkpoint from
+    a since-changed ticker_type filter can't be resumed and is discarded instead."""
+
+    __tablename__ = "sync_progress"
+
+    job_name: Mapped[str] = mapped_column(String, primary_key=True)
+    next_url: Mapped[str] = mapped_column(String)
+    run_started_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
+    ticker_type: Mapped[str | None] = mapped_column(String)
+
+
 class OhlcBar(Base):
     """One row per bar returned by GET /v2/aggs/ticker/{ticker}/range/{multiplier}/
     {timespan}/{from}/{to}, keyed by (ticker, multiplier, timespan, timestamp) so the
