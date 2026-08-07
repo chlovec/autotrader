@@ -65,6 +65,23 @@ export function PlayIcon({ className }: IconProps) {
   )
 }
 
+export function PauseIcon({ className }: IconProps) {
+  return (
+    <svg className={className} viewBox="0 0 20 20" fill="none" aria-hidden="true">
+      <rect x="6" y="4.5" width="2.6" height="11" rx="0.6" fill="currentColor" />
+      <rect x="11.4" y="4.5" width="2.6" height="11" rx="0.6" fill="currentColor" />
+    </svg>
+  )
+}
+
+export function StopIcon({ className }: IconProps) {
+  return (
+    <svg className={className} viewBox="0 0 20 20" fill="none" aria-hidden="true">
+      <rect x="5" y="5" width="10" height="10" rx="1.5" fill="currentColor" />
+    </svg>
+  )
+}
+
 export function ChevronIcon({ className }: IconProps) {
   return (
     <svg className={className} viewBox="0 0 20 20" fill="none" aria-hidden="true">

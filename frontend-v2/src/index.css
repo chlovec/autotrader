@@ -403,6 +403,11 @@ body {
   height: 16px;
 }
 
+.job-cancel-button:hover {
+  background: rgba(208, 59, 59, 0.12);
+  color: var(--status-critical);
+}
+
 /* Hover-triggered tooltip, shared by the job-info span and the play button - see
    JobCard's tooltip-anchor/tooltip-bubble usage. */
 .job-info {
@@ -485,6 +490,16 @@ body {
 .job-status-badge.failed {
   background: rgba(208, 59, 59, 0.12);
   color: var(--status-critical);
+}
+
+.job-status-badge.paused {
+  background: rgba(201, 130, 15, 0.15);
+  color: #c9820f;
+}
+
+.job-status-badge.cancelled {
+  background: rgba(107, 114, 128, 0.15);
+  color: #6b7280;
 }
 
 .job-last-run-grid {
@@ -643,6 +658,10 @@ body {
   margin: 0;
   color: var(--status-critical);
   font-size: 13px;
+}
+
+.job-control-error {
+  margin-top: 10px;
 }
 
 /* Searchable multi/single-select - see components/SearchableSelect.tsx. */
@@ -808,6 +827,17 @@ body {
 
 .job-button-ghost:hover:not(:disabled) {
   background: var(--page);
+}
+
+.job-button-danger {
+  border-color: var(--status-critical);
+  background: var(--status-critical);
+  color: #ffffff;
+}
+
+.job-button-danger:hover:not(:disabled) {
+  background: var(--status-critical);
+  opacity: 0.9;
 }
 
 .job-history {

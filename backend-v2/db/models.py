@@ -116,6 +116,41 @@ class TickerBarSyncState(Base):
     synced_through: Mapped[dt.date] = mapped_column(Date)
 
 
+class CurrentSnapshot(Base):
+    """One row per ticker's latest market snapshot from GET /v2/snapshot/locale/us/
+    markets/stocks/tickers/{ticker}, keyed by the ticker symbol. Upserted by
+    jobs/sync_snapshots.py - a re-fetched ticker overwrites the existing row (there's no
+    history kept), same PK-overwrite semantics as Ticker."""
+
+    __tablename__ = "current_snapshots"
+
+    ticker: Mapped[str] = mapped_column(ForeignKey("tickers.ticker"), primary_key=True)
+    todays_change: Mapped[float | None] = mapped_column(Float)
+    todays_change_perc: Mapped[float | None] = mapped_column(Float)
+    updated: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=False))
+    day_open: Mapped[float | None] = mapped_column(Float)
+    day_high: Mapped[float | None] = mapped_column(Float)
+    day_low: Mapped[float | None] = mapped_column(Float)
+    day_close: Mapped[float | None] = mapped_column(Float)
+    day_volume: Mapped[float | None] = mapped_column(Float)
+    day_vwap: Mapped[float | None] = mapped_column(Float)
+    min_open: Mapped[float | None] = mapped_column(Float)
+    min_high: Mapped[float | None] = mapped_column(Float)
+    min_low: Mapped[float | None] = mapped_column(Float)
+    min_close: Mapped[float | None] = mapped_column(Float)
+    min_volume: Mapped[float | None] = mapped_column(Float)
+    min_vwap: Mapped[float | None] = mapped_column(Float)
+    min_accumulated_volume: Mapped[float | None] = mapped_column(Float)
+    min_timestamp: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=False))
+    prev_day_open: Mapped[float | None] = mapped_column(Float)
+    prev_day_high: Mapped[float | None] = mapped_column(Float)
+    prev_day_low: Mapped[float | None] = mapped_column(Float)
+    prev_day_close: Mapped[float | None] = mapped_column(Float)
+    prev_day_volume: Mapped[float | None] = mapped_column(Float)
+    prev_day_vwap: Mapped[float | None] = mapped_column(Float)
+    fetched_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
+
+
 class JobConfig(Base):
     """Per-job settings, editable from the dashboard's Jobs page (see app/main.py).
     Seeded with defaults (app/main.py's _get_or_create_config) the first time a job's
@@ -126,10 +161,13 @@ class JobConfig(Base):
     (the dashboard's "Run now" button) works regardless of run_type, same as v1's
     ResearchSchedule.enabled bypass at the repo root. `schedule_interval_unit` ("minutes",
     "hours", or "days") and `schedule_interval_value` (the N) together describe a
-    recurring "every N <unit>" cadence - app/main.py builds an APScheduler
-    IntervalTrigger straight from these two (the unit string doubles as the trigger's
-    keyword argument name). update_job_config reschedules the live APScheduler job
-    when these change, so edits take effect immediately rather than needing a
+    recurring "every N <unit>" cadence, anchored to `start_time` - a UTC "HH:MM" time of
+    day (see registry.START_TIME_OPTIONS for the quarter-hour slots the dashboard offers)
+    that app/main.py's _interval_trigger feeds to APScheduler's IntervalTrigger as its
+    start_date, so the first fire lands on that time of day and every fire after that is
+    exactly N <unit> later - e.g. start_time="00:15" with schedule_interval_unit="hours"
+    fires at :15 past every hour. update_job_config reschedules the live APScheduler job
+    when any of these change, so edits take effect immediately rather than needing a
     backend-v2 restart; the schedule is kept (and shown) even for a "manual" job, so
     switching it to "auto" later doesn't need re-entering it.
 
@@ -146,6 +184,7 @@ class JobConfig(Base):
     run_type: Mapped[str] = mapped_column(String, default="auto")
     schedule_interval_unit: Mapped[str] = mapped_column(String, default="days")
     schedule_interval_value: Mapped[int] = mapped_column(Integer, default=1)
+    start_time: Mapped[str] = mapped_column(String, default="00:00")
     ticker_types: Mapped[str | None] = mapped_column(String)
     tickers: Mapped[str | None] = mapped_column(String)
     multiplier: Mapped[int | None] = mapped_column(Integer)

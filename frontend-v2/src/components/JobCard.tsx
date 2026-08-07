@@ -1,6 +1,15 @@
 import { useEffect, useState, type FormEvent } from 'react'
-import { api, type Job, type JobRun, type RunType, type ScheduleIntervalUnit, type TickerTypeOption } from '../api'
-import { ChevronIcon, InfoIcon, PlayIcon } from './icons'
+import {
+  api,
+  START_TIME_OPTIONS,
+  type Job,
+  type JobRun,
+  type RunType,
+  type ScheduleIntervalUnit,
+  type TickerTypeOption,
+} from '../api'
+import { CancelJobModal } from './CancelJobModal'
+import { ChevronIcon, InfoIcon, PauseIcon, PlayIcon, StopIcon } from './icons'
 import { RunJobModal } from './RunJobModal'
 import { SearchableSelect, type SelectOption } from './SearchableSelect'
 
@@ -50,6 +59,7 @@ function formatDuration(seconds: number | null): string {
 function runStatusLabel(status: JobRun['status']): string {
   if (status === 'in_progress') return 'In progress'
   if (status === 'failed') return 'Failed'
+  if (status === 'cancelled') return 'Cancelled'
   return 'Completed'
 }
 
@@ -62,9 +72,11 @@ function formatNextRunTime(value: string | null): string {
 }
 
 function StatusBadge({ job }: { job: Job }) {
+  if (job.running && job.paused) return <span className="job-status-badge paused">Paused</span>
   if (job.running) return <span className="job-status-badge running">Running</span>
   if (!job.last_run) return <span className="job-status-badge idle">Never run</span>
   if (job.last_run.status === 'failed') return <span className="job-status-badge failed">Failed</span>
+  if (job.last_run.status === 'cancelled') return <span className="job-status-badge cancelled">Cancelled</span>
   return <span className="job-status-badge succeeded">Succeeded</span>
 }
 
@@ -72,6 +84,7 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
   const [runType, setRunType] = useState<RunType>(job.run_type)
   const [scheduleIntervalUnit, setScheduleIntervalUnit] = useState<ScheduleIntervalUnit>(job.schedule_interval_unit)
   const [scheduleIntervalValue, setScheduleIntervalValue] = useState(job.schedule_interval_value)
+  const [startTime, setStartTime] = useState(job.start_time)
   const [tickerTypes, setTickerTypes] = useState<string[]>(() => parseCsv(job.ticker_types))
   const [tickers, setTickers] = useState<string[]>(() => parseCsv(job.tickers))
   const [multiplier, setMultiplier] = useState(job.multiplier ?? 1)
@@ -84,6 +97,9 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
   const [history, setHistory] = useState<JobRun[] | null>(null)
   const [historyLoading, setHistoryLoading] = useState(false)
   const [runModalOpen, setRunModalOpen] = useState(false)
+  const [cancelModalOpen, setCancelModalOpen] = useState(false)
+  const [controlBusy, setControlBusy] = useState(false)
+  const [controlError, setControlError] = useState<string | null>(null)
   const [collapsed, setCollapsed] = useState(true)
 
   // Discards the cached run history once a new run finishes, so re-expanding shows it
@@ -101,10 +117,11 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
         run_type: runType,
         schedule_interval_unit: scheduleIntervalUnit,
         schedule_interval_value: scheduleIntervalValue,
-        ...(job.has_ticker_type_filter ? { ticker_types: toCsv(tickerTypes) } : {}),
+        start_time: startTime,
+        ...(job.has_ticker_type_filter || job.has_ticker_selector ? { ticker_types: toCsv(tickerTypes) } : {}),
+        ...(job.has_ticker_selector ? { tickers: toCsv(tickers) } : {}),
         ...(job.has_bars_fields
           ? {
-              tickers: toCsv(tickers),
               multiplier,
               timespan,
               backfill_days: backfillDays,
@@ -116,6 +133,32 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
       setSaveError(err instanceof Error ? err.message : 'Failed to save')
     } finally {
       setSaving(false)
+    }
+  }
+
+  const handlePause = async () => {
+    setControlBusy(true)
+    setControlError(null)
+    try {
+      await api.pauseJob(job.name)
+      onRun()
+    } catch (err) {
+      setControlError(err instanceof Error ? err.message : 'Failed to pause job')
+    } finally {
+      setControlBusy(false)
+    }
+  }
+
+  const handleResume = async () => {
+    setControlBusy(true)
+    setControlError(null)
+    try {
+      await api.resumeJob(job.name)
+      onRun()
+    } catch (err) {
+      setControlError(err instanceof Error ? err.message : 'Failed to resume job')
+    } finally {
+      setControlBusy(false)
     }
   }
 
@@ -159,21 +202,56 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
         </div>
         <div className="job-card-header-actions">
           <StatusBadge job={job} />
-          <span className="tooltip-anchor">
-            <button
-              type="button"
-              className="icon-button job-play-button"
-              aria-label={`Run ${job.label} job now.`}
-              onClick={() => setRunModalOpen(true)}
-            >
-              <PlayIcon className="icon" />
-            </button>
-            <span className="tooltip-bubble tooltip-bubble-right" role="tooltip">
-              Run {job.label} job now.
+          {!job.running && (
+            <span className="tooltip-anchor">
+              <button
+                type="button"
+                className="icon-button job-play-button"
+                aria-label={`Run ${job.label} job now.`}
+                onClick={() => setRunModalOpen(true)}
+              >
+                <PlayIcon className="icon" />
+              </button>
+              <span className="tooltip-bubble tooltip-bubble-right" role="tooltip">
+                Run {job.label} job now.
+              </span>
             </span>
-          </span>
+          )}
+          {job.running && (
+            <>
+              <span className="tooltip-anchor">
+                <button
+                  type="button"
+                  className="icon-button job-play-button"
+                  aria-label={job.paused ? `Resume ${job.label} job.` : `Pause ${job.label} job.`}
+                  disabled={controlBusy}
+                  onClick={job.paused ? handleResume : handlePause}
+                >
+                  {job.paused ? <PlayIcon className="icon" /> : <PauseIcon className="icon" />}
+                </button>
+                <span className="tooltip-bubble tooltip-bubble-right" role="tooltip">
+                  {job.paused ? `Resume ${job.label} job.` : `Pause ${job.label} job.`}
+                </span>
+              </span>
+              <span className="tooltip-anchor">
+                <button
+                  type="button"
+                  className="icon-button job-play-button job-cancel-button"
+                  aria-label={`Cancel ${job.label} job.`}
+                  disabled={controlBusy}
+                  onClick={() => setCancelModalOpen(true)}
+                >
+                  <StopIcon className="icon" />
+                </button>
+                <span className="tooltip-bubble tooltip-bubble-right" role="tooltip">
+                  Cancel {job.label} job.
+                </span>
+              </span>
+            </>
+          )}
         </div>
       </div>
+      {controlError && <p className="job-field-error job-control-error">{controlError}</p>}
 
       {!collapsed && (
         <>
@@ -260,13 +338,27 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
                     <option value="days">Days</option>
                   </select>
                 </label>
+                <label className="job-field">
+                  Start time (UTC)
+                  <select value={startTime} disabled={runType === 'manual'} onChange={(e) => setStartTime(e.target.value)}>
+                    {START_TIME_OPTIONS.map((option) => (
+                      <option key={option} value={option}>
+                        {option}
+                      </option>
+                    ))}
+                  </select>
+                </label>
               </div>
+              <p className="job-field-hint">
+                The schedule's first run lands on this UTC time of day; every run after that follows "run every"
+                above from there - e.g. start 00:15 + every 1 hour fires at :15 past every hour.
+              </p>
             </div>
 
             <div className="job-form-section">
               <h3 className="job-form-section-title">Run parameters</h3>
 
-              {!job.has_bars_fields && job.has_ticker_type_filter && (
+              {!job.has_ticker_selector && job.has_ticker_type_filter && (
                 // A plain div, not <label> - a native <label> forwards clicks on any
                 // non-form-control descendant (like a dropdown <li>) to the first
                 // labelable element inside it (button, input, ...) in DOM order. Once
@@ -285,11 +377,11 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
                 </div>
               )}
 
-              {!job.has_bars_fields && !job.has_ticker_type_filter && (
+              {!job.has_ticker_selector && !job.has_ticker_type_filter && (
                 <p className="job-field-hint">This job has no run parameters to configure.</p>
               )}
 
-              {job.has_bars_fields && (
+              {job.has_ticker_selector && (
                 <>
                   <div className="job-field-row">
                     <div className="job-field">
@@ -325,32 +417,34 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
                   <p className="job-field-hint">
                     Leave both blank to sync every ticker. Specify one or the other, not both.
                   </p>
-
-                  <div className="job-field-row">
-                    <label className="job-field">
-                      Multiplier
-                      <input
-                        type="number"
-                        min={1}
-                        value={multiplier}
-                        onChange={(e) => setMultiplier(Number(e.target.value))}
-                      />
-                    </label>
-                    <label className="job-field">
-                      Timespan
-                      <input type="text" value={timespan} onChange={(e) => setTimespan(e.target.value)} />
-                    </label>
-                    <label className="job-field">
-                      Backfill days
-                      <input
-                        type="number"
-                        min={1}
-                        value={backfillDays}
-                        onChange={(e) => setBackfillDays(Number(e.target.value))}
-                      />
-                    </label>
-                  </div>
                 </>
+              )}
+
+              {job.has_bars_fields && (
+                <div className="job-field-row">
+                  <label className="job-field">
+                    Multiplier
+                    <input
+                      type="number"
+                      min={1}
+                      value={multiplier}
+                      onChange={(e) => setMultiplier(Number(e.target.value))}
+                    />
+                  </label>
+                  <label className="job-field">
+                    Timespan
+                    <input type="text" value={timespan} onChange={(e) => setTimespan(e.target.value)} />
+                  </label>
+                  <label className="job-field">
+                    Backfill days
+                    <input
+                      type="number"
+                      min={1}
+                      value={backfillDays}
+                      onChange={(e) => setBackfillDays(Number(e.target.value))}
+                    />
+                  </label>
+                </div>
               )}
             </div>
 
@@ -400,6 +494,9 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
       )}
 
       {runModalOpen && <RunJobModal job={job} onClose={() => setRunModalOpen(false)} onRun={onRun} />}
+      {cancelModalOpen && (
+        <CancelJobModal job={job} onClose={() => setCancelModalOpen(false)} onCancelled={onRun} />
+      )}
     </section>
   )
 }

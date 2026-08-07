@@ -1,3 +1,4 @@
+import asyncio
 import datetime as dt
 
 import httpx
@@ -6,6 +7,7 @@ import pytest
 from data.client import DataClient
 from db.models import SyncProgress, SyncState, Ticker
 from db.session import SessionLocal, init_db
+from jobs.control import JobCancelled, JobControl
 from jobs.sync_tickers import TICKERS_PATH, sync_tickers
 
 
@@ -185,3 +187,94 @@ async def test_stale_checkpoint_from_different_ticker_type_is_discarded():
     assert requests[0].url.path == TICKERS_PATH
     assert "cursor" not in requests[0].url.params
     assert requests[0].url.params["type"] == "CS"
+
+
+async def test_cancel_between_pages_leaves_a_checkpoint_the_next_run_resumes_from():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == TICKERS_PATH and "cursor" not in request.url.params:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [{"ticker": "AAA", "name": "Alpha"}],
+                    "next_url": "https://api.massive.com/v3/reference/tickers?cursor=page2",
+                },
+            )
+        return httpx.Response(200, json={"results": [{"ticker": "BBB", "name": "Beta"}]})
+
+    control = JobControl()
+    control.request_cancel()
+
+    async with _client_with_handler(handler) as client:
+        session = SessionLocal()
+        try:
+            with pytest.raises(JobCancelled):
+                await sync_tickers(client, session, control=control)
+
+            # Page 1 already committed before the cancel checkpoint was reached.
+            assert session.get(Ticker, "AAA") is not None
+            assert session.get(Ticker, "BBB") is None
+            assert session.get(SyncState, "tickers") is None
+            progress = session.get(SyncProgress, "tickers")
+            assert progress is not None
+            assert progress.next_url == "https://api.massive.com/v3/reference/tickers?cursor=page2"
+        finally:
+            session.close()
+
+    # A fresh run (no cancellation this time) resumes from page 2, same as crash recovery.
+    requests: list[httpx.Request] = []
+
+    def resumed_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"results": [{"ticker": "BBB", "name": "Beta"}]})
+
+    async with _client_with_handler(resumed_handler) as client:
+        session = SessionLocal()
+        try:
+            fetched = await sync_tickers(client, session)
+
+            assert fetched == 1
+            assert session.get(Ticker, "BBB") is not None
+            assert session.get(SyncProgress, "tickers") is None
+        finally:
+            session.close()
+
+    assert requests[0].url.params["cursor"] == "page2"
+
+
+async def test_pause_blocks_between_pages_until_resumed():
+    fetched_page_two = asyncio.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == TICKERS_PATH and "cursor" not in request.url.params:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [{"ticker": "AAA", "name": "Alpha"}],
+                    "next_url": "https://api.massive.com/v3/reference/tickers?cursor=page2",
+                },
+            )
+        fetched_page_two.set()
+        return httpx.Response(200, json={"results": [{"ticker": "BBB", "name": "Beta"}]})
+
+    control = JobControl()
+    control.request_pause()
+
+    async def resume_after_page_one_commits():
+        # Page 1 must already be committed (the job is parked at the checkpoint, not
+        # mid-fetch) before this resumes it.
+        while session_scoped.get(Ticker, "AAA") is None:
+            await asyncio.sleep(0.01)
+        assert not fetched_page_two.is_set()
+        control.request_resume()
+
+    async with _client_with_handler(handler) as client:
+        session_scoped = SessionLocal()
+        try:
+            resume_task = asyncio.create_task(resume_after_page_one_commits())
+            fetched = await sync_tickers(client, session_scoped, control=control)
+            await resume_task
+
+            assert fetched == 2
+            assert session_scoped.get(Ticker, "BBB") is not None
+        finally:
+            session_scoped.close()

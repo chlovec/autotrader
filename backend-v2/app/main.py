@@ -11,6 +11,7 @@ BackgroundTasks-triggered run releases its lock in a finally block, and a dashbo
 run-type ("manual" vs "auto") gates the *scheduled* trigger without blocking a manual one.
 """
 
+import asyncio
 import datetime as dt
 import logging
 import os
@@ -29,8 +30,19 @@ from sqlalchemy.orm import Session
 from data.client import DataClient
 from db.models import JobConfig, JobRun, Ticker, TickerType
 from db.session import SessionLocal, init_db
-from jobs.registry import BARS_JOB, DEFAULT_SCHEDULES, JOB_DEFINITIONS, TICKER_TYPES_JOB, TICKERS_JOB
+from jobs.control import JobCancelled, JobControl
+from jobs.registry import (
+    BARS_JOB,
+    DEFAULT_SCHEDULES,
+    DEFAULT_START_TIME,
+    JOB_DEFINITIONS,
+    SNAPSHOTS_JOB,
+    START_TIME_OPTIONS,
+    TICKER_TYPES_JOB,
+    TICKERS_JOB,
+)
 from jobs.sync_bars import DEFAULT_BACKFILL_DAYS, DEFAULT_MULTIPLIER, DEFAULT_TIMESPAN, sync_bars_nightly
+from jobs.sync_snapshots import sync_snapshots
 from jobs.sync_ticker_types import sync_ticker_types
 from jobs.sync_tickers import sync_tickers
 
@@ -53,6 +65,16 @@ if not _cors_origins:
 # other's locks.
 _job_locks: dict[str, threading.Lock] = {name: threading.Lock() for name in JOB_DEFINITIONS}
 
+# Populated with a fresh JobControl (see jobs/control.py) for the duration of each
+# job's run - present in this dict for exactly as long as _job_locks[job_name] is held.
+# pause_job/resume_job/cancel_job below look a job up here rather than through the lock
+# since the lock alone can't carry a pause/cancel signal into the running job's loop.
+# Plain dict, not a Lock-guarded one: entries are only ever set/popped by _run_job on
+# the event loop thread, and read (via .get()) from FastAPI's sync-endpoint threadpool -
+# CPython dict reads/writes are atomic per-operation under the GIL, same assumption
+# _job_locks itself already relies on.
+_job_controls: dict[str, JobControl] = {}
+
 # Set by lifespan on startup. update_job_config reschedules through this so an edited
 # schedule_interval_unit/schedule_interval_value takes effect immediately instead of
 # only on the next backend-v2 restart.
@@ -69,6 +91,7 @@ def _get_or_create_config(session: Session, job_name: str) -> JobConfig:
         run_type=JOB_DEFINITIONS[job_name].default_run_type,
         schedule_interval_unit=unit,
         schedule_interval_value=value,
+        start_time=DEFAULT_START_TIME,
         multiplier=DEFAULT_MULTIPLIER if job_name == BARS_JOB else None,
         timespan=DEFAULT_TIMESPAN if job_name == BARS_JOB else None,
         backfill_days=DEFAULT_BACKFILL_DAYS if job_name == BARS_JOB else None,
@@ -78,10 +101,19 @@ def _get_or_create_config(session: Session, job_name: str) -> JobConfig:
     return config
 
 
-def _interval_trigger(unit: str, value: int) -> IntervalTrigger:
+def _interval_trigger(unit: str, value: int, start_time: str) -> IntervalTrigger:
     """`unit` ("minutes"/"hours"/"days") doubles as the IntervalTrigger keyword arg name -
-    see db/models.py's JobConfig.schedule_interval_unit."""
-    return IntervalTrigger(**{unit: value}, timezone="UTC")
+    see db/models.py's JobConfig.schedule_interval_unit. `start_time` ("HH:MM" UTC, one
+    of registry.START_TIME_OPTIONS) anchors the trigger's phase via start_date: combined
+    with *today's* UTC date, since only the time-of-day component matters here -
+    APScheduler's IntervalTrigger walks forward from start_date in `value`-`unit` steps
+    to find the next fire time >= now regardless of whether start_date itself is in the
+    past, so "today" is just as good an anchor date as the literal day the schedule was
+    first configured."""
+    hour, minute = (int(part) for part in start_time.split(":"))
+    today = dt.datetime.now(dt.timezone.utc).date()
+    start_date = dt.datetime.combine(today, dt.time(hour, minute), tzinfo=dt.timezone.utc)
+    return IntervalTrigger(**{unit: value}, start_date=start_date, timezone="UTC")
 
 
 def _split_csv(value: str | None) -> list[str] | None:
@@ -93,36 +125,71 @@ def _split_csv(value: str | None) -> list[str] | None:
 
 async def _run_job(job_name: str, trigger: str) -> None:
     """Assumes the caller already holds _job_locks[job_name]; releases it when done.
-    `trigger` is "manual" or "auto" - see db/models.py's JobRun."""
+    `trigger` is "manual" or "auto" - see db/models.py's JobRun.
+
+    Publishes a fresh JobControl to _job_controls for the run's duration - pause_job/
+    resume_job/cancel_job below signal through it, and every sync_* call is handed it
+    so it can check in between units of work (see jobs/control.py). A pause blocks
+    inside that call, still holding this job's lock, so nothing here needs to change to
+    support it. A cancel raises JobCancelled, caught separately below so a
+    user-requested stop is recorded as "cancelled" rather than logged and stored as a
+    "failed" run."""
     session = SessionLocal()
     run = JobRun(job_name=job_name, trigger=trigger, status="in_progress", started_at=dt.datetime.utcnow())
     session.add(run)
     session.commit()
     run_id = run.id
+    control = JobControl()
+    _job_controls[job_name] = control
     try:
         config = _get_or_create_config(session, job_name)
-        async with DataClient() as client:
-            if job_name == TICKERS_JOB:
-                count = await sync_tickers(client, session, ticker_type=config.ticker_types or None)
-                summary = f"{count} ticker(s) synced"
-            elif job_name == TICKER_TYPES_JOB:
-                count = await sync_ticker_types(client, session)
-                summary = f"{count} ticker type(s) synced"
-            else:
-                results = await sync_bars_nightly(
-                    client,
-                    session,
-                    _split_csv(config.ticker_types),
-                    _split_csv(config.tickers),
-                    multiplier=config.multiplier or DEFAULT_MULTIPLIER,
-                    timespan=config.timespan or DEFAULT_TIMESPAN,
-                    backfill_days=config.backfill_days or DEFAULT_BACKFILL_DAYS,
-                )
-                summary = f"{len(results)} ticker(s) synced, {sum(results.values())} bar(s) fetched"
+        if job_name == SNAPSHOTS_JOB:
+            # No shared DataClient here - sync_snapshots fans out across a thread pool
+            # where each worker opens its own DataClient bound to its own event loop
+            # (see jobs/sync_snapshots.py). Runs via asyncio.to_thread so this blocking
+            # call doesn't stall the server's event loop.
+            count = await asyncio.to_thread(
+                sync_snapshots,
+                session,
+                _split_csv(config.ticker_types),
+                _split_csv(config.tickers),
+                control=control,
+            )
+            summary = f"{count} snapshot(s) synced"
+        else:
+            async with DataClient() as client:
+                if job_name == TICKERS_JOB:
+                    count = await sync_tickers(
+                        client, session, ticker_type=config.ticker_types or None, control=control
+                    )
+                    summary = f"{count} ticker(s) synced"
+                elif job_name == TICKER_TYPES_JOB:
+                    count = await sync_ticker_types(client, session, control=control)
+                    summary = f"{count} ticker type(s) synced"
+                else:
+                    results = await sync_bars_nightly(
+                        client,
+                        session,
+                        _split_csv(config.ticker_types),
+                        _split_csv(config.tickers),
+                        multiplier=config.multiplier or DEFAULT_MULTIPLIER,
+                        timespan=config.timespan or DEFAULT_TIMESPAN,
+                        backfill_days=config.backfill_days or DEFAULT_BACKFILL_DAYS,
+                        control=control,
+                    )
+                    summary = f"{len(results)} ticker(s) synced, {sum(results.values())} bar(s) fetched"
         run = session.get(JobRun, run_id)
         assert run is not None
         run.status = "completed"
         run.result_summary = summary
+        run.finished_at = dt.datetime.utcnow()
+        session.commit()
+    except JobCancelled:
+        logger.info("%s job cancelled", job_name)
+        session.rollback()
+        run = session.get(JobRun, run_id)
+        assert run is not None
+        run.status = "cancelled"
         run.finished_at = dt.datetime.utcnow()
         session.commit()
     except Exception as exc:
@@ -136,6 +203,7 @@ async def _run_job(job_name: str, trigger: str) -> None:
         session.commit()
     finally:
         session.close()
+        _job_controls.pop(job_name, None)
         _job_locks[job_name].release()
 
 
@@ -171,12 +239,16 @@ async def lifespan(app: FastAPI):
     for name, config in schedules.items():
         scheduler.add_job(
             _scheduled_job,
-            _interval_trigger(config.schedule_interval_unit, config.schedule_interval_value),
+            _interval_trigger(config.schedule_interval_unit, config.schedule_interval_value, config.start_time),
             args=[name],
             id=name,
         )
         logger.info(
-            "scheduled %s every %d %s", name, config.schedule_interval_value, config.schedule_interval_unit
+            "scheduled %s every %d %s starting %s UTC",
+            name,
+            config.schedule_interval_value,
+            config.schedule_interval_unit,
+            config.start_time,
         )
     scheduler.start()
     _scheduler = scheduler
@@ -235,9 +307,11 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         "description": definition.description,
         "has_bars_fields": definition.has_bars_fields,
         "has_ticker_type_filter": definition.has_ticker_type_filter,
+        "has_ticker_selector": definition.has_ticker_selector,
         "run_type": config.run_type,
         "schedule_interval_unit": config.schedule_interval_unit,
         "schedule_interval_value": config.schedule_interval_value,
+        "start_time": config.start_time,
         "next_run_time": _next_run_time(job_name, config.run_type),
         "ticker_types": config.ticker_types,
         "tickers": config.tickers,
@@ -245,6 +319,7 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         "timespan": config.timespan,
         "backfill_days": config.backfill_days,
         "running": _job_locks[job_name].locked(),
+        "paused": job_name in _job_controls and _job_controls[job_name].pause_requested,
         "last_run": _run_to_dict(last_run) if last_run is not None else None,
     }
 
@@ -258,6 +333,7 @@ class JobConfigIn(BaseModel):
     run_type: Literal["manual", "auto"]
     schedule_interval_unit: Literal["minutes", "hours", "days"]
     schedule_interval_value: int
+    start_time: str = DEFAULT_START_TIME
     ticker_types: str | None = None
     tickers: str | None = None
     multiplier: int | None = None
@@ -331,20 +407,27 @@ def update_job_config(job_name: str, body: JobConfigIn) -> dict:
         raise HTTPException(status_code=400, detail="schedule_interval_value must be at least 1")
     if body.ticker_types and body.tickers:
         raise HTTPException(status_code=400, detail="specify ticker_types or tickers, not both")
+    if body.start_time not in START_TIME_OPTIONS:
+        raise HTTPException(status_code=400, detail="start_time must be a quarter-hour UTC time, e.g. '00:15'")
 
     with SessionLocal() as session:
+        definition = JOB_DEFINITIONS[job_name]
         config = _get_or_create_config(session, job_name)
         config.run_type = body.run_type
         config.schedule_interval_unit = body.schedule_interval_unit
         config.schedule_interval_value = body.schedule_interval_value
-        # ticker_types applies to jobs with has_ticker_type_filter - a single type
-        # filter for the tickers job (see sync_tickers's ticker_type param), a
-        # multi-select filter for the bars job. Dropped for a job like ticker-types
-        # sync that takes no run parameters at all, even if the caller sent one.
-        # tickers/multiplier/timespan/backfill_days stay bars-only.
-        config.ticker_types = body.ticker_types if JOB_DEFINITIONS[job_name].has_ticker_type_filter else None
-        if JOB_DEFINITIONS[job_name].has_bars_fields:
-            config.tickers = body.tickers
+        config.start_time = body.start_time
+        # ticker_types applies to jobs with has_ticker_type_filter (a single type
+        # filter - see sync_tickers's ticker_type param) or has_ticker_selector (a
+        # multi-select filter - see sync_bars/sync_snapshots's _resolve_tickers).
+        # Dropped for a job like ticker-types sync that takes no run parameters at
+        # all, even if the caller sent one.
+        config.ticker_types = (
+            body.ticker_types if (definition.has_ticker_type_filter or definition.has_ticker_selector) else None
+        )
+        # tickers is only meaningful alongside the multi-select ticker_types above.
+        config.tickers = body.tickers if definition.has_ticker_selector else None
+        if definition.has_bars_fields:
             config.multiplier = body.multiplier
             config.timespan = body.timespan
             config.backfill_days = body.backfill_days
@@ -356,7 +439,8 @@ def update_job_config(job_name: str, body: JobConfigIn) -> dict:
         # hand the caller a stale pre-reschedule value until their next GET /jobs.
         if _scheduler is not None:
             _scheduler.reschedule_job(
-                job_name, trigger=_interval_trigger(body.schedule_interval_unit, body.schedule_interval_value)
+                job_name,
+                trigger=_interval_trigger(body.schedule_interval_unit, body.schedule_interval_value, body.start_time),
             )
         result = _job_to_dict(session, job_name)
 
@@ -370,6 +454,38 @@ def trigger_job(job_name: str, background_tasks: BackgroundTasks) -> dict:
         raise HTTPException(status_code=409, detail=f"{job_name} is already running")
     background_tasks.add_task(_run_job, job_name, "manual")
     return {"status": "started"}
+
+
+def _require_running(job_name: str) -> JobControl:
+    """Shared guard for pause/resume/cancel below - all three only make sense against
+    a run that's actually in flight (see _run_job, which is the only thing that ever
+    populates _job_controls)."""
+    _require_job(job_name)
+    control = _job_controls.get(job_name)
+    if control is None:
+        raise HTTPException(status_code=409, detail=f"{job_name} is not running")
+    return control
+
+
+@app.post("/jobs/{job_name}/pause")
+def pause_job(job_name: str) -> dict:
+    control = _require_running(job_name)
+    control.request_pause()
+    return {"status": "pause-requested"}
+
+
+@app.post("/jobs/{job_name}/resume")
+def resume_job(job_name: str) -> dict:
+    control = _require_running(job_name)
+    control.request_resume()
+    return {"status": "resumed"}
+
+
+@app.post("/jobs/{job_name}/cancel")
+def cancel_job(job_name: str) -> dict:
+    control = _require_running(job_name)
+    control.request_cancel()
+    return {"status": "cancel-requested"}
 
 
 @app.get("/jobs/{job_name}/runs")

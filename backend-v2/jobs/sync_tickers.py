@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from data.client import DataClient
 from db.models import SyncProgress, SyncState, Ticker
 from db.session import SessionLocal, init_db
+from jobs.control import JobControl
 
 logger = logging.getLogger("backend_v2.jobs.sync_tickers")
 
@@ -48,7 +49,9 @@ def _upsert_ticker(session: Session, result: dict[str, Any]) -> None:
     session.execute(stmt)
 
 
-async def sync_tickers(client: DataClient, session: Session, ticker_type: str | None = None) -> int:
+async def sync_tickers(
+    client: DataClient, session: Session, ticker_type: str | None = None, control: JobControl | None = None
+) -> int:
     """Fetches every page of /v3/reference/tickers, upserting each result into the
     tickers table, then records this run's start time as the new sync cutoff.
 
@@ -66,6 +69,11 @@ async def sync_tickers(client: DataClient, session: Session, ticker_type: str | 
     resumes from the failed page's cursor instead of re-paging everything already
     fetched. A checkpoint left behind by a different ticker_type filter is discarded
     rather than resumed, since massive.com bakes the filter into the cursor itself.
+
+    `control`, if given, is checked between pages (see jobs/control.py) - a pause
+    blocks right here until resumed, and a cancel raises JobCancelled once the
+    in-flight page's results are already committed, so the same sync_progress cursor
+    above is what the next run (paused-then-resumed or a fresh trigger) continues from.
     """
     state = session.get(SyncState, JOB_NAME)
     is_first_run = state is None
@@ -107,6 +115,8 @@ async def sync_tickers(client: DataClient, session: Session, ticker_type: str | 
         session.commit()
         if not next_url:
             break
+        if control is not None:
+            await control.checkpoint_async()
 
     if is_first_run:
         session.add(SyncState(job_name=JOB_NAME, last_synced_at=run_started_at))

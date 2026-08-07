@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 from data.client import DataClient
 from db.models import OhlcBar, Ticker, TickerBarSyncState
 from db.session import SessionLocal, init_db
+from jobs.control import JobControl
 
 logger = logging.getLogger("backend_v2.jobs.sync_bars")
 
@@ -138,13 +139,21 @@ async def sync_bars_manual(
     tickers: list[str] | None = None,
     multiplier: int = DEFAULT_MULTIPLIER,
     timespan: str = DEFAULT_TIMESPAN,
+    control: JobControl | None = None,
 ) -> dict[str, int]:
     """Fetches [start_date, end_date] for every selected ticker, regardless of what's
     already synced. One ticker's failure doesn't stop the rest - see
-    engine/multi_runner.py at the repo root for the same per-item isolation pattern."""
+    engine/multi_runner.py at the repo root for the same per-item isolation pattern.
+
+    `control`, if given, is checked before each ticker (see jobs/control.py) - a pause
+    blocks right here until resumed, and a cancel raises JobCancelled, which is
+    deliberately *not* caught by the try/except below (unlike a real per-ticker
+    failure) so it unwinds the whole run instead of being logged and skipped."""
     selected = _resolve_tickers(session, ticker_types, tickers)
     results: dict[str, int] = {}
     for ticker in selected:
+        if control is not None:
+            await control.checkpoint_async()
         try:
             results[ticker] = await fetch_and_store_bars(
                 client, session, ticker, start_date, end_date, multiplier=multiplier, timespan=timespan
@@ -162,15 +171,21 @@ async def sync_bars_nightly(
     multiplier: int = DEFAULT_MULTIPLIER,
     timespan: str = DEFAULT_TIMESPAN,
     backfill_days: int = DEFAULT_BACKFILL_DAYS,
+    control: JobControl | None = None,
 ) -> dict[str, int]:
     """Syncs every selected ticker through yesterday, skipping any already synced
     through yesterday. A ticker with no prior TickerBarSyncState row backfills the last
-    backfill_days days; one that has a cursor resumes the day after it."""
+    backfill_days days; one that has a cursor resumes the day after it.
+
+    `control`, if given, is checked before each ticker - see sync_bars_manual's
+    docstring above; the same reasoning applies here."""
     end_date = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)
     selected = _resolve_tickers(session, ticker_types, tickers)
 
     results: dict[str, int] = {}
     for ticker in selected:
+        if control is not None:
+            await control.checkpoint_async()
         state = session.get(TickerBarSyncState, (ticker, multiplier, timespan))
         if state is not None and state.synced_through >= end_date:
             continue  # already up to date
