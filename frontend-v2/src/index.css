@@ -920,6 +920,21 @@ body {
   max-width: 480px;
 }
 
+/* ReportGrid's own toolbar (see components/ReportGrid.tsx) - currently just the
+   "Columns" show/hide button, but its own row so a future per-report toolbar action
+   (export, row count, ...) has somewhere to sit alongside it. */
+.report-grid-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 8px;
+}
+
+.report-columns-button-active {
+  border-color: var(--series-1);
+  color: var(--series-1);
+  font-weight: 600;
+}
+
 /* Fixed height + overflow-y so the grid scrolls internally with only its rows
    moving - the sticky thead below needs a scrolling ancestor to stick within.
    var(--gridline) is the app's "clearly a different tone from the page" color (it's
@@ -1165,6 +1180,15 @@ body {
   border-bottom: 1px solid var(--border);
   border-top: 1px solid color-mix(in srgb, var(--text-primary) 8%, transparent);
   border-bottom: 1px solid color-mix(in srgb, var(--text-primary) 22%, transparent);
+}
+
+/* The "no rows match the current filters" placeholder row - a single wide cell rather
+   than a normal data row, so it reads as a message, not an empty record. */
+.report-empty-cell {
+  padding: 24px 12px;
+  text-align: center;
+  white-space: normal;
+  color: var(--text-muted);
 }
 
 /* Zebra striping + hover give the rows some visual separation instead of a flat,

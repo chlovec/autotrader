@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
+import { useAnchoredDropdown } from './useAnchoredDropdown'
 
 type ColumnHeaderMenuProps = {
   label: string
@@ -15,18 +15,17 @@ type ColumnHeaderMenuProps = {
   onSortAsc: () => void
   onSortDesc: () => void
   onToggleFrozen: () => void
+  onHide: () => void
   onFilterChange: (next: Set<string> | null) => void
 }
 
 const DROPDOWN_WIDTH = 240
 
-// One combined dropdown per column header: sort direction, a freeze/pin toggle, and
-// the Excel-style value checklist filter, all behind a single click on the header
-// itself. Rendered through a portal into document.body, positioned via
-// getBoundingClientRect from the trigger button rather than as an absolutely-
-// positioned descendant of the th - the table lives inside .report-table-wrap's
-// `overflow: auto`, which would otherwise clip the dropdown for any column near the
-// scrolled-out edge.
+// One combined dropdown per column header: sort direction, a freeze/pin toggle, hiding
+// the column, and the Excel-style value checklist filter, all behind a single click on
+// the header itself. Hiding is one-directional from here - once hidden, this column's
+// own header (and so this menu) disappears, so unhiding lives in ReportGrid's separate
+// always-visible "Columns" toolbar button instead.
 export function ColumnHeaderMenu({
   label,
   sortDir,
@@ -36,43 +35,10 @@ export function ColumnHeaderMenu({
   onSortAsc,
   onSortDesc,
   onToggleFrozen,
+  onHide,
   onFilterChange,
 }: ColumnHeaderMenuProps) {
-  const [open, setOpen] = useState(false)
-  const [position, setPosition] = useState<{ top: number; left: number } | null>(null)
-  const buttonRef = useRef<HTMLButtonElement>(null)
-  const dropdownRef = useRef<HTMLDivElement>(null)
-
-  const openMenu = () => {
-    const rect = buttonRef.current?.getBoundingClientRect()
-    if (rect) {
-      // Right-aligned under the button when there's room; clamped to the viewport
-      // otherwise so a column near either edge doesn't run off-screen.
-      const left = Math.max(4, Math.min(rect.right - DROPDOWN_WIDTH, window.innerWidth - DROPDOWN_WIDTH - 4))
-      setPosition({ top: rect.bottom + 4, left })
-    }
-    setOpen(true)
-  }
-
-  const closeMenu = () => setOpen(false)
-
-  useEffect(() => {
-    if (!open) return
-    const close = (event: Event) => {
-      const target = event.target as Node
-      if (buttonRef.current?.contains(target) || dropdownRef.current?.contains(target)) return
-      setOpen(false)
-    }
-    document.addEventListener('mousedown', close)
-    // The position above is captured once, on open - rather than tracking it live,
-    // scrolling the table (the capture-phase listener catches that even though native
-    // scroll events don't bubble) just closes the menu.
-    document.addEventListener('scroll', close, true)
-    return () => {
-      document.removeEventListener('mousedown', close)
-      document.removeEventListener('scroll', close, true)
-    }
-  }, [open])
+  const { open, position, anchorRef, dropdownRef, toggleMenu, closeMenu } = useAnchoredDropdown(DROPDOWN_WIDTH)
 
   const isActive = selected !== null
   const isChecked = (value: string) => selected === null || selected.has(value)
@@ -94,12 +60,12 @@ export function ColumnHeaderMenu({
   return (
     <>
       <button
-        ref={buttonRef}
+        ref={anchorRef}
         type="button"
         className="report-th-trigger"
         aria-haspopup="menu"
         aria-expanded={open}
-        onClick={() => (open ? closeMenu() : openMenu())}
+        onClick={toggleMenu}
       >
         <span className="report-th-label">{label}</span>
         <span className="report-th-indicators">
@@ -154,6 +120,19 @@ export function ColumnHeaderMenu({
               <input type="checkbox" checked={frozen} onChange={onToggleFrozen} />
               Freeze column
             </label>
+
+            <div className="report-menu-divider" />
+
+            <button
+              type="button"
+              className="report-menu-item"
+              onClick={() => {
+                onHide()
+                closeMenu()
+              }}
+            >
+              Hide column
+            </button>
 
             <div className="report-menu-divider" />
 
