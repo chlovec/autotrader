@@ -151,6 +151,196 @@ class CurrentSnapshot(Base):
     fetched_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
 
 
+class TopMarketMover(Base):
+    """One row per ticker currently on the top-gainers or top-losers list from GET
+    /v2/snapshot/locale/us/markets/stocks/{direction}, keyed by (ticker, direction) -
+    both directions share this table, distinguished by the direction column, rather
+    than each getting its own table. Unlike CurrentSnapshot's upsert-forever
+    semantics, jobs/sync_top_movers.py replaces a direction's rows outright on every
+    run: list membership is the point of a top-N list, so a ticker that drops off
+    shouldn't linger here the way a re-fetched single ticker's old snapshot data
+    would. rank is this ticker's position (1 = biggest mover) in the list as
+    massive.com returned it."""
+
+    __tablename__ = "top_market_movers"
+
+    ticker: Mapped[str] = mapped_column(String, primary_key=True)
+    direction: Mapped[str] = mapped_column(String, primary_key=True)
+    rank: Mapped[int] = mapped_column(Integer)
+    todays_change: Mapped[float | None] = mapped_column(Float)
+    todays_change_perc: Mapped[float | None] = mapped_column(Float)
+    updated: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=False))
+    day_open: Mapped[float | None] = mapped_column(Float)
+    day_high: Mapped[float | None] = mapped_column(Float)
+    day_low: Mapped[float | None] = mapped_column(Float)
+    day_close: Mapped[float | None] = mapped_column(Float)
+    day_volume: Mapped[float | None] = mapped_column(Float)
+    day_vwap: Mapped[float | None] = mapped_column(Float)
+    min_open: Mapped[float | None] = mapped_column(Float)
+    min_high: Mapped[float | None] = mapped_column(Float)
+    min_low: Mapped[float | None] = mapped_column(Float)
+    min_close: Mapped[float | None] = mapped_column(Float)
+    min_volume: Mapped[float | None] = mapped_column(Float)
+    min_vwap: Mapped[float | None] = mapped_column(Float)
+    min_accumulated_volume: Mapped[float | None] = mapped_column(Float)
+    min_timestamp: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=False))
+    prev_day_open: Mapped[float | None] = mapped_column(Float)
+    prev_day_high: Mapped[float | None] = mapped_column(Float)
+    prev_day_low: Mapped[float | None] = mapped_column(Float)
+    prev_day_close: Mapped[float | None] = mapped_column(Float)
+    prev_day_volume: Mapped[float | None] = mapped_column(Float)
+    prev_day_vwap: Mapped[float | None] = mapped_column(Float)
+    fetched_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
+
+
+class UnifiedSnapshot(Base):
+    """One row per ticker returned by GET /v3/snapshot ("Unified Snapshot"), keyed by
+    the ticker symbol alone - massive.com's ticker scheme is already unique across
+    asset classes (plain "AAPL" for stocks, "O:..." for options, "I:..." for indices,
+    "C:..." for fx, "X:..." for crypto), so unlike TopMarketMover there's no need for
+    a second primary-key column to keep classes from colliding. Upserted by
+    jobs/sync_unified_snapshot.py, one asset-class `type` at a time (see
+    jobs/registry.py's SNAPSHOT_TYPE_OPTIONS) - same upsert-forever semantics as
+    CurrentSnapshot, not TopMarketMover's replace-on-run.
+
+    Which columns are populated depends on `type`: session_*/last_quote_*/last_trade_*
+    apply broadly; greeks_*/details_*/underlying_asset_*/break_even_price/
+    implied_volatility/open_interest are options-only; value is indices-only.
+    last_trade_conditions is stored comma-joined - massive.com returns it as a list of
+    condition codes and there's no array column type to reach for on sqlite."""
+
+    __tablename__ = "unified_snapshots"
+
+    ticker: Mapped[str] = mapped_column(String, primary_key=True)
+    type: Mapped[str | None] = mapped_column(String)
+    name: Mapped[str | None] = mapped_column(String)
+    market_status: Mapped[str | None] = mapped_column(String)
+    error: Mapped[str | None] = mapped_column(String)
+    message: Mapped[str | None] = mapped_column(String)
+    value: Mapped[float | None] = mapped_column(Float)
+    fmv: Mapped[float | None] = mapped_column(Float)
+
+    # Options only.
+    break_even_price: Mapped[float | None] = mapped_column(Float)
+    implied_volatility: Mapped[float | None] = mapped_column(Float)
+    open_interest: Mapped[float | None] = mapped_column(Float)
+
+    # `session` block.
+    session_change: Mapped[float | None] = mapped_column(Float)
+    session_change_percent: Mapped[float | None] = mapped_column(Float)
+    session_early_trading_change: Mapped[float | None] = mapped_column(Float)
+    session_early_trading_change_percent: Mapped[float | None] = mapped_column(Float)
+    session_late_trading_change: Mapped[float | None] = mapped_column(Float)
+    session_late_trading_change_percent: Mapped[float | None] = mapped_column(Float)
+    session_close: Mapped[float | None] = mapped_column(Float)
+    session_high: Mapped[float | None] = mapped_column(Float)
+    session_low: Mapped[float | None] = mapped_column(Float)
+    session_open: Mapped[float | None] = mapped_column(Float)
+    session_previous_close: Mapped[float | None] = mapped_column(Float)
+    session_volume: Mapped[float | None] = mapped_column(Float)
+
+    # `last_quote` block.
+    last_quote_ask: Mapped[float | None] = mapped_column(Float)
+    last_quote_ask_size: Mapped[float | None] = mapped_column(Float)
+    last_quote_ask_exchange: Mapped[int | None] = mapped_column(Integer)
+    last_quote_bid: Mapped[float | None] = mapped_column(Float)
+    last_quote_bid_size: Mapped[float | None] = mapped_column(Float)
+    last_quote_bid_exchange: Mapped[int | None] = mapped_column(Integer)
+    last_quote_exchange: Mapped[int | None] = mapped_column(Integer)
+    last_quote_midpoint: Mapped[float | None] = mapped_column(Float)
+    last_quote_timeframe: Mapped[str | None] = mapped_column(String)
+    last_quote_last_updated: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=False))
+
+    # `last_trade` block.
+    last_trade_conditions: Mapped[str | None] = mapped_column(String)
+    last_trade_exchange: Mapped[int | None] = mapped_column(Integer)
+    last_trade_id: Mapped[str | None] = mapped_column(String)
+    last_trade_price: Mapped[float | None] = mapped_column(Float)
+    last_trade_size: Mapped[float | None] = mapped_column(Float)
+    last_trade_timeframe: Mapped[str | None] = mapped_column(String)
+    last_trade_sip_timestamp: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=False))
+
+    # `details` block (options only).
+    details_contract_type: Mapped[str | None] = mapped_column(String)
+    details_exercise_style: Mapped[str | None] = mapped_column(String)
+    details_expiration_date: Mapped[dt.date | None] = mapped_column(Date)
+    details_shares_per_contract: Mapped[float | None] = mapped_column(Float)
+    details_strike_price: Mapped[float | None] = mapped_column(Float)
+    details_ticker: Mapped[str | None] = mapped_column(String)
+
+    # `greeks` block (options only).
+    greeks_delta: Mapped[float | None] = mapped_column(Float)
+    greeks_gamma: Mapped[float | None] = mapped_column(Float)
+    greeks_theta: Mapped[float | None] = mapped_column(Float)
+    greeks_vega: Mapped[float | None] = mapped_column(Float)
+
+    # `underlying_asset` block (options only).
+    underlying_asset_change_to_break_even: Mapped[float | None] = mapped_column(Float)
+    underlying_asset_last_updated: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=False))
+    underlying_asset_price: Mapped[float | None] = mapped_column(Float)
+    underlying_asset_ticker: Mapped[str | None] = mapped_column(String)
+    underlying_asset_timeframe: Mapped[str | None] = mapped_column(String)
+    underlying_asset_value: Mapped[float | None] = mapped_column(Float)
+
+    fetched_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
+
+
+class TechnicalIndicator(Base):
+    """One row per (ticker, indicator, timestamp) value returned by GET
+    /v1/indicators/{sma,ema,macd,rsi}/{ticker} ("Technical Indicators"), `indicator`
+    holding which of the four ("sma"/"ema"/"macd"/"rsi") the row came from - one shared
+    table rather than four near-identical ones, same reasoning as UnifiedSnapshot
+    covering every asset-class `type` in one table. Upserted by
+    jobs/sync_indicators.py - a re-fetched (ticker, indicator, timestamp) overwrites the
+    existing row, but unlike CurrentSnapshot's single-row-per-ticker semantics, distinct
+    timestamps accumulate as separate rows since each is its own point in the
+    indicator's time series.
+
+    signal/histogram are MACD-only (massive.com's SMA/EMA/RSI responses carry just
+    `value`) and left None for the other three indicators."""
+
+    __tablename__ = "technical_indicators"
+
+    ticker: Mapped[str] = mapped_column(ForeignKey("tickers.ticker"), primary_key=True)
+    indicator: Mapped[str] = mapped_column(String, primary_key=True)
+    timestamp: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False), primary_key=True)
+    value: Mapped[float | None] = mapped_column(Float)
+    signal: Mapped[float | None] = mapped_column(Float)
+    histogram: Mapped[float | None] = mapped_column(Float)
+    fetched_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
+
+
+class News(Base):
+    """One row per article returned by GET /v2/reference/news, keyed by massive.com's
+    own article `id` rather than by ticker - a single article often covers more than
+    one ticker (see `tickers` below), so unlike CurrentSnapshot/UnifiedSnapshot there's
+    no natural ticker-scoped primary key here. Upserted by jobs/sync_news.py.
+
+    tickers/keywords are stored comma-joined - same reasoning as UnifiedSnapshot's
+    last_trade_conditions, massive.com returns them as lists and there's no array
+    column type on sqlite. insights (per-ticker sentiment) is a list of objects rather
+    than of plain strings, so it's stored as a JSON-encoded string instead."""
+
+    __tablename__ = "news"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    publisher_name: Mapped[str | None] = mapped_column(String)
+    publisher_homepage_url: Mapped[str | None] = mapped_column(String)
+    publisher_logo_url: Mapped[str | None] = mapped_column(String)
+    publisher_favicon_url: Mapped[str | None] = mapped_column(String)
+    title: Mapped[str | None] = mapped_column(String)
+    author: Mapped[str | None] = mapped_column(String)
+    published_utc: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=False))
+    article_url: Mapped[str | None] = mapped_column(String)
+    amp_url: Mapped[str | None] = mapped_column(String)
+    image_url: Mapped[str | None] = mapped_column(String)
+    description: Mapped[str | None] = mapped_column(String)
+    keywords: Mapped[str | None] = mapped_column(String)
+    tickers: Mapped[str | None] = mapped_column(String)
+    insights: Mapped[str | None] = mapped_column(String)
+    fetched_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
+
+
 class JobConfig(Base):
     """Per-job settings, editable from the dashboard's Jobs page (see app/main.py).
     Seeded with defaults (app/main.py's _get_or_create_config) the first time a job's
@@ -176,7 +366,13 @@ class JobConfig(Base):
     ticker_types applies to both jobs: a single upstream `type` filter for the tickers
     job (jobs/sync_tickers.py's ticker_type param - None syncs every type), or a
     multi-select filter for the bars job, mutually exclusive with tickers there - see
-    jobs/sync_bars.py's _resolve_tickers. Comma-separated either way."""
+    jobs/sync_bars.py's _resolve_tickers. Comma-separated either way.
+
+    snapshot_types is unrelated to ticker_types - it only applies to the unified-
+    snapshot job (registry.JobDefinition.has_snapshot_type_filter), filtering by
+    massive.com's own asset-class `type` query param (see registry.SNAPSHOT_TYPE_OPTIONS
+    and jobs/sync_unified_snapshot.py) rather than by anything in the tickers table.
+    Comma-separated; left None to sync every asset class."""
 
     __tablename__ = "job_configs"
 
@@ -190,6 +386,7 @@ class JobConfig(Base):
     multiplier: Mapped[int | None] = mapped_column(Integer)
     timespan: Mapped[str | None] = mapped_column(String)
     backfill_days: Mapped[int | None] = mapped_column(Integer)
+    snapshot_types: Mapped[str | None] = mapped_column(String)
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False), default=dt.datetime.utcnow)
 
 

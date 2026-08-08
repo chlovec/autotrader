@@ -34,6 +34,11 @@ export interface Job {
   has_bars_fields: boolean
   has_ticker_type_filter: boolean
   has_ticker_selector: boolean
+  has_snapshot_type_filter: boolean
+  // Always the full massive.com asset-class list (jobs/registry.py's
+  // SNAPSHOT_TYPE_OPTIONS), regardless of has_snapshot_type_filter - fetched from the
+  // backend rather than hardcoded here so the two never drift.
+  snapshot_type_options: string[]
   run_type: RunType
   schedule_interval_unit: ScheduleIntervalUnit
   schedule_interval_value: number
@@ -44,6 +49,7 @@ export interface Job {
   multiplier: number | null
   timespan: string | null
   backfill_days: number | null
+  snapshot_types: string | null
   running: boolean
   // Only meaningful while running - a job that isn't running can't be paused. Reflects
   // a pause *request*, not confirmation the run has actually parked at a checkpoint
@@ -62,6 +68,7 @@ export interface JobConfigInput {
   multiplier?: number | null
   timespan?: string | null
   backfill_days?: number | null
+  snapshot_types?: string | null
 }
 
 export interface TickerOption {
@@ -73,6 +80,41 @@ export interface TickerTypeOption {
   code: string
   asset_class: string
   description: string | null
+}
+
+// One row per (ticker, direction) from backend-v2's top_market_movers table, joined
+// out to name/type - backs the Analytics > Top Movers report grid.
+export interface TopMarketMoverRow {
+  ticker: string
+  name: string | null
+  type: string | null
+  asset_class: string | null
+  direction: string
+  rank: number
+  todays_change: number | null
+  todays_change_perc: number | null
+  updated: string | null
+  day_open: number | null
+  day_high: number | null
+  day_low: number | null
+  day_close: number | null
+  day_volume: number | null
+  day_vwap: number | null
+  min_open: number | null
+  min_high: number | null
+  min_low: number | null
+  min_close: number | null
+  min_volume: number | null
+  min_vwap: number | null
+  min_accumulated_volume: number | null
+  min_timestamp: string | null
+  prev_day_open: number | null
+  prev_day_high: number | null
+  prev_day_low: number | null
+  prev_day_close: number | null
+  prev_day_volume: number | null
+  prev_day_vwap: number | null
+  fetched_at: string
 }
 
 async function getJSON<T>(path: string): Promise<T> {
@@ -123,4 +165,6 @@ export const api = {
     getJSON<TickerOption[]>(`/tickers/search?q=${encodeURIComponent(q)}&limit=${limit}`),
   searchTickerTypes: (q: string, limit = 20) =>
     getJSON<TickerTypeOption[]>(`/ticker-types/search?q=${encodeURIComponent(q)}&limit=${limit}`),
+  topMoversReport: (tickerTypes: string[] = []) =>
+    getJSON<TopMarketMoverRow[]>(`/reports/top-movers?ticker_types=${encodeURIComponent(tickerTypes.join(','))}`),
 }

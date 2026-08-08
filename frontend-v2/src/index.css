@@ -227,6 +227,42 @@ body {
   font-weight: 600;
 }
 
+.side-menu-item.has-children {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.side-menu-chevron {
+  font-size: 10px;
+  color: var(--text-muted);
+  transition: transform 0.15s ease;
+}
+
+.side-menu-chevron.expanded {
+  transform: rotate(90deg);
+}
+
+.side-menu-sublist {
+  list-style: none;
+  margin: 2px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow: hidden;
+}
+
+.side-menu-sublist.collapsed {
+  display: none;
+}
+
+.side-menu-subitem {
+  padding-left: 28px;
+  font-size: 13px;
+}
+
 .app-content {
   flex: 1;
   min-width: 0;
@@ -867,6 +903,314 @@ body {
   color: var(--text-secondary);
   border-bottom: 1px solid var(--border);
   white-space: normal;
+}
+
+/* Top Movers report (Analytics side menu) */
+
+.report-controls {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 20px;
+}
+
+.report-ticker-type-field {
+  min-width: 280px;
+  max-width: 480px;
+}
+
+/* Fixed height + overflow-y so the grid scrolls internally with only its rows
+   moving - the sticky thead below needs a scrolling ancestor to stick within.
+   var(--gridline) is the app's "clearly a different tone from the page" color (it's
+   what hover states elsewhere use), so it anchors a guaranteed-visible step away from
+   the page in both themes; color-mix layers a slice of var(--series-1) - the header's
+   own color (see .report-table th) - on top of that, so the body reads as the same
+   theme as the header rather than an unrelated neutral grey underneath a blue bar. */
+.report-table-wrap {
+  max-height: 60vh;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border: 1px solid color-mix(in srgb, var(--series-1) 30%, var(--border));
+  border-radius: 8px;
+  background: var(--gridline);
+  background: color-mix(in srgb, var(--series-1) 10%, var(--gridline));
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+}
+
+/* border-spacing (not border-collapse) so the sticky th's own border stays attached to
+   it while scrolling, rather than rendering on the table edge the way a collapsed
+   border would. */
+.report-table {
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+/* Same theme as the "Run report" button (.job-button-primary) - var(--series-1) with
+   white text - rather than its own one-off color, so the header reads as this page's
+   accent color rather than an unrelated brand color. */
+.report-table th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding: 0;
+  background: var(--series-1);
+  color: #ffffff;
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  border-bottom: 2px solid var(--series-1);
+  border-bottom: 2px solid color-mix(in srgb, var(--series-1) 70%, black);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+}
+
+/* The whole header cell is one click target - see components/ColumnHeaderMenu.tsx -
+   opening a single dropdown with sort/freeze/filter rather than separate controls.
+   Inherits the th's color/weight/etc. since it's a bare reset button, not a styled
+   one. */
+.report-th-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-transform: inherit;
+  letter-spacing: inherit;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.report-th-trigger:hover {
+  background: rgba(0, 0, 0, 0.08);
+}
+
+.report-th-trigger:focus-visible {
+  outline: 2px solid #ffffff;
+  outline-offset: -2px;
+}
+
+.report-th-indicators {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.report-sort-indicator {
+  font-size: 10px;
+}
+
+/* Small status dots next to a column's label - frozen (pinned, square) and filtered
+   (active, round) - so a glance at the header row shows which columns have something
+   applied without opening every menu. currentColor rather than a fixed color so it
+   always matches the header's own text color regardless of the header's theme. */
+.report-th-dot {
+  width: 6px;
+  height: 6px;
+  background: currentColor;
+}
+
+.report-th-dot-frozen {
+  border-radius: 2px;
+  opacity: 0.6;
+}
+
+.report-th-dot-filter {
+  border-radius: 50%;
+}
+
+/* position/top/left/width are set inline (see ColumnHeaderMenu.tsx) - it's portaled
+   to document.body and positioned from the trigger button's getBoundingClientRect
+   rather than being an absolutely-positioned descendant of the th, which would get
+   clipped by .report-table-wrap's overflow: auto for columns near either edge. */
+.report-menu-dropdown {
+  z-index: 20;
+  max-height: 360px;
+  display: flex;
+  flex-direction: column;
+  padding: 4px 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-1);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.report-menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  background: none;
+  color: var(--text-primary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.report-menu-item:hover {
+  background: var(--page);
+}
+
+.report-menu-divider {
+  height: 1px;
+  margin: 4px 0;
+  background: var(--border);
+}
+
+.report-menu-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+}
+
+.report-menu-checkbox input {
+  width: 14px;
+  height: 14px;
+}
+
+.report-menu-section-title {
+  padding: 6px 12px 2px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.report-filter-actions {
+  display: flex;
+  gap: 8px;
+  padding: 6px 12px 8px;
+}
+
+.report-filter-action {
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--page);
+  color: var(--text-primary);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.report-filter-action:hover {
+  background: var(--gridline);
+}
+
+.report-filter-list {
+  flex: 1;
+  min-height: 0;
+  list-style: none;
+  margin: 0;
+  padding: 4px 8px;
+  overflow-y: auto;
+}
+
+.report-filter-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.report-filter-option:hover {
+  background: var(--page);
+}
+
+.report-filter-option input {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+.report-filter-option span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.report-filter-empty {
+  padding: 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.report-table td {
+  padding: 9px 12px;
+  white-space: nowrap;
+  /* Overrides .job-history-table td's plain 1px border-bottom. A flat rgba(0,0,0,..)
+     shadow/border is invisible against --page/--surface-1, which are both near-black
+     in dark mode - color-mix against --text-primary flips light-vs-dark automatically
+     (a black tint in light mode, a white tint in dark mode) so the edge actually shows
+     up in both themes instead of only in light mode. The plain var(--border) line
+     ships first as a fallback for browsers without color-mix support (Safari <16.2,
+     Firefox <113) - an unsupported second declaration is dropped, leaving the first. */
+  border-top: 1px solid transparent;
+  border-bottom: 1px solid var(--border);
+  border-top: 1px solid color-mix(in srgb, var(--text-primary) 8%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--text-primary) 22%, transparent);
+}
+
+/* Zebra striping + hover give the rows some visual separation instead of a flat,
+   uniform block - var(--gridline)/var(--surface-1)/darkened-gridline anchor three
+   guaranteed-distinct lightness steps (odd/even/hover), same as before; color-mix
+   layers the header's own var(--series-1) on top of each one so the whole body reads
+   as one themed surface with the header, not a neutral grey grid under a blue bar. */
+.report-table tbody tr:nth-child(even) {
+  background: var(--surface-1);
+  background: color-mix(in srgb, var(--series-1) 10%, var(--surface-1));
+}
+
+.report-table tbody tr:hover {
+  background: var(--page);
+  background: color-mix(in srgb, var(--series-1) 18%, color-mix(in srgb, var(--text-primary) 20%, var(--gridline)));
+}
+
+/* Frozen (pinned) columns - see TopMoversPage's frozenOffsets/toggleFrozen. `left`
+   ships inline since it's a measured, data-dependent pixel offset; these classes only
+   carry the static positioning/visual treatment. z-index keeps a frozen header above
+   plain headers, and both above/below the sticky header appropriately:
+   frozen td (1) < base th (2) < frozen th (3) - otherwise a frozen body cell would
+   paint over the sticky header once its row scrolled up underneath it. */
+.report-table th.report-cell-frozen-header {
+  z-index: 3;
+  box-shadow:
+    0 2px 6px rgba(0, 0, 0, 0.35),
+    2px 0 4px rgba(0, 0, 0, 0.25);
+}
+
+.report-table td.report-cell-frozen-body {
+  position: sticky;
+  z-index: 1;
+  background: var(--gridline);
+  background: color-mix(in srgb, var(--series-1) 10%, var(--gridline));
+  box-shadow: 2px 0 4px rgba(0, 0, 0, 0.25);
+}
+
+.report-table tbody tr:nth-child(even) td.report-cell-frozen-body {
+  background: var(--surface-1);
+  background: color-mix(in srgb, var(--series-1) 10%, var(--surface-1));
+}
+
+.report-table tbody tr:hover td.report-cell-frozen-body {
+  background: var(--page);
+  background: color-mix(in srgb, var(--series-1) 18%, color-mix(in srgb, var(--text-primary) 20%, var(--gridline)));
 }
 
 @media (max-width: 480px) {

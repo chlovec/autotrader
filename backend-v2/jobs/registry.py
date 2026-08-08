@@ -11,6 +11,28 @@ TICKERS_JOB = "sync-tickers"
 BARS_JOB = "sync-bars-nightly"
 TICKER_TYPES_JOB = "sync-ticker-types"
 SNAPSHOTS_JOB = "sync-snapshots"
+MOVERS_JOB = "sync-top-movers"
+UNIFIED_SNAPSHOT_JOB = "sync-unified-snapshot"
+NEWS_JOB = "sync-news"
+SMA_JOB = "sync-sma"
+EMA_JOB = "sync-ema"
+MACD_JOB = "sync-macd"
+RSI_JOB = "sync-rsi"
+
+# job name -> massive.com indicator path segment (GET /v1/indicators/{indicator}/
+# {ticker}) - jobs/sync_indicators.py's sync_indicator takes the latter, app/main.py's
+# _run_job looks up which of the four a given job name is via this dict.
+INDICATOR_NAMES: dict[str, str] = {
+    SMA_JOB: "sma",
+    EMA_JOB: "ema",
+    MACD_JOB: "macd",
+    RSI_JOB: "rsi",
+}
+
+# massive.com's own asset-class filter for GET /v3/snapshot (jobs/sync_unified_snapshot.py) -
+# unrelated to the tickers table's `type` column (CS, ETF, ...) that ticker_types/
+# has_ticker_type_filter/has_ticker_selector filter against elsewhere in this file.
+SNAPSHOT_TYPE_OPTIONS: list[str] = ["stocks", "options", "indices", "fx", "crypto"]
 
 # Quarter-hour UTC time-of-day options for JobConfig.start_time - the dashboard's "Start
 # time" select for an auto job (app/main.py's _interval_trigger anchors the recurring
@@ -26,6 +48,13 @@ DEFAULT_SCHEDULES: dict[str, tuple[str, int]] = {
     BARS_JOB: ("days", 1),
     TICKER_TYPES_JOB: ("days", 1),
     SNAPSHOTS_JOB: ("days", 1),
+    MOVERS_JOB: ("days", 1),
+    UNIFIED_SNAPSHOT_JOB: ("days", 1),
+    NEWS_JOB: ("days", 1),
+    SMA_JOB: ("days", 1),
+    EMA_JOB: ("days", 1),
+    MACD_JOB: ("days", 1),
+    RSI_JOB: ("days", 1),
 }
 
 
@@ -50,6 +79,12 @@ class JobDefinition:
     # can offer this picker without also carrying bars-only multiplier/timespan/
     # backfill_days fields.
     has_ticker_selector: bool = False
+    # Whether this job offers the asset-class "Snapshot types" multi-select (see
+    # SNAPSHOT_TYPE_OPTIONS above and jobs/sync_unified_snapshot.py) - only the
+    # unified-snapshot job takes this; every other job leaves it False. Unlike
+    # has_ticker_type_filter/has_ticker_selector this doesn't touch the tickers table
+    # at all, so it's an independent flag rather than layered onto those.
+    has_snapshot_type_filter: bool = False
     # Seeded into JobConfig.run_type the first time this job's config row is created
     # (see app/main.py's _get_or_create_config). "auto" unless overridden below.
     default_run_type: str = "auto"
@@ -93,4 +128,64 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
         # manual by default, same reasoning as ticker-types.
         default_run_type="manual",
     ),
+    MOVERS_JOB: JobDefinition(
+        name=MOVERS_JOB,
+        label="Sync top market movers",
+        description=(
+            "Syncs GET /v2/snapshot/locale/us/markets/stocks/{gainers,losers} into the "
+            "top_market_movers table - both directions every run, replacing each "
+            "direction's rows outright since a top-N list's membership is the point."
+        ),
+        has_bars_fields=False,
+        # No filter to offer - every run always fetches both directions in full.
+        has_ticker_type_filter=False,
+        # Current market data with no natural daily cadence of its own - manual by
+        # default, same reasoning as ticker-types/snapshots.
+        default_run_type="manual",
+    ),
+    UNIFIED_SNAPSHOT_JOB: JobDefinition(
+        name=UNIFIED_SNAPSHOT_JOB,
+        label="Sync unified snapshot",
+        description=(
+            "Syncs GET /v3/snapshot into the unified_snapshots table for the selected "
+            "asset-class types (stocks/options/indices/fx/crypto) - every type if none "
+            "is selected."
+        ),
+        has_bars_fields=False,
+        has_ticker_type_filter=False,
+        has_snapshot_type_filter=True,
+        # Current market data with no natural daily cadence of its own - manual by
+        # default, same reasoning as ticker-types/snapshots.
+        default_run_type="manual",
+    ),
+    NEWS_JOB: JobDefinition(
+        name=NEWS_JOB,
+        label="Sync news",
+        description="Syncs GET /v2/reference/news into the news table.",
+        has_bars_fields=False,
+        # No filter to offer - every run fetches every article published since the
+        # last sync, not scoped to a ticker or ticker type.
+        has_ticker_type_filter=False,
+        # Incremental like tickers/bars (jobs/sync_news.py tracks a SyncState cutoff),
+        # so it keeps the same "auto" daily default those two use.
+    ),
+    **{
+        job_name: JobDefinition(
+            name=job_name,
+            label=f"Sync {indicator.upper()}",
+            description=(
+                f"Syncs GET /v1/indicators/{indicator}/{{ticker}} into the "
+                "technical_indicators table for the selected tickers or ticker types."
+            ),
+            has_bars_fields=False,
+            # Ticker-driven, same picker as the snapshots job (has_ticker_type_filter
+            # stays at its True default, superseded by has_ticker_selector below - see
+            # JobDefinition.has_ticker_selector's docstring).
+            has_ticker_selector=True,
+            # Current market data with no natural daily cadence of its own - manual by
+            # default, same reasoning as ticker-types/snapshots/movers.
+            default_run_type="manual",
+        )
+        for job_name, indicator in INDICATOR_NAMES.items()
+    },
 }

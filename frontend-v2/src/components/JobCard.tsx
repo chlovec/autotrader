@@ -90,6 +90,7 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
   const [multiplier, setMultiplier] = useState(job.multiplier ?? 1)
   const [timespan, setTimespan] = useState(job.timespan ?? 'day')
   const [backfillDays, setBackfillDays] = useState(job.backfill_days ?? 730)
+  const [snapshotTypes, setSnapshotTypes] = useState<string[]>(() => parseCsv(job.snapshot_types))
 
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
@@ -127,6 +128,7 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
               backfill_days: backfillDays,
             }
           : {}),
+        ...(job.has_snapshot_type_filter ? { snapshot_types: toCsv(snapshotTypes) } : {}),
       })
       onSaved(updated)
     } catch (err) {
@@ -377,8 +379,33 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
                 </div>
               )}
 
-              {!job.has_ticker_selector && !job.has_ticker_type_filter && (
+              {!job.has_ticker_selector && !job.has_ticker_type_filter && !job.has_snapshot_type_filter && (
                 <p className="job-field-hint">This job has no run parameters to configure.</p>
+              )}
+
+              {job.has_snapshot_type_filter && (
+                <>
+                  <div className="job-field">
+                    <span className="job-field-label">Snapshot types</span>
+                    <div className="job-run-type-options">
+                      {job.snapshot_type_options.map((type) => (
+                        <label key={type} className="job-run-type-option">
+                          <input
+                            type="checkbox"
+                            checked={snapshotTypes.includes(type)}
+                            onChange={(e) =>
+                              setSnapshotTypes((prev) =>
+                                e.target.checked ? [...prev, type] : prev.filter((t) => t !== type),
+                              )
+                            }
+                          />
+                          {type}
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                  <p className="job-field-hint">Leave every type unchecked to sync all of them.</p>
+                </>
               )}
 
               {job.has_ticker_selector && (
