@@ -117,7 +117,14 @@ export function TopMoversPage() {
       {error && <p className="jobs-error">{error}</p>}
 
       {!loading && rows && (
-        <ReportGrid columns={COLUMNS} rows={rows} rowKey={rowKey} formatCell={formatCell} emptyMessage="No movers found." />
+        <ReportGrid
+          columns={COLUMNS}
+          rows={rows}
+          rowKey={rowKey}
+          formatCell={formatCell}
+          emptyMessage="No movers found."
+          storageKey="top-movers"
+        />
       )}
 
       {!rows && !loading && !error && (

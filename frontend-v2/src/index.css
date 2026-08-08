@@ -926,6 +926,7 @@ body {
 .report-grid-toolbar {
   display: flex;
   justify-content: flex-end;
+  gap: 8px;
   margin-bottom: 8px;
 }
 
@@ -1017,6 +1018,16 @@ body {
   flex-shrink: 0;
 }
 
+/* Truncates instead of overflowing into the next column once a header's own column
+   has been dragged narrower than its label. min-width: 0 overrides the flex item
+   default of auto, which otherwise refuses to shrink below the label's content size
+   and defeats the ellipsis. */
+.report-th-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .report-sort-indicator {
   font-size: 10px;
 }
@@ -1038,6 +1049,34 @@ body {
 
 .report-th-dot-filter {
   border-radius: 50%;
+}
+
+/* Drag-to-resize strip on a column's trailing edge (see ReportGrid.tsx's startResize) -
+   .report-table th is already position: sticky, which (like relative/absolute) still
+   establishes a containing block for this, so no extra positioning is needed on the
+   th itself. */
+.report-th-resize-handle {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 8px;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.report-th-resize-handle:hover,
+.report-th-resize-handle:active {
+  background: rgba(0, 0, 0, 0.25);
+}
+
+/* Applied once a column has been dragged to an explicit width (see ReportGrid.tsx's
+   columnWidths) - overrides .report-table td's default nowrap so long values wrap
+   inside the narrower column instead of overflowing it. Compound selector so it beats
+   .report-table td's own specificity regardless of source order. */
+.report-table td.report-cell-wrap {
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 /* position/top/left/width are set inline (see ColumnHeaderMenu.tsx) - it's portaled
