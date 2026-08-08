@@ -4,6 +4,7 @@ import { SideMenu } from './components/SideMenu'
 import { JobsPage } from './components/JobsPage'
 import { TopMoversPage } from './components/TopMoversPage'
 import { TradingSymbolsPage } from './components/TradingSymbolsPage'
+import { StaleTickersPage } from './components/StaleTickersPage'
 
 // Below this width the side menu renders as an overlay drawer (see index.css) and
 // should start closed; at/above it, it renders inline and should start open.
@@ -18,6 +19,7 @@ export type View =
   | 'Analytics'
   | 'Top Movers'
   | 'Trading Symbols'
+  | 'Stale Tickers'
   | 'Settings'
 
 function App() {
@@ -46,6 +48,8 @@ function App() {
             <TopMoversPage />
           ) : activeView === 'Trading Symbols' ? (
             <TradingSymbolsPage />
+          ) : activeView === 'Stale Tickers' ? (
+            <StaleTickersPage />
           ) : (
             <p className="placeholder-note">{activeView} goes here.</p>
           )}

@@ -9,7 +9,8 @@ import {
   type TickerTypeOption,
 } from '../api'
 import { CancelJobModal } from './CancelJobModal'
-import { ChevronIcon, EyeIcon, InfoIcon, PauseIcon, PlayIcon, StopIcon } from './icons'
+import { ChevronIcon, EyeIcon, InfoIcon, PauseIcon, PlayIcon, StopIcon, TrashIcon } from './icons'
+import { ResetJobModal } from './ResetJobModal'
 import { RunJobModal } from './RunJobModal'
 import { SearchableSelect, type SelectOption } from './SearchableSelect'
 
@@ -93,6 +94,8 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
   const [snapshotTypes, setSnapshotTypes] = useState<string[]>(() => parseCsv(job.snapshot_types))
   const [averageVolumeStartDate, setAverageVolumeStartDate] = useState(job.average_volume_start_date ?? '')
   const [averageVolumeDaysInterval, setAverageVolumeDaysInterval] = useState(job.average_volume_days_interval ?? 50)
+  const [backtestStartDate, setBacktestStartDate] = useState(job.backtest_start_date ?? '')
+  const [backtestEndDate, setBacktestEndDate] = useState(job.backtest_end_date ?? '')
 
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
@@ -101,6 +104,7 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
   const [historyLoading, setHistoryLoading] = useState(false)
   const [runModalOpen, setRunModalOpen] = useState(false)
   const [cancelModalOpen, setCancelModalOpen] = useState(false)
+  const [resetModalOpen, setResetModalOpen] = useState(false)
   const [controlBusy, setControlBusy] = useState(false)
   const [controlError, setControlError] = useState<string | null>(null)
   const [collapsed, setCollapsed] = useState(true)
@@ -135,6 +139,12 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
           ? {
               average_volume_start_date: averageVolumeStartDate || null,
               average_volume_days_interval: averageVolumeDaysInterval,
+            }
+          : {}),
+        ...(job.has_backtest_fields
+          ? {
+              backtest_start_date: backtestStartDate || null,
+              backtest_end_date: backtestEndDate || null,
             }
           : {}),
       })
@@ -224,6 +234,20 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
         </div>
         <div className="job-card-header-actions">
           <StatusBadge job={job} />
+          <span className="tooltip-anchor">
+            <button
+              type="button"
+              className="icon-button job-play-button job-cancel-button"
+              aria-label={`Reset ${job.label} job.`}
+              disabled={controlBusy || job.running}
+              onClick={() => setResetModalOpen(true)}
+            >
+              <TrashIcon className="icon" />
+            </button>
+            <span className="tooltip-bubble tooltip-bubble-right" role="tooltip">
+              Reset {job.label} job - empties its data.
+            </span>
+          </span>
           <span className="tooltip-anchor">
             <button
               type="button"
@@ -416,7 +440,8 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
               {!job.has_ticker_selector &&
                 !job.has_ticker_type_filter &&
                 !job.has_snapshot_type_filter &&
-                !job.has_average_volume_fields && (
+                !job.has_average_volume_fields &&
+                !job.has_backtest_fields && (
                   <p className="job-field-hint">This job has no run parameters to configure.</p>
                 )}
 
@@ -537,6 +562,29 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
                   </p>
                 </>
               )}
+
+              {job.has_backtest_fields && (
+                <>
+                  <div className="job-field-row">
+                    <label className="job-field">
+                      Start date (UTC)
+                      <input
+                        type="date"
+                        value={backtestStartDate}
+                        onChange={(e) => setBacktestStartDate(e.target.value)}
+                      />
+                    </label>
+                    <label className="job-field">
+                      End date (UTC)
+                      <input type="date" value={backtestEndDate} onChange={(e) => setBacktestEndDate(e.target.value)} />
+                    </label>
+                  </div>
+                  <p className="job-field-hint">
+                    Leave end date blank to default to yesterday (UTC) at run time, and start date blank to default
+                    to 90 days before that.
+                  </p>
+                </>
+              )}
             </div>
 
             {saveError && <p className="job-field-error">{saveError}</p>}
@@ -587,6 +635,9 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
       {runModalOpen && <RunJobModal job={job} onClose={() => setRunModalOpen(false)} onRun={onRun} />}
       {cancelModalOpen && (
         <CancelJobModal job={job} onClose={() => setCancelModalOpen(false)} onCancelled={onRun} />
+      )}
+      {resetModalOpen && (
+        <ResetJobModal job={job} onClose={() => setResetModalOpen(false)} onReset={onSaved} />
       )}
     </section>
   )

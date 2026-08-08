@@ -36,6 +36,7 @@ export interface Job {
   has_ticker_selector: boolean
   has_snapshot_type_filter: boolean
   has_average_volume_fields: boolean
+  has_backtest_fields: boolean
   // Always the full massive.com asset-class list (jobs/registry.py's
   // SNAPSHOT_TYPE_OPTIONS), regardless of has_snapshot_type_filter - fetched from the
   // backend rather than hardcoded here so the two never drift.
@@ -55,6 +56,11 @@ export interface Job {
   // backend-v2 jobs/average_volume.py's compute_average_volume.
   average_volume_start_date: string | null
   average_volume_days_interval: number | null
+  // ISO dates ("YYYY-MM-DD"), or null to default to a trailing 90-day window ending
+  // yesterday (UTC) at run time - see backend-v2 jobs/backtest_market_state.py's
+  // compute_market_state_backtest.
+  backtest_start_date: string | null
+  backtest_end_date: string | null
   // Persisted (JobConfig.hidden), not display-only - keeps a job off the Jobs page's
   // default list across reloads until explicitly unhidden. Independent of running/
   // paused: a hidden job still runs on its schedule, it's just tucked away here.
@@ -80,6 +86,8 @@ export interface JobConfigInput {
   snapshot_types?: string | null
   average_volume_start_date?: string | null
   average_volume_days_interval?: number | null
+  backtest_start_date?: string | null
+  backtest_end_date?: string | null
 }
 
 export interface TickerOption {
@@ -185,6 +193,37 @@ export interface TradingSymbolOrderField {
   dir: 'asc' | 'desc'
 }
 
+// One row per ticker whose most recent daily ohlc_bars row is stale or missing - backs
+// the Analytics > Stale Tickers report grid (see app/main.py's stale_tickers_report).
+// type_class/type_description are resolved from the ticker_types table the same
+// first-seen-per-code way TradingSymbolRow's asset_class is.
+export interface StaleTickerRow {
+  ticker: string
+  name: string | null
+  type: string | null
+  type_class: string | null
+  type_description: string | null
+  // ISO date ("YYYY-MM-DD"), or null if this ticker has never had a daily bar synced.
+  last_ohlc_date: string | null
+}
+
+// Backend caps page_size at 1000 (see app/main.py's STALE_TICKERS_MAX_PAGE_SIZE).
+export const STALE_TICKERS_MAX_PAGE_SIZE = 1000
+
+export interface StaleTickersReport {
+  rows: StaleTickerRow[]
+  total: number
+  page: number
+  page_size: number
+}
+
+// Sort priority for the Stale Tickers report - same shape/reasoning as
+// TradingSymbolOrderField, against STALE_TICKERS_ORDERABLE_FIELDS instead.
+export interface StaleTickerOrderField {
+  field: string
+  dir: 'asc' | 'desc'
+}
+
 async function getJSON<T>(path: string): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`)
   if (!res.ok) throw new Error(`${path} failed: ${res.status}`)
@@ -231,6 +270,7 @@ export const api = {
   cancelJob: (name: string) => postJSON<{ status: string }>(`/jobs/${name}/cancel`),
   hideJob: (name: string) => postJSON<Job>(`/jobs/${name}/hide`),
   unhideJob: (name: string) => postJSON<Job>(`/jobs/${name}/unhide`),
+  resetJob: (name: string) => postJSON<Job>(`/jobs/${name}/reset`),
   searchTickers: (q: string, limit = 20) =>
     getJSON<TickerOption[]>(`/tickers/search?q=${encodeURIComponent(q)}&limit=${limit}`),
   searchTickerTypes: (q: string, limit = 20) =>
@@ -246,6 +286,18 @@ export const api = {
     const orderByParam = orderBy.map(({ field, dir }) => `${field}:${dir}`).join(',')
     return getJSON<TradingSymbolsPage>(
       `/reports/trading-symbols?ticker_types=${encodeURIComponent(tickerTypes.join(','))}&page=${page}&page_size=${pageSize}&order_by=${encodeURIComponent(orderByParam)}`,
+    )
+  },
+  staleTickersReport: (
+    tickerTypes: string[] = [],
+    staleAfterDays = 1,
+    page = 1,
+    pageSize = STALE_TICKERS_MAX_PAGE_SIZE,
+    orderBy: StaleTickerOrderField[] = [],
+  ) => {
+    const orderByParam = orderBy.map(({ field, dir }) => `${field}:${dir}`).join(',')
+    return getJSON<StaleTickersReport>(
+      `/reports/stale-tickers?ticker_types=${encodeURIComponent(tickerTypes.join(','))}&stale_after_days=${staleAfterDays}&page=${page}&page_size=${pageSize}&order_by=${encodeURIComponent(orderByParam)}`,
     )
   },
 }

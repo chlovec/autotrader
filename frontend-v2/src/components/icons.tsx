@@ -114,6 +114,27 @@ export function EyeIcon({ className }: IconProps) {
   )
 }
 
+export function TrashIcon({ className }: IconProps) {
+  return (
+    <svg className={className} viewBox="0 0 20 20" fill="none" aria-hidden="true">
+      <path
+        d="M4.5 6h11M8 6V4.5A1 1 0 0 1 9 3.5h2a1 1 0 0 1 1 1V6M8.5 9.5v5M11.5 9.5v5"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M5.5 6 6 15.5A1.5 1.5 0 0 0 7.5 17h5a1.5 1.5 0 0 0 1.5-1.5L14.5 6"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  )
+}
+
 export function BellIcon({ className }: IconProps) {
   return (
     <svg className={className} viewBox="0 0 20 20" fill="none" aria-hidden="true">

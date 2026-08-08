@@ -9,9 +9,10 @@ A paused checkpoint blocks in place - same call stack, same DB session, same
 _job_locks entry held throughout - so resuming just continues the loop exactly where
 it left off; there's no separate "resume" code path to get right. A cancelled
 checkpoint raises JobCancelled, which unwinds the whole run. Whatever that job already
-checkpoints to the database along the way (sync_tickers' SyncProgress cursor,
-sync_bars' TickerBarSyncState) is what the *next* run resumes from - cancellation
-doesn't need its own resumption bookkeeping on top of that.
+committed to the database along the way (sync_tickers' SyncProgress cursor, sync_bars'
+own upserted ohlc_bars rows - see jobs/sync_bars.py's _last_bar_dates) is what the
+*next* run resumes from - cancellation doesn't need its own resumption bookkeeping on
+top of that.
 """
 
 import asyncio

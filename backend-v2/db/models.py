@@ -2,7 +2,7 @@
 
 import datetime as dt
 
-from sqlalchemy import Date, DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -99,21 +99,6 @@ class OhlcBar(Base):
     volume: Mapped[float | None] = mapped_column(Float)
     vwap: Mapped[float | None] = mapped_column(Float)
     transactions: Mapped[int | None] = mapped_column(Integer)
-
-
-class TickerBarSyncState(Base):
-    """Per (ticker, multiplier, timespan) cursor: the last date whose bars are known to
-    be fully synced. jobs/sync_bars.py's sync_bars_nightly reads this to find tickers
-    that aren't up to date and to pick up where each one left off; every successful
-    fetch_and_store_bars call advances it (never rewinds it - see that function's
-    docstring)."""
-
-    __tablename__ = "ticker_bar_sync_state"
-
-    ticker: Mapped[str] = mapped_column(ForeignKey("tickers.ticker"), primary_key=True)
-    multiplier: Mapped[int] = mapped_column(Integer, primary_key=True)
-    timespan: Mapped[str] = mapped_column(String, primary_key=True)
-    synced_through: Mapped[dt.date] = mapped_column(Date)
 
 
 class CurrentSnapshot(Base):
@@ -333,6 +318,85 @@ class AverageVolume(Base):
     computed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
 
 
+class MarketPrediction(Base):
+    """One row per (ticker, predicted_date), the next-session state prediction produced
+    by jobs/predict_market_state.py's compute_market_state_predictions. Purely local -
+    no massive.com call, reads daily bars already synced by jobs/sync_bars.py into
+    ohlc_bars, same reasoning as AverageVolume.
+
+    A first-order Markov chain is fit per ticker on its own history of daily
+    close-to-close returns, each bucketed into one of five quantile-based states
+    (strong_down/down/flat/up/strong_up - see predict_market_state.STATE_LABELS).
+    current_state is the bucket the most recent bar's return fell into;
+    predicted_state is the state with the highest observed transition probability out
+    of current_state (state_confidence), falling back to the unconditional state
+    distribution if current_state was never observed as a "from" state before.
+
+    entry_price/exit_price are today's close and that close projected forward by
+    predicted_state's historical mean return (expected_return) - not a forecast of an
+    actual next-session open/close, since daily bars carry no intraday price path.
+    entry_time/exit_time are therefore fixed constants (regular-session open/close),
+    not predicted values - see the module docstring for why daily-bar data can't
+    support a real time-of-day prediction.
+
+    Upserted - a re-run for the same (ticker, predicted_date) overwrites the prior
+    prediction rather than accumulating rows, same semantics as AverageVolume."""
+
+    __tablename__ = "market_predictions"
+
+    ticker: Mapped[str] = mapped_column(ForeignKey("tickers.ticker"), primary_key=True)
+    predicted_date: Mapped[dt.date] = mapped_column(Date, primary_key=True)
+    current_state: Mapped[str] = mapped_column(String)
+    predicted_state: Mapped[str] = mapped_column(String)
+    state_confidence: Mapped[float] = mapped_column(Float)
+    expected_return: Mapped[float] = mapped_column(Float)
+    entry_price: Mapped[float] = mapped_column(Float)
+    exit_price: Mapped[float] = mapped_column(Float)
+    entry_time: Mapped[str] = mapped_column(String)
+    exit_time: Mapped[str] = mapped_column(String)
+    history_days: Mapped[int] = mapped_column(Integer)
+    computed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
+
+
+class MarketPredictionBacktest(Base):
+    """One row per (ticker, evaluated_date), a walk-forward evaluation of
+    predict_market_state.py's approach against history that had already happened by
+    the time of the run - produced by jobs/backtest_market_state.py's
+    compute_market_state_backtest. Purely local, same reasoning as MarketPrediction.
+
+    For each evaluated_date within the requested range, the model is re-fit exactly as
+    MarketPrediction does, but using only ohlc_bars up through as_of_date (the prior
+    trading day) - current_state/predicted_state/state_confidence/expected_return/
+    entry_price mean the same thing as MarketPrediction's columns of the same name,
+    computed the same way. actual_state is evaluated_date's *actually realized* return
+    bucketed against the cut points fit on history through as_of_date (not refit to
+    include evaluated_date - the walk-forward equivalent of no lookahead bias), and
+    actual_exit_price is evaluated_date's real close. predicted_correct is just
+    predicted_state == actual_state; price_error_pct is
+    (predicted_exit_price - actual_exit_price) / actual_exit_price.
+
+    Upserted - a re-run for the same (ticker, evaluated_date) overwrites the prior
+    result rather than accumulating rows, same semantics as MarketPrediction."""
+
+    __tablename__ = "market_prediction_backtests"
+
+    ticker: Mapped[str] = mapped_column(ForeignKey("tickers.ticker"), primary_key=True)
+    evaluated_date: Mapped[dt.date] = mapped_column(Date, primary_key=True)
+    as_of_date: Mapped[dt.date] = mapped_column(Date)
+    current_state: Mapped[str] = mapped_column(String)
+    predicted_state: Mapped[str] = mapped_column(String)
+    actual_state: Mapped[str] = mapped_column(String)
+    predicted_correct: Mapped[bool] = mapped_column(Boolean)
+    state_confidence: Mapped[float] = mapped_column(Float)
+    expected_return: Mapped[float] = mapped_column(Float)
+    entry_price: Mapped[float] = mapped_column(Float)
+    predicted_exit_price: Mapped[float] = mapped_column(Float)
+    actual_exit_price: Mapped[float] = mapped_column(Float)
+    price_error_pct: Mapped[float] = mapped_column(Float)
+    history_days: Mapped[int] = mapped_column(Integer)
+    computed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
+
+
 class News(Base):
     """One row per article returned by GET /v2/reference/news, keyed by massive.com's
     own article `id` rather than by ticker - a single article often covers more than
@@ -403,7 +467,12 @@ class JobConfig(Base):
     bars' multiplier/timespan/backfill_days are - jobs/average_volume.py resolves a None
     start date to "yesterday" and a None days interval to 50 at *run* time, so a job left
     on defaults tracks "yesterday" on every run instead of freezing to whatever date its
-    config row happened to be created on."""
+    config row happened to be created on.
+
+    backtest_start_date/backtest_end_date only apply to the backtest job
+    (registry.JobDefinition.has_backtest_fields), same "left None, resolved at run time"
+    reasoning as average_volume_start_date - jobs/backtest_market_state.py resolves a
+    None end date to "yesterday" and a None start date to 90 days before that."""
 
     __tablename__ = "job_configs"
 
@@ -420,6 +489,8 @@ class JobConfig(Base):
     snapshot_types: Mapped[str | None] = mapped_column(String)
     average_volume_start_date: Mapped[dt.date | None] = mapped_column(Date)
     average_volume_days_interval: Mapped[int | None] = mapped_column(Integer)
+    backtest_start_date: Mapped[dt.date | None] = mapped_column(Date)
+    backtest_end_date: Mapped[dt.date | None] = mapped_column(Date)
     # Hides the job's card from the Jobs page's default list (see app/main.py's
     # list_jobs) without affecting its schedule - a hidden job still runs normally.
     hidden: Mapped[bool] = mapped_column(default=False)

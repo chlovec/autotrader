@@ -4,10 +4,13 @@
 Two ways to trigger a sync, both built on fetch_and_store_bars:
 - sync_bars_manual (run_bars_manual.py): caller gives an explicit start/end date range,
   applied to every selected ticker regardless of what's already synced.
-- sync_bars_nightly (run_jobs.py): no date range given - each ticker's range is derived
-  from its own TickerBarSyncState cursor (never synced -> backfill_days back from
-  today; otherwise the day after its last synced date), through yesterday. Tickers
-  already synced through yesterday are skipped entirely.
+- sync_bars_nightly (run_jobs.py): no date range given - each ticker's start date is
+  max(its own most recent ohlc_bars date + 1, backfill_days back from today), through
+  yesterday. Reading the actual last bar straight from ohlc_bars (rather than a
+  separately-tracked cursor - see _last_bar_dates) means a ticker massive.com returns
+  nothing for is never silently marked "caught up"; it's simply retried again next run,
+  since its last real bar date hasn't moved. Tickers already synced through yesterday
+  are skipped entirely.
 
 Both accept an optional ticker_types or tickers filter (mutually exclusive); if neither
 is given, every ticker in the tickers table is selected.
@@ -28,12 +31,12 @@ import os
 from typing import Any, Callable
 from urllib.parse import quote
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from data.client import DataClient
-from db.models import OhlcBar, Ticker, TickerBarSyncState
+from db.models import OhlcBar, Ticker
 from db.session import SessionLocal, init_db
 from jobs.control import JobCancelled, JobControl
 
@@ -81,16 +84,6 @@ def _upsert_bar(session: Session, ticker: str, multiplier: int, timespan: str, r
     session.execute(stmt)
 
 
-def _advance_sync_state(session: Session, ticker: str, multiplier: int, timespan: str, end_date: dt.date) -> None:
-    state = session.get(TickerBarSyncState, (ticker, multiplier, timespan))
-    if state is None:
-        session.add(
-            TickerBarSyncState(ticker=ticker, multiplier=multiplier, timespan=timespan, synced_through=end_date)
-        )
-    elif end_date > state.synced_through:
-        state.synced_through = end_date
-
-
 async def fetch_and_store_bars(
     client: DataClient,
     session: Session,
@@ -101,13 +94,10 @@ async def fetch_and_store_bars(
     timespan: str = DEFAULT_TIMESPAN,
 ) -> int:
     """Fetches every page of bars for one ticker over [start_date, end_date] and upserts
-    them, then advances that ticker's (multiplier, timespan) cursor to
-    max(current cursor, end_date).
-
-    Advancing only forward means a manual backfill of an older gap (end_date in the
-    past relative to what's already synced) can never roll the cursor backwards and
-    make the nightly job re-walk years of already-synced history.
-    """
+    them into ohlc_bars. Nothing else is tracked - a caller that wants to know how
+    up-to-date a ticker is can just look at ohlc_bars.MAX(timestamp) itself (see
+    _last_bar_dates), rather than a separately-maintained cursor that could say one
+    thing while the data says another."""
     params: dict[str, Any] = {"adjusted": "true", "sort": "asc", "limit": PAGE_LIMIT}
     path = _bars_path(ticker, multiplier, timespan, start_date, end_date)
 
@@ -124,9 +114,24 @@ async def fetch_and_store_bars(
         if not next_url:
             break
 
-    _advance_sync_state(session, ticker, multiplier, timespan, end_date)
     session.commit()
     return fetched
+
+
+def _last_bar_dates(session: Session, multiplier: int, timespan: str) -> dict[str, dt.date]:
+    """Every ticker's most recent (multiplier, timespan) bar date, in one grouped query
+    rather than one per ticker - same reasoning as jobs/average_volume.py's
+    _apply_ticker_filter docstring: sync_bars_nightly's selection can be tens of
+    thousands of tickers, too many to bind as a literal IN(...) even if this were
+    scoped to just the selected ones. ohlc_bars' primary key leads with
+    (ticker, multiplier, timespan, timestamp), so grouping by ticker after filtering on
+    multiplier/timespan is a single ordered index scan, not a table scan + sort."""
+    query = (
+        select(OhlcBar.ticker, func.max(OhlcBar.timestamp))
+        .where(OhlcBar.multiplier == multiplier, OhlcBar.timespan == timespan)
+        .group_by(OhlcBar.ticker)
+    )
+    return {ticker: timestamp.date() for ticker, timestamp in session.execute(query).all()}
 
 
 def _resolve_tickers(session: Session, ticker_types: list[str] | None, tickers: list[str] | None) -> list[str]:
@@ -249,25 +254,33 @@ def sync_bars_nightly(
     control: JobControl | None = None,
 ) -> dict[str, int]:
     """Syncs every selected ticker through yesterday, skipping any already synced
-    through yesterday, in parallel across a thread pool of `max_workers` workers. A
-    ticker with no prior TickerBarSyncState row backfills the last backfill_days days;
-    one that has a cursor resumes the day after it. Each selected ticker's start date is
-    resolved up front (cheap local TickerBarSyncState lookups, not worth a checkpoint of
-    their own) before fanning out - see _fetch_and_store_one for where `control` is
-    actually checked, once per ticker, right before its (slow) HTTP fetch."""
+    through yesterday, in parallel across a thread pool of `max_workers` workers.
+
+    Each ticker's start date is max(its own most recent ohlc_bars date + 1,
+    backfill_floor), where backfill_floor = end_date - backfill_days - the same floor a
+    ticker with no bars at all backfills from, so "never synced" and "last bar predates
+    the backfill window" both naturally resolve to the same starting point. Reading the
+    actual last bar from ohlc_bars (see _last_bar_dates) rather than a
+    separately-tracked cursor means a ticker massive.com returns nothing for is never
+    silently marked "caught up" - its last real bar date hasn't moved, so it's simply
+    selected again next run.
+
+    Each selected ticker's start date is resolved up front (one grouped query over
+    ohlc_bars, not a per-ticker lookup, not worth a checkpoint of its own) before
+    fanning out - see _fetch_and_store_one for where `control` is actually checked,
+    once per ticker, right before its (slow) HTTP fetch."""
     end_date = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)
+    backfill_floor = end_date - dt.timedelta(days=backfill_days)
     selected = _resolve_tickers(session, ticker_types, tickers)
+    last_bar_by_ticker = _last_bar_dates(session, multiplier, timespan)
 
     jobs: dict[str, dt.date] = {}
     for ticker in selected:
-        state = session.get(TickerBarSyncState, (ticker, multiplier, timespan))
-        if state is not None and state.synced_through >= end_date:
+        last_bar_date = last_bar_by_ticker.get(ticker)
+        start_date = max(last_bar_date + dt.timedelta(days=1), backfill_floor) if last_bar_date else backfill_floor
+        if start_date > end_date:
             continue  # already up to date
-        jobs[ticker] = (
-            state.synced_through + dt.timedelta(days=1)
-            if state is not None
-            else end_date - dt.timedelta(days=backfill_days)
-        )
+        jobs[ticker] = start_date
 
     return _run_pool(jobs, end_date, multiplier, timespan, max_workers, client_factory, control, "nightly")
 

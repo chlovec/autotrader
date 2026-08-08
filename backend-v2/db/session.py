@@ -23,6 +23,8 @@ def init_db() -> None:
     _add_job_configs_snapshot_types_column()
     _add_job_configs_average_volume_columns()
     _add_job_configs_hidden_column()
+    _add_job_configs_backtest_columns()
+    _drop_ticker_bar_sync_state_table()
 
 
 def _add_job_configs_column(column: str, ddl_type: str) -> None:
@@ -59,6 +61,24 @@ def _add_job_configs_average_volume_columns() -> None:
 
 def _add_job_configs_hidden_column() -> None:
     _add_job_configs_column("hidden", "BOOLEAN DEFAULT 0")
+
+
+def _add_job_configs_backtest_columns() -> None:
+    _add_job_configs_column("backtest_start_date", "DATE")
+    _add_job_configs_column("backtest_end_date", "DATE")
+
+
+def _drop_ticker_bar_sync_state_table() -> None:
+    """ticker_bar_sync_state (db/models.py's now-removed TickerBarSyncState) used to
+    track each ticker's "synced through" cursor separately from ohlc_bars itself - that
+    cursor could silently drift from reality (advanced even when a fetch returned zero
+    bars, permanently masking a ticker that had gone stale). jobs/sync_bars.py now
+    derives each ticker's start date straight from ohlc_bars.MAX(timestamp) instead, so
+    this table has no reader left; dropped here the same idempotent way columns are
+    added elsewhere in this module, since a database from before this change would
+    otherwise carry it around inertly forever."""
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS ticker_bar_sync_state"))
 
 
 def get_session() -> Session:

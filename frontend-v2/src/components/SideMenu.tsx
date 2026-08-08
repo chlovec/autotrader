@@ -23,7 +23,7 @@ const NAV_ITEMS: NavItem[] = [
   { view: 'Signals' },
   { view: 'Research' },
   { view: 'Jobs' },
-  { view: 'Analytics', children: ['Top Movers', 'Trading Symbols'] },
+  { view: 'Analytics', children: ['Top Movers', 'Trading Symbols', 'Stale Tickers'] },
   { view: 'Settings' },
 ]
 

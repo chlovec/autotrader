@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from data.client import DataClient
-from db.models import OhlcBar, Ticker, TickerBarSyncState
+from db.models import OhlcBar, Ticker
 from db.session import SessionLocal, init_db
 from jobs.control import JobCancelled, JobControl
 from jobs.sync_bars import fetch_and_store_bars, sync_bars_manual, sync_bars_nightly
@@ -17,7 +17,6 @@ def _clean_db():
     init_db()
     session = SessionLocal()
     session.query(OhlcBar).delete()
-    session.query(TickerBarSyncState).delete()
     session.query(Ticker).delete()
     session.commit()
     session.close()
@@ -39,7 +38,7 @@ def _bar(ts: dt.date, close: float) -> dict:
     return {"t": timestamp_ms, "o": close - 1, "h": close + 1, "l": close - 2, "c": close, "v": 1000, "vw": close, "n": 10}
 
 
-async def test_fetch_and_store_bars_paginates_upserts_and_advances_cursor():
+async def test_fetch_and_store_bars_paginates_and_upserts():
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -64,34 +63,11 @@ async def test_fetch_and_store_bars_paginates_upserts_and_advances_cursor():
             assert [b.close for b in bars] == [10.0, 11.0]
             assert bars[0].multiplier == 1
             assert bars[0].timespan == "day"
-
-            state = session.get(TickerBarSyncState, ("AAA", 1, "day"))
-            assert state.synced_through == dt.date(2024, 1, 2)
         finally:
             session.close()
 
     assert requests[0].url.path == "/v2/aggs/ticker/AAA/range/1/day/2024-01-01/2024-01-02"
     assert requests[1].url.params["cursor"] == "page2"
-
-
-async def test_fetch_and_store_bars_never_rewinds_cursor():
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"results": [_bar(dt.date(2020, 1, 1), 5.0)]})
-
-    session = SessionLocal()
-    session.add(TickerBarSyncState(ticker="AAA", multiplier=1, timespan="day", synced_through=dt.date(2026, 1, 1)))
-    session.commit()
-    session.close()
-
-    async with _client_with_handler(handler) as client:
-        session = SessionLocal()
-        try:
-            # A manual backfill of an old gap must not roll the cursor backwards.
-            await fetch_and_store_bars(client, session, "AAA", dt.date(2020, 1, 1), dt.date(2020, 1, 1))
-            state = session.get(TickerBarSyncState, ("AAA", 1, "day"))
-            assert state.synced_through == dt.date(2026, 1, 1)
-        finally:
-            session.close()
 
 
 def test_sync_bars_manual_defaults_to_all_tickers_and_isolates_failures():
@@ -190,15 +166,28 @@ def test_sync_bars_manual_pause_blocks_a_worker_until_resumed():
         resumer.join()
 
 
-def test_sync_bars_nightly_skips_up_to_date_and_resumes_from_cursor():
+def test_sync_bars_nightly_skips_up_to_date_and_resumes_from_last_bar():
     yesterday = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)
+    resume_last_bar = yesterday - dt.timedelta(days=5)
 
     session = SessionLocal()
     session.add_all([Ticker(ticker="UPTODATE"), Ticker(ticker="RESUME"), Ticker(ticker="NEVER")])
-    session.add(TickerBarSyncState(ticker="UPTODATE", multiplier=1, timespan="day", synced_through=yesterday))
     session.add(
-        TickerBarSyncState(
-            ticker="RESUME", multiplier=1, timespan="day", synced_through=yesterday - dt.timedelta(days=5)
+        OhlcBar(
+            ticker="UPTODATE",
+            multiplier=1,
+            timespan="day",
+            timestamp=dt.datetime.combine(yesterday, dt.time.min),
+            close=1.0,
+        )
+    )
+    session.add(
+        OhlcBar(
+            ticker="RESUME",
+            multiplier=1,
+            timespan="day",
+            timestamp=dt.datetime.combine(resume_last_bar, dt.time.min),
+            close=1.0,
         )
     )
     session.commit()
@@ -220,9 +209,53 @@ def test_sync_bars_nightly_skips_up_to_date_and_resumes_from_cursor():
     finally:
         session.close()
 
-    assert "UPTODATE" not in results  # already synced through yesterday - skipped entirely
-    assert requested_ranges["RESUME"] == ((yesterday - dt.timedelta(days=4)).isoformat(), yesterday.isoformat())
+    assert "UPTODATE" not in results  # last bar is already yesterday - skipped entirely
+    assert requested_ranges["RESUME"] == ((resume_last_bar + dt.timedelta(days=1)).isoformat(), yesterday.isoformat())
     assert requested_ranges["NEVER"] == ((yesterday - dt.timedelta(days=730)).isoformat(), yesterday.isoformat())
+
+
+def test_sync_bars_nightly_retries_a_ticker_that_gets_no_new_bars_back():
+    """The bug this design replaces: a ticker massive.com returned nothing for used to
+    get its cursor silently advanced anyway, so it was never retried again even though
+    its real ohlc_bars data stayed stale forever. Now there's no cursor to wrongly
+    advance - start_date is recomputed from ohlc_bars itself every run, so a ticker
+    with no fresh data keeps being retried run after run."""
+    yesterday = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)
+    old_bar_date = yesterday - dt.timedelta(days=10)
+
+    session = SessionLocal()
+    session.add(Ticker(ticker="QUIET"))
+    session.add(
+        OhlcBar(
+            ticker="QUIET",
+            multiplier=1,
+            timespan="day",
+            timestamp=dt.datetime.combine(old_bar_date, dt.time.min),
+            close=1.0,
+        )
+    )
+    session.commit()
+
+    def empty_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": []})
+
+    try:
+        results = sync_bars_nightly(
+            session, tickers=["QUIET"], backfill_days=730, client_factory=lambda: _client_with_handler(empty_handler)
+        )
+        assert results == {"QUIET": 0}  # attempted, but nothing came back
+
+        last_bar = session.query(OhlcBar).filter_by(ticker="QUIET").order_by(OhlcBar.timestamp.desc()).first()
+        assert last_bar.timestamp.date() == old_bar_date  # still stale - unchanged
+
+        # Run again - the old cursor-based design would have marked this "caught up"
+        # after the first attempt and skipped it here.
+        results_again = sync_bars_nightly(
+            session, tickers=["QUIET"], backfill_days=730, client_factory=lambda: _client_with_handler(empty_handler)
+        )
+        assert results_again == {"QUIET": 0}
+    finally:
+        session.close()
 
 
 def test_sync_bars_nightly_cancel_stops_the_run_and_raises_job_cancelled():

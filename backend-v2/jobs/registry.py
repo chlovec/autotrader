@@ -19,6 +19,8 @@ EMA_JOB = "sync-ema"
 MACD_JOB = "sync-macd"
 RSI_JOB = "sync-rsi"
 AVERAGE_VOLUME_JOB = "average-volume"
+PREDICT_MARKET_STATE_JOB = "predict-market-state"
+BACKTEST_MARKET_STATE_JOB = "backtest-market-state"
 
 # job name -> massive.com indicator path segment (GET /v1/indicators/{indicator}/
 # {ticker}) - jobs/sync_indicators.py's sync_indicator takes the latter, app/main.py's
@@ -57,6 +59,8 @@ DEFAULT_SCHEDULES: dict[str, tuple[str, int]] = {
     MACD_JOB: ("days", 1),
     RSI_JOB: ("days", 1),
     AVERAGE_VOLUME_JOB: ("days", 1),
+    PREDICT_MARKET_STATE_JOB: ("days", 1),
+    BACKTEST_MARKET_STATE_JOB: ("days", 1),
 }
 
 
@@ -93,6 +97,11 @@ class JobDefinition:
     # the average-volume job also layers has_ticker_selector on top to scope which
     # tickers get computed.
     has_average_volume_fields: bool = False
+    # Whether this job offers the "Start date"/"End date" pair (see
+    # jobs/backtest_market_state.py) - only the backtest job takes this. Independent of
+    # the other flags, same layering as has_average_volume_fields: the backtest job
+    # also sets has_ticker_selector to scope which tickers get backtested.
+    has_backtest_fields: bool = False
     # Seeded into JobConfig.run_type the first time this job's config row is created
     # (see app/main.py's _get_or_create_config). "auto" unless overridden below.
     default_run_type: str = "auto"
@@ -210,6 +219,44 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
         has_average_volume_fields=True,
         # Run-on-demand statistic over already-synced bars, no natural daily cadence of
         # its own - manual by default, same reasoning as ticker-types/snapshots/movers.
+        default_run_type="manual",
+    ),
+    PREDICT_MARKET_STATE_JOB: JobDefinition(
+        name=PREDICT_MARKET_STATE_JOB,
+        label="Predict market state",
+        description=(
+            "Fits a first-order Markov chain per selected ticker on its history of "
+            "discretized daily ohlc_bars returns, and stores each ticker's predicted "
+            "next-session state (strong_down/down/flat/up/strong_up), a confidence "
+            "score, and a projected entry/exit price in the market_predictions table. "
+            "Purely local - no massive.com call, reads bars already synced by the bars "
+            "job. Entry/exit time are fixed to the regular session's open/close, not "
+            "predicted - daily bars carry no intraday timestamp to predict from."
+        ),
+        has_bars_fields=False,
+        has_ticker_selector=True,
+        # Run-on-demand statistic over already-synced bars, no natural daily cadence of
+        # its own - manual by default, same reasoning as average-volume.
+        default_run_type="manual",
+    ),
+    BACKTEST_MARKET_STATE_JOB: JobDefinition(
+        name=BACKTEST_MARKET_STATE_JOB,
+        label="Backtest market state",
+        description=(
+            "Walk-forward backtests the predict-market-state job's approach over a "
+            "start date/end date range: for each evaluated day, re-fits the same "
+            "per-ticker Markov chain on ohlc_bars history through the prior day only, "
+            "and compares the resulting prediction to what actually happened, storing "
+            "one result per (ticker, evaluated date) in the market_prediction_backtests "
+            "table. Purely local - no massive.com call, reads bars already synced by "
+            "the bars job."
+        ),
+        has_bars_fields=False,
+        has_ticker_selector=True,
+        has_backtest_fields=True,
+        # Run-on-demand evaluation over an explicit date range, no natural daily
+        # cadence of its own - manual by default, same reasoning as average-volume/
+        # predict-market-state.
         default_run_type="manual",
     ),
 }
