@@ -129,6 +129,53 @@ export interface TopMarketMoverRow {
   fetched_at: string
 }
 
+// One row per tickers row, joined out to asset_class/average_volume/current_snapshots -
+// backs the Analytics > Trading Symbols report grid. Unlike TopMarketMoverRow, snapshot
+// fields (everything past average_volume) can all be null - a ticker with no
+// current_snapshots row (sync-snapshots never run against it) still gets a row here.
+export interface TradingSymbolRow {
+  ticker: string
+  name: string | null
+  type: string | null
+  asset_class: string | null
+  average_volume: number | null
+  todays_change: number | null
+  todays_change_perc: number | null
+  updated: string | null
+  day_open: number | null
+  day_high: number | null
+  day_low: number | null
+  day_close: number | null
+  day_volume: number | null
+  day_vwap: number | null
+  min_open: number | null
+  min_high: number | null
+  min_low: number | null
+  min_close: number | null
+  min_volume: number | null
+  min_vwap: number | null
+  min_accumulated_volume: number | null
+  min_timestamp: string | null
+  prev_day_open: number | null
+  prev_day_high: number | null
+  prev_day_low: number | null
+  prev_day_close: number | null
+  prev_day_volume: number | null
+  prev_day_vwap: number | null
+  fetched_at: string | null
+}
+
+// Backend caps page_size at 1000 (see app/main.py's TRADING_SYMBOLS_MAX_PAGE_SIZE) -
+// requesting more just gets clamped down to it server-side, not rejected.
+export const TRADING_SYMBOLS_MAX_PAGE_SIZE = 1000
+
+export interface TradingSymbolsPage {
+  rows: TradingSymbolRow[]
+  total: number
+  page: number
+  page_size: number
+}
+
 async function getJSON<T>(path: string): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`)
   if (!res.ok) throw new Error(`${path} failed: ${res.status}`)
@@ -181,4 +228,8 @@ export const api = {
     getJSON<TickerTypeOption[]>(`/ticker-types/search?q=${encodeURIComponent(q)}&limit=${limit}`),
   topMoversReport: (tickerTypes: string[] = []) =>
     getJSON<TopMarketMoverRow[]>(`/reports/top-movers?ticker_types=${encodeURIComponent(tickerTypes.join(','))}`),
+  tradingSymbolsReport: (tickerTypes: string[] = [], page = 1, pageSize = TRADING_SYMBOLS_MAX_PAGE_SIZE) =>
+    getJSON<TradingSymbolsPage>(
+      `/reports/trading-symbols?ticker_types=${encodeURIComponent(tickerTypes.join(','))}&page=${page}&page_size=${pageSize}`,
+    ),
 }

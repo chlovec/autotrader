@@ -3,12 +3,22 @@ import { Header } from './components/Header'
 import { SideMenu } from './components/SideMenu'
 import { JobsPage } from './components/JobsPage'
 import { TopMoversPage } from './components/TopMoversPage'
+import { TradingSymbolsPage } from './components/TradingSymbolsPage'
 
 // Below this width the side menu renders as an overlay drawer (see index.css) and
 // should start closed; at/above it, it renders inline and should start open.
 const DESKTOP_MENU_QUERY = '(min-width: 769px)'
 
-export type View = 'Dashboard' | 'Positions' | 'Signals' | 'Research' | 'Jobs' | 'Analytics' | 'Top Movers' | 'Settings'
+export type View =
+  | 'Dashboard'
+  | 'Positions'
+  | 'Signals'
+  | 'Research'
+  | 'Jobs'
+  | 'Analytics'
+  | 'Top Movers'
+  | 'Trading Symbols'
+  | 'Settings'
 
 function App() {
   const [menuOpen, setMenuOpen] = useState(
@@ -34,6 +44,8 @@ function App() {
             <JobsPage />
           ) : activeView === 'Top Movers' ? (
             <TopMoversPage />
+          ) : activeView === 'Trading Symbols' ? (
+            <TradingSymbolsPage />
           ) : (
             <p className="placeholder-note">{activeView} goes here.</p>
           )}

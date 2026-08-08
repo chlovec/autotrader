@@ -1,5 +1,5 @@
 import { createPortal } from 'react-dom'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useAnchoredDropdown } from './useAnchoredDropdown'
 
 type ColumnHeaderMenuProps = {
@@ -41,32 +41,53 @@ export function ColumnHeaderMenu({
 }: ColumnHeaderMenuProps) {
   const { open, position, anchorRef, dropdownRef, toggleMenu, closeMenu } = useAnchoredDropdown(DROPDOWN_WIDTH)
   const [search, setSearch] = useState('')
+  // Checkbox state staged in this dropdown until "Filter" is clicked - the grid itself
+  // (via `selected`) only ever sees the committed value. Reset each time the menu opens:
+  // starts blank (no entries checked) when there's no active filter yet, per the
+  // "default no entry selected" behavior, or mirrors the already-committed set so
+  // reopening a filtered column shows what's actually applied.
+  const [pendingSelected, setPendingSelected] = useState<Set<string>>(() => new Set(selected ?? []))
+  // Read inside the effect below via a ref, not a `selected` dependency - the effect
+  // should only reset pendingSelected when the menu itself opens, not on every commit
+  // that changes `selected` (e.g. right after this same dropdown's own Filter click).
+  const selectedRef = useRef(selected)
+  selectedRef.current = selected
 
-  // Search box should start blank each time the menu reopens rather than remembering
-  // the last query, since a stale filter over a fresh list of values is more confusing
-  // than a momentary reset.
   useEffect(() => {
-    if (!open) setSearch('')
+    if (open) {
+      setPendingSelected(new Set(selectedRef.current ?? []))
+    } else {
+      // Search box should start blank each time the menu reopens rather than remembering
+      // the last query, since a stale filter over a fresh list of values is more
+      // confusing than a momentary reset.
+      setSearch('')
+    }
   }, [open])
 
   const isActive = selected !== null
-  const isChecked = (value: string) => selected === null || selected.has(value)
+  const isChecked = (value: string) => pendingSelected.has(value)
   const visibleValues = search.trim()
     ? values.filter((value) => value.toLowerCase().includes(search.trim().toLowerCase()))
     : values
 
   const toggleValue = (value: string) => {
-    const current = selected ?? new Set(values)
-    const next = new Set(current)
-    if (next.has(value)) {
-      next.delete(value)
-    } else {
-      next.add(value)
-    }
-    // Re-checking back to every value collapses to null - otherwise a "fully selected"
+    setPendingSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(value)) {
+        next.delete(value)
+      } else {
+        next.add(value)
+      }
+      return next
+    })
+  }
+
+  const applyFilter = () => {
+    // Every value checked is equivalent to no filter - otherwise a "fully selected"
     // explicit set and the true no-filter state would both be reachable, silently
     // disagreeing about whether the header should render its filter dot as active.
-    onFilterChange(next.size === values.length ? null : next)
+    onFilterChange(pendingSelected.size === values.length ? null : new Set(pendingSelected))
+    closeMenu()
   }
 
   return (
@@ -160,10 +181,14 @@ export function ColumnHeaderMenu({
               />
             </div>
             <div className="report-filter-actions">
-              <button type="button" className="report-filter-action" onClick={() => onFilterChange(null)}>
+              <button
+                type="button"
+                className="report-filter-action"
+                onClick={() => setPendingSelected(new Set(values))}
+              >
                 Select all
               </button>
-              <button type="button" className="report-filter-action" onClick={() => onFilterChange(new Set())}>
+              <button type="button" className="report-filter-action" onClick={() => setPendingSelected(new Set())}>
                 Clear
               </button>
             </div>
@@ -181,6 +206,11 @@ export function ColumnHeaderMenu({
                 <li className="report-filter-empty">No values match "{search}"</li>
               )}
             </ul>
+            <div className="report-filter-apply-wrap">
+              <button type="button" className="job-button job-button-primary report-filter-apply" onClick={applyFilter}>
+                Filter
+              </button>
+            </div>
           </div>,
           document.body,
         )}

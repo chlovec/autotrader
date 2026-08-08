@@ -100,6 +100,19 @@ function compareRows<T>(a: T, b: T, key: Extract<keyof T, string>, dir: SortDir)
 const COLUMNS_MENU_WIDTH = 220
 const MIN_COLUMN_WIDTH = 64
 
+// Row-window virtualization: only the rows actually scrolled into view (plus this many
+// on either side, so a fast scroll doesn't flash blank space before the next render
+// catches up) are ever mounted as real <tr> elements - the rest of the table's height
+// is held open by two spacer rows. Without this, a large report (e.g. Trading Symbols'
+// ~46k tickers) would mount every row's cells as real DOM nodes up front regardless of
+// how few are ever actually visible through the scrolled viewport.
+const OVERSCAN_ROWS = 8
+// Matches .report-table td's 9px vertical padding plus its ~19px line height - only
+// used for the very first render, before a real row has been measured (see
+// measureRowHeight below); wrong by a few px here just means the first paint's window
+// is slightly mis-sized until that measurement lands, not a lasting error.
+const DEFAULT_ROW_HEIGHT = 37
+
 // The "Columns" toolbar button - always visible above the grid regardless of which
 // columns are currently hidden, since a hidden column's own header (and so its
 // ColumnHeaderMenu) disappears along with it. This is the only way back to unhide one.
@@ -317,6 +330,62 @@ export function ReportGrid<T>({ columns, rows, rowKey, formatCell, emptyMessage,
     return () => window.removeEventListener('resize', measure)
   }, [frozenKeys, visibleColumns, sortedRows, columnWidths])
 
+  // Virtualization: scrollTop/viewportHeight of the scrolled .report-table-wrap, kept
+  // in state (rather than read ad hoc) since both feed directly into which row indices
+  // get windowed into real <tr>s below.
+  const scrollElRef = useRef<HTMLDivElement | null>(null)
+  const [scrollTop, setScrollTop] = useState(0)
+  const [viewportHeight, setViewportHeight] = useState(0)
+  // Measured once from the first real rendered row rather than assumed - a row's height
+  // is uniform in practice (.report-table td is nowrap by default, see index.css) except
+  // once a column's been manually resized to wrap (report-cell-wrap), which this can't
+  // account for, but that's a rare, user-initiated edge case not worth the complexity of
+  // tracking per-row heights for.
+  const [measuredRowHeight, setMeasuredRowHeight] = useState<number | null>(null)
+  const rowHeight = measuredRowHeight ?? DEFAULT_ROW_HEIGHT
+  const measureFirstRow = (el: HTMLTableRowElement | null) => {
+    if (el && measuredRowHeight === null) {
+      const { height } = el.getBoundingClientRect()
+      if (height) setMeasuredRowHeight(height)
+    }
+  }
+
+  // Tracks the wrap's height as the window/layout changes (e.g. sidebar collapse) -
+  // ResizeObserver rather than a window resize listener since the wrap's own size can
+  // change independently of the window (e.g. a browser zoom change, or this page's
+  // layout shifting for reasons unrelated to the viewport).
+  useLayoutEffect(() => {
+    const el = scrollElRef.current
+    if (!el) return
+    setViewportHeight(el.clientHeight)
+    const observer = new ResizeObserver(([entry]) => setViewportHeight(entry.contentRect.height))
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [])
+
+  // rAF-throttled rather than set on every scroll event - a fast scroll/trackpad fling
+  // can fire dozens of scroll events per frame, and each one only needs to result in at
+  // most one re-render.
+  const scrollRafRef = useRef<number | null>(null)
+  useEffect(() => () => {
+    if (scrollRafRef.current != null) cancelAnimationFrame(scrollRafRef.current)
+  }, [])
+  const handleScroll = () => {
+    if (scrollRafRef.current != null) return
+    scrollRafRef.current = requestAnimationFrame(() => {
+      scrollRafRef.current = null
+      const el = scrollElRef.current
+      if (el) setScrollTop(el.scrollTop)
+    })
+  }
+
+  const rowCount = sortedRows.length
+  const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - OVERSCAN_ROWS)
+  const endIndex = Math.min(rowCount, Math.ceil((scrollTop + viewportHeight) / rowHeight) + OVERSCAN_ROWS)
+  const visibleRows = sortedRows.slice(startIndex, endIndex)
+  const topSpacerHeight = startIndex * rowHeight
+  const bottomSpacerHeight = (rowCount - endIndex) * rowHeight
+
   // Drag-to-resize: mousedown on a column's resize handle starts tracking, then
   // mousemove/mouseup are wired to the document (not the handle itself) so the drag
   // keeps working even once the cursor leaves the thin handle strip.
@@ -365,7 +434,7 @@ export function ReportGrid<T>({ columns, rows, rowKey, formatCell, emptyMessage,
           match" state) would take the header, and with it every column's own
           ColumnHeaderMenu, off screen along with the body - leaving no way back into
           that filter's dropdown to re-select anything. */}
-      <div className="report-table-wrap">
+      <div className="report-table-wrap" ref={scrollElRef} onScroll={handleScroll}>
         <table className="job-history-table report-table">
           <thead>
             <tr>
@@ -420,30 +489,47 @@ export function ReportGrid<T>({ columns, rows, rowKey, formatCell, emptyMessage,
                 </td>
               </tr>
             ) : (
-              sortedRows.map((row) => (
-                <tr key={rowKey(row)}>
-                  {visibleColumns.map((col) => {
-                    const isFrozen = frozenKeys.has(col.key)
-                    const width = columnWidths[col.key]
-                    return (
-                      <td
-                        key={col.key}
-                        className={
-                          [isFrozen && 'report-cell-frozen-body', width && 'report-cell-wrap']
-                            .filter(Boolean)
-                            .join(' ') || undefined
-                        }
-                        style={{
-                          ...(isFrozen ? { left: frozenOffsets[col.key] ?? 0 } : undefined),
-                          ...(width ? { width, minWidth: width, maxWidth: width } : undefined),
-                        }}
-                      >
-                        {formatCell(row, col.key)}
-                      </td>
-                    )
-                  })}
-                </tr>
-              ))
+              <>
+                {/* Holds open the scrolled height of every row above the windowed slice,
+                    so the real rows below sit at the same scroll offset they would if
+                    every row between them and the top were actually mounted. */}
+                {topSpacerHeight > 0 && (
+                  <tr aria-hidden="true" style={{ height: topSpacerHeight }}>
+                    <td colSpan={visibleColumns.length} style={{ padding: 0, border: 'none' }} />
+                  </tr>
+                )}
+                {visibleRows.map((row, i) => (
+                  <tr key={rowKey(row)} ref={i === 0 ? measureFirstRow : undefined}>
+                    {visibleColumns.map((col) => {
+                      const isFrozen = frozenKeys.has(col.key)
+                      const width = columnWidths[col.key]
+                      return (
+                        <td
+                          key={col.key}
+                          className={
+                            [isFrozen && 'report-cell-frozen-body', width && 'report-cell-wrap']
+                              .filter(Boolean)
+                              .join(' ') || undefined
+                          }
+                          style={{
+                            ...(isFrozen ? { left: frozenOffsets[col.key] ?? 0 } : undefined),
+                            ...(width ? { width, minWidth: width, maxWidth: width } : undefined),
+                          }}
+                        >
+                          {formatCell(row, col.key)}
+                        </td>
+                      )
+                    })}
+                  </tr>
+                ))}
+                {/* Same reasoning as the top spacer, for every row below the windowed
+                    slice - keeps the scrollbar's total scrollable height correct. */}
+                {bottomSpacerHeight > 0 && (
+                  <tr aria-hidden="true" style={{ height: bottomSpacerHeight }}>
+                    <td colSpan={visibleColumns.length} style={{ padding: 0, border: 'none' }} />
+                  </tr>
+                )}
+              </>
             )}
           </tbody>
         </table>

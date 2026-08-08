@@ -28,7 +28,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from data.client import DataClient
-from db.models import AverageVolume, JobConfig, JobRun, Ticker, TickerType, TopMarketMover
+from db.models import AverageVolume, CurrentSnapshot, JobConfig, JobRun, Ticker, TickerType, TopMarketMover
 from db.session import SessionLocal, init_db
 from jobs.average_volume import DEFAULT_DAYS_INTERVAL, compute_average_volume
 from jobs.control import JobCancelled, JobControl
@@ -546,6 +546,125 @@ def top_movers_report(ticker_types: str = "") -> list[dict]:
             )
             for mover, ticker in rows
         ]
+
+
+def _symbol_to_dict(
+    ticker: Ticker, asset_class: str | None, average_volume: float | None, snapshot: CurrentSnapshot | None
+) -> dict[str, Any]:
+    return {
+        "ticker": ticker.ticker,
+        "name": ticker.name,
+        "type": ticker.type,
+        "asset_class": asset_class,
+        "average_volume": average_volume,
+        "todays_change": snapshot.todays_change if snapshot else None,
+        "todays_change_perc": snapshot.todays_change_perc if snapshot else None,
+        "updated": snapshot.updated.isoformat() if snapshot and snapshot.updated else None,
+        "day_open": snapshot.day_open if snapshot else None,
+        "day_high": snapshot.day_high if snapshot else None,
+        "day_low": snapshot.day_low if snapshot else None,
+        "day_close": snapshot.day_close if snapshot else None,
+        "day_volume": snapshot.day_volume if snapshot else None,
+        "day_vwap": snapshot.day_vwap if snapshot else None,
+        "min_open": snapshot.min_open if snapshot else None,
+        "min_high": snapshot.min_high if snapshot else None,
+        "min_low": snapshot.min_low if snapshot else None,
+        "min_close": snapshot.min_close if snapshot else None,
+        "min_volume": snapshot.min_volume if snapshot else None,
+        "min_vwap": snapshot.min_vwap if snapshot else None,
+        "min_accumulated_volume": snapshot.min_accumulated_volume if snapshot else None,
+        "min_timestamp": snapshot.min_timestamp.isoformat() if snapshot and snapshot.min_timestamp else None,
+        "prev_day_open": snapshot.prev_day_open if snapshot else None,
+        "prev_day_high": snapshot.prev_day_high if snapshot else None,
+        "prev_day_low": snapshot.prev_day_low if snapshot else None,
+        "prev_day_close": snapshot.prev_day_close if snapshot else None,
+        "prev_day_volume": snapshot.prev_day_volume if snapshot else None,
+        "prev_day_vwap": snapshot.prev_day_vwap if snapshot else None,
+        "fetched_at": snapshot.fetched_at.isoformat() if snapshot and snapshot.fetched_at else None,
+    }
+
+
+TRADING_SYMBOLS_MAX_PAGE_SIZE = 1000
+TRADING_SYMBOLS_DEFAULT_PAGE_SIZE = 500
+
+
+@app.get("/reports/trading-symbols")
+def trading_symbols_report(
+    ticker_types: str = "", page: int = 1, page_size: int = TRADING_SYMBOLS_DEFAULT_PAGE_SIZE
+) -> dict[str, Any]:
+    """Backs the Analytics > Trading Symbols page's report grid: every synced tickers
+    row, joined out to its asset_class, most recently computed average_volumes row, and
+    current_snapshots row (both may be missing for a ticker that's never had that job
+    run against it, unlike top_movers_report's mover-driven rows which always have a
+    tickers row to join against).
+
+    Paginated - `page` (1-based) and `page_size` (capped at
+    TRADING_SYMBOLS_MAX_PAGE_SIZE) select a slice of the full tickers table, ordered by
+    ticker. average_volumes/current_snapshots are looked up only for that page's
+    tickers rather than loaded in full, so page_size bounds the work done per request
+    the same way it bounds the response size."""
+    types = _split_csv(ticker_types)
+    page = max(1, page)
+    page_size = max(1, min(page_size, TRADING_SYMBOLS_MAX_PAGE_SIZE))
+    with SessionLocal() as session:
+        base_query = select(Ticker)
+        count_query = select(func.count(Ticker.ticker))
+        if types:
+            base_query = base_query.where(Ticker.type.in_(types))
+            count_query = count_query.where(Ticker.type.in_(types))
+        total = session.execute(count_query).scalar_one()
+
+        query = base_query.order_by(Ticker.ticker).limit(page_size).offset((page - 1) * page_size)
+        tickers = session.execute(query).scalars().all()
+        ticker_codes = [ticker.ticker for ticker in tickers]
+
+        # Same first-seen-per-code reasoning as top_movers_report.
+        asset_class_by_code: dict[str, str] = {}
+        for code, asset_class in session.execute(select(TickerType.code, TickerType.asset_class)).all():
+            asset_class_by_code.setdefault(code, asset_class)
+
+        # Same "latest run per ticker" pattern as top_movers_report - scoped to this
+        # page's tickers (at most page_size of them) rather than every ticker that's
+        # ever had an average-volume run, now that the caller only needs this page.
+        latest_computed_at = (
+            select(AverageVolume.ticker, func.max(AverageVolume.computed_at).label("computed_at"))
+            .where(AverageVolume.ticker.in_(ticker_codes))
+            .group_by(AverageVolume.ticker)
+        )
+        latest_computed_at = latest_computed_at.subquery()
+        average_volume_by_ticker: dict[str, float | None] = {
+            ticker: average_volume
+            for ticker, average_volume in session.execute(
+                select(AverageVolume.ticker, AverageVolume.average_volume).join(
+                    latest_computed_at,
+                    (AverageVolume.ticker == latest_computed_at.c.ticker)
+                    & (AverageVolume.computed_at == latest_computed_at.c.computed_at),
+                )
+            ).all()
+        }
+
+        # current_snapshots is already one row per ticker (upsert-forever, no history),
+        # so unlike average_volumes there's no "latest" disambiguation needed here.
+        # Same page-scoping as average_volume_by_ticker above.
+        snapshot_by_ticker: dict[str, CurrentSnapshot] = {
+            snapshot.ticker: snapshot
+            for snapshot in session.execute(
+                select(CurrentSnapshot).where(CurrentSnapshot.ticker.in_(ticker_codes))
+            )
+            .scalars()
+            .all()
+        }
+
+        rows = [
+            _symbol_to_dict(
+                ticker,
+                asset_class_by_code.get(ticker.type) if ticker.type else None,
+                average_volume_by_ticker.get(ticker.ticker),
+                snapshot_by_ticker.get(ticker.ticker),
+            )
+            for ticker in tickers
+        ]
+        return {"rows": rows, "total": total, "page": page, "page_size": page_size}
 
 
 @app.get("/jobs")
