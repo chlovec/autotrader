@@ -176,6 +176,15 @@ export interface TradingSymbolsPage {
   page_size: number
 }
 
+// Sort priority for the Trading Symbols report: applied in array order, so entry 0 is
+// the primary sort key. `field` is one of TRADING_SYMBOLS_ORDERABLE_FIELDS' keys
+// (see components/TradingSymbolsPage.tsx) - kept as a plain string here rather than a
+// union so api.ts doesn't need to import the page's field list.
+export interface TradingSymbolOrderField {
+  field: string
+  dir: 'asc' | 'desc'
+}
+
 async function getJSON<T>(path: string): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`)
   if (!res.ok) throw new Error(`${path} failed: ${res.status}`)
@@ -228,8 +237,15 @@ export const api = {
     getJSON<TickerTypeOption[]>(`/ticker-types/search?q=${encodeURIComponent(q)}&limit=${limit}`),
   topMoversReport: (tickerTypes: string[] = []) =>
     getJSON<TopMarketMoverRow[]>(`/reports/top-movers?ticker_types=${encodeURIComponent(tickerTypes.join(','))}`),
-  tradingSymbolsReport: (tickerTypes: string[] = [], page = 1, pageSize = TRADING_SYMBOLS_MAX_PAGE_SIZE) =>
-    getJSON<TradingSymbolsPage>(
-      `/reports/trading-symbols?ticker_types=${encodeURIComponent(tickerTypes.join(','))}&page=${page}&page_size=${pageSize}`,
-    ),
+  tradingSymbolsReport: (
+    tickerTypes: string[] = [],
+    page = 1,
+    pageSize = TRADING_SYMBOLS_MAX_PAGE_SIZE,
+    orderBy: TradingSymbolOrderField[] = [],
+  ) => {
+    const orderByParam = orderBy.map(({ field, dir }) => `${field}:${dir}`).join(',')
+    return getJSON<TradingSymbolsPage>(
+      `/reports/trading-symbols?ticker_types=${encodeURIComponent(tickerTypes.join(','))}&page=${page}&page_size=${pageSize}&order_by=${encodeURIComponent(orderByParam)}`,
+    )
+  },
 }

@@ -1,7 +1,22 @@
-import { useEffect, useState } from 'react'
-import { api, TRADING_SYMBOLS_MAX_PAGE_SIZE, type TickerTypeOption, type TradingSymbolRow } from '../api'
+import { useEffect, useRef, useState } from 'react'
+import {
+  api,
+  TRADING_SYMBOLS_MAX_PAGE_SIZE,
+  type TickerTypeOption,
+  type TradingSymbolOrderField,
+  type TradingSymbolRow,
+} from '../api'
+import { loadReportParams, saveReportParams } from '../reportParams'
 import { ReportGrid, type ReportColumn } from './ReportGrid'
 import { SearchableSelect, type SelectOption } from './SearchableSelect'
+
+const REPORT_PARAMS_ID = 'trading-symbols'
+
+type SavedParams = {
+  tickerTypes: string[]
+  pageSize: number
+  orderBy: TradingSymbolOrderField[]
+}
 
 // Backend caps /ticker-types/search's limit at 50 (see app/main.py's search_ticker_types) -
 // ticker_types is a short, mostly-static reference list (db/models.py's TickerType
@@ -9,6 +24,18 @@ import { SearchableSelect, type SelectOption } from './SearchableSelect'
 const TICKER_TYPE_OPTIONS_LIMIT = 50
 
 const DEFAULT_PAGE_SIZE = 500
+
+// Fields the backend accepts in `order_by` (see TRADING_SYMBOLS_ORDERABLE_FIELDS in
+// app/main.py) - a subset of COLUMNS below, since ordering runs as a SQL ORDER BY
+// against the full filtered set (not just the fetched page), so it's limited to
+// fields that are cheap to sort on at the database level.
+const ORDER_BY_FIELDS: { key: string; label: string }[] = [
+  { key: 'ticker', label: 'Ticker' },
+  { key: 'name', label: 'Name' },
+  { key: 'type', label: 'Type' },
+  { key: 'todays_change_perc', label: "Today's Change %" },
+  { key: 'day_volume', label: 'Day Volume' },
+]
 
 function tickerTypeLabel(t: TickerTypeOption): string {
   const detail = [t.asset_class, t.description].filter(Boolean).join(': ')
@@ -64,14 +91,25 @@ function rowKey(row: TradingSymbolRow): string {
   return row.ticker
 }
 
+// Computed once on module load (not per-mount) purely so the lazy useState
+// initializers below - which all need the same saved blob - don't each re-read and
+// re-parse localStorage independently.
+function loadSavedParams(): Partial<SavedParams> | null {
+  return loadReportParams<SavedParams>(REPORT_PARAMS_ID)
+}
+
 export function TradingSymbolsPage() {
   const [tickerTypeOptions, setTickerTypeOptions] = useState<SelectOption[]>([])
-  const [tickerTypes, setTickerTypes] = useState<string[]>([])
+  const [tickerTypes, setTickerTypes] = useState<string[]>(() => loadSavedParams()?.tickerTypes ?? [])
+  // Sort priority for the report - array order is priority order (index 0 = primary
+  // sort key), same convention as SearchableSelect's chip order. Sent to the backend
+  // as-is on the next fetch, same as tickerTypes below.
+  const [orderBy, setOrderBy] = useState<TradingSymbolOrderField[]>(() => loadSavedParams()?.orderBy ?? [])
   // Draft value bound to the page-size input, distinct from `pageSize` below (the
   // value the currently-displayed page was actually fetched with) - editing this
   // doesn't affect what's on screen, or what Prev/Next page through, until "Run
   // report" is clicked again.
-  const [pageSizeInput, setPageSizeInput] = useState(DEFAULT_PAGE_SIZE)
+  const [pageSizeInput, setPageSizeInput] = useState(() => loadSavedParams()?.pageSize ?? DEFAULT_PAGE_SIZE)
   const [page, setPage] = useState(1)
   // Draft value bound to the "Page X of N" jump-to-page input - same pattern as
   // pageSizeInput, but synced back to `page` on every successful fetch (including
@@ -96,7 +134,7 @@ export function TradingSymbolsPage() {
     setLoading(true)
     setError(null)
     try {
-      const result = await api.tradingSymbolsReport(tickerTypes, targetPage, requestedPageSize)
+      const result = await api.tradingSymbolsReport(tickerTypes, targetPage, requestedPageSize, orderBy)
       setRows(result.rows)
       setTotal(result.total)
       setPage(result.page)
@@ -114,6 +152,37 @@ export function TradingSymbolsPage() {
 
   const runReport = () => fetchPage(1, pageSizeInput)
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
+
+  // Persists the current draft controls (not necessarily the ones the on-screen page
+  // was fetched with) so the next visit to this page restores them - separate from
+  // ReportGrid's own "Save view", which only covers sort/filter/freeze/hide/width on
+  // the grid itself, not these report-level controls.
+  const [paramsJustSaved, setParamsJustSaved] = useState(false)
+  const paramsSavedFlashTimeout = useRef<number | null>(null)
+  useEffect(() => () => {
+    if (paramsSavedFlashTimeout.current) window.clearTimeout(paramsSavedFlashTimeout.current)
+  }, [])
+  const saveParams = () => {
+    saveReportParams<SavedParams>(REPORT_PARAMS_ID, { tickerTypes, pageSize: pageSizeInput, orderBy })
+    setParamsJustSaved(true)
+    if (paramsSavedFlashTimeout.current) window.clearTimeout(paramsSavedFlashTimeout.current)
+    paramsSavedFlashTimeout.current = window.setTimeout(() => setParamsJustSaved(false), 1500)
+  }
+
+  const addOrderField = (field: string) => {
+    if (!field || orderBy.some((entry) => entry.field === field)) return
+    setOrderBy([...orderBy, { field, dir: 'asc' }])
+  }
+  const removeOrderField = (index: number) => setOrderBy(orderBy.filter((_, i) => i !== index))
+  const toggleOrderDir = (index: number) =>
+    setOrderBy(orderBy.map((entry, i) => (i === index ? { ...entry, dir: entry.dir === 'asc' ? 'desc' : 'asc' } : entry)))
+  const moveOrderField = (index: number, delta: number) => {
+    const target = index + delta
+    if (target < 0 || target >= orderBy.length) return
+    const next = [...orderBy]
+    ;[next[index], next[target]] = [next[target], next[index]]
+    setOrderBy(next)
+  }
 
   const goToPage = () => {
     if (!Number.isFinite(pageInput)) {
@@ -134,40 +203,117 @@ export function TradingSymbolsPage() {
       </p>
 
       <div className="report-controls">
-        <div className="job-field report-ticker-type-field">
-          <span className="job-field-label">Ticker types</span>
-          <SearchableSelect
-            multiple
-            selected={tickerTypes}
-            onChange={setTickerTypes}
-            options={tickerTypeOptions}
-            placeholder="Search ticker types... (leave blank for all)"
-          />
+        <div className="report-controls-fields">
+          <div className="job-field report-ticker-type-field">
+            <span className="job-field-label">Ticker types</span>
+            <SearchableSelect
+              multiple
+              selected={tickerTypes}
+              onChange={setTickerTypes}
+              options={tickerTypeOptions}
+              placeholder="Search ticker types... (leave blank for all)"
+            />
+          </div>
+          <div className="job-field report-page-size-field">
+            <span className="job-field-label">Page size</span>
+            <input
+              type="number"
+              min={1}
+              max={TRADING_SYMBOLS_MAX_PAGE_SIZE}
+              step={1}
+              value={pageSizeInput}
+              onChange={(event) => setPageSizeInput(Number(event.target.value))}
+              onBlur={() =>
+                setPageSizeInput((current) =>
+                  Number.isFinite(current) ? Math.min(TRADING_SYMBOLS_MAX_PAGE_SIZE, Math.max(1, Math.round(current))) : DEFAULT_PAGE_SIZE,
+                )
+              }
+            />
+          </div>
+          <div className="job-field report-order-by-field">
+            <span className="job-field-label">Order by</span>
+            <div className="order-by-picker">
+              {orderBy.length > 0 && (
+                <ul className="order-by-list">
+                  {orderBy.map((entry, index) => {
+                    const field = ORDER_BY_FIELDS.find((f) => f.key === entry.field)
+                    return (
+                      <li key={entry.field} className="order-by-row">
+                        <span className="order-by-priority">{index + 1}</span>
+                        <span className="order-by-label">{field?.label ?? entry.field}</span>
+                        <button
+                          type="button"
+                          className="order-by-dir-toggle"
+                          onClick={() => toggleOrderDir(index)}
+                          title={entry.dir === 'asc' ? 'Ascending - click for descending' : 'Descending - click for ascending'}
+                        >
+                          {entry.dir === 'asc' ? '▲ Asc' : '▼ Desc'}
+                        </button>
+                        <button
+                          type="button"
+                          className="order-by-move"
+                          disabled={index === 0}
+                          onClick={() => moveOrderField(index, -1)}
+                          title="Move up in sort priority"
+                          aria-label="Move up in sort priority"
+                        >
+                          ↑
+                        </button>
+                        <button
+                          type="button"
+                          className="order-by-move"
+                          disabled={index === orderBy.length - 1}
+                          onClick={() => moveOrderField(index, 1)}
+                          title="Move down in sort priority"
+                          aria-label="Move down in sort priority"
+                        >
+                          ↓
+                        </button>
+                        <button
+                          type="button"
+                          className="order-by-remove"
+                          onClick={() => removeOrderField(index)}
+                          title="Remove from sort"
+                          aria-label="Remove from sort"
+                        >
+                          ×
+                        </button>
+                      </li>
+                    )
+                  })}
+                </ul>
+              )}
+              <select
+                className="order-by-add"
+                value=""
+                onChange={(event) => addOrderField(event.target.value)}
+                disabled={orderBy.length === ORDER_BY_FIELDS.length}
+              >
+                <option value="" disabled>
+                  {orderBy.length === ORDER_BY_FIELDS.length ? 'All fields added' : '+ Add sort field...'}
+                </option>
+                {ORDER_BY_FIELDS.filter((f) => !orderBy.some((entry) => entry.field === f.key)).map((f) => (
+                  <option key={f.key} value={f.key}>
+                    {f.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
         </div>
-        <div className="job-field report-page-size-field">
-          <span className="job-field-label">Page size</span>
-          <input
-            type="number"
-            min={1}
-            max={TRADING_SYMBOLS_MAX_PAGE_SIZE}
-            step={1}
-            value={pageSizeInput}
-            onChange={(event) => setPageSizeInput(Number(event.target.value))}
-            onBlur={() =>
-              setPageSizeInput((current) =>
-                Number.isFinite(current) ? Math.min(TRADING_SYMBOLS_MAX_PAGE_SIZE, Math.max(1, Math.round(current))) : DEFAULT_PAGE_SIZE,
-              )
-            }
-          />
+        <div className="report-controls-actions">
+          <button
+            type="button"
+            className="job-button job-button-primary"
+            disabled={loading || !Number.isFinite(pageSizeInput) || pageSizeInput < 1}
+            onClick={runReport}
+          >
+            {loading ? 'Running...' : 'Run report'}
+          </button>
+          <button type="button" className="job-button" onClick={saveParams}>
+            {paramsJustSaved ? 'Saved' : 'Save parameters'}
+          </button>
         </div>
-        <button
-          type="button"
-          className="job-button job-button-primary"
-          disabled={loading || !Number.isFinite(pageSizeInput) || pageSizeInput < 1}
-          onClick={runReport}
-        >
-          {loading ? 'Running...' : 'Run report'}
-        </button>
       </div>
 
       {error && <p className="jobs-error">{error}</p>}

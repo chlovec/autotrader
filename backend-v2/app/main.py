@@ -25,6 +25,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import func, or_, select
+from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.orm import Session
 
 from data.client import DataClient
@@ -587,10 +588,43 @@ def _symbol_to_dict(
 TRADING_SYMBOLS_MAX_PAGE_SIZE = 1000
 TRADING_SYMBOLS_DEFAULT_PAGE_SIZE = 500
 
+# order_by field keys accepted by trading_symbols_report, mapped to the column they sort
+# on. Ticker/name/type live on Ticker itself; todays_change_perc/day_volume live on
+# current_snapshots, hence the join added below - without it those two couldn't be
+# ordered on before the page is sliced out.
+TRADING_SYMBOLS_ORDERABLE_FIELDS: dict[str, ColumnElement] = {
+    "ticker": Ticker.ticker,
+    "name": Ticker.name,
+    "type": Ticker.type,
+    "todays_change_perc": CurrentSnapshot.todays_change_perc,
+    "day_volume": CurrentSnapshot.day_volume,
+}
+
+
+def _parse_order_by(order_by: str) -> list[tuple[str, str]]:
+    """Parses the `order_by` query param, e.g. "todays_change_perc:desc,ticker:asc",
+    into [("todays_change_perc", "desc"), ("ticker", "asc")] - the order of entries is
+    the caller's requested sort priority. Raises 422 on an unknown field or direction
+    rather than silently ignoring it, since this drives a paginated SQL ORDER BY and a
+    silently-dropped clause would be confusing (the report would just look unsorted)."""
+    fields: list[tuple[str, str]] = []
+    for entry in _split_csv(order_by) or []:
+        field, _, direction = entry.partition(":")
+        direction = direction.lower() or "asc"
+        if field not in TRADING_SYMBOLS_ORDERABLE_FIELDS:
+            raise HTTPException(422, f"Unknown order_by field: {field}")
+        if direction not in ("asc", "desc"):
+            raise HTTPException(422, f"Unknown order_by direction: {direction}")
+        fields.append((field, direction))
+    return fields
+
 
 @app.get("/reports/trading-symbols")
 def trading_symbols_report(
-    ticker_types: str = "", page: int = 1, page_size: int = TRADING_SYMBOLS_DEFAULT_PAGE_SIZE
+    ticker_types: str = "",
+    page: int = 1,
+    page_size: int = TRADING_SYMBOLS_DEFAULT_PAGE_SIZE,
+    order_by: str = "",
 ) -> dict[str, Any]:
     """Backs the Analytics > Trading Symbols page's report grid: every synced tickers
     row, joined out to its asset_class, most recently computed average_volumes row, and
@@ -599,23 +633,46 @@ def trading_symbols_report(
     tickers row to join against).
 
     Paginated - `page` (1-based) and `page_size` (capped at
-    TRADING_SYMBOLS_MAX_PAGE_SIZE) select a slice of the full tickers table, ordered by
-    ticker. average_volumes/current_snapshots are looked up only for that page's
-    tickers rather than loaded in full, so page_size bounds the work done per request
-    the same way it bounds the response size."""
+    TRADING_SYMBOLS_MAX_PAGE_SIZE) select a slice of the full tickers table.
+    average_volumes is looked up only for that page's tickers rather than loaded in
+    full, so page_size bounds the work done per request the same way it bounds the
+    response size.
+
+    `order_by` (see _parse_order_by) picks the sort priority among
+    TRADING_SYMBOLS_ORDERABLE_FIELDS, applied before the page is sliced out so it
+    orders the whole filtered set rather than just the returned page. Defaults to
+    ticker ascending, which is also always appended as a final tiebreaker so pagination
+    stays stable when the requested fields have ties (e.g. many tickers sharing the
+    same day_volume)."""
     types = _split_csv(ticker_types)
     page = max(1, page)
     page_size = max(1, min(page_size, TRADING_SYMBOLS_MAX_PAGE_SIZE))
+    order_fields = _parse_order_by(order_by) or [("ticker", "asc")]
+    if "ticker" not in {field for field, _ in order_fields}:
+        order_fields = [*order_fields, ("ticker", "asc")]
     with SessionLocal() as session:
-        base_query = select(Ticker)
         count_query = select(func.count(Ticker.ticker))
+        # current_snapshots is joined in (rather than looked up separately, as
+        # average_volumes still is below) so todays_change_perc/day_volume are
+        # available to order_by before LIMIT/OFFSET slices out the page - left join
+        # since a ticker that's never had sync-snapshots run against it still needs to
+        # appear.
+        base_query = select(Ticker, CurrentSnapshot).outerjoin(
+            CurrentSnapshot, CurrentSnapshot.ticker == Ticker.ticker
+        )
         if types:
             base_query = base_query.where(Ticker.type.in_(types))
             count_query = count_query.where(Ticker.type.in_(types))
         total = session.execute(count_query).scalar_one()
 
-        query = base_query.order_by(Ticker.ticker).limit(page_size).offset((page - 1) * page_size)
-        tickers = session.execute(query).scalars().all()
+        order_clauses = []
+        for field, direction in order_fields:
+            column = TRADING_SYMBOLS_ORDERABLE_FIELDS[field]
+            order_clauses.append((column.desc() if direction == "desc" else column.asc()).nulls_last())
+        query = base_query.order_by(*order_clauses).limit(page_size).offset((page - 1) * page_size)
+        page_rows = session.execute(query).all()
+        tickers = [ticker for ticker, _ in page_rows]
+        snapshot_by_ticker: dict[str, CurrentSnapshot | None] = {ticker.ticker: snapshot for ticker, snapshot in page_rows}
         ticker_codes = [ticker.ticker for ticker in tickers]
 
         # Same first-seen-per-code reasoning as top_movers_report.
@@ -641,18 +698,6 @@ def trading_symbols_report(
                     & (AverageVolume.computed_at == latest_computed_at.c.computed_at),
                 )
             ).all()
-        }
-
-        # current_snapshots is already one row per ticker (upsert-forever, no history),
-        # so unlike average_volumes there's no "latest" disambiguation needed here.
-        # Same page-scoping as average_volume_by_ticker above.
-        snapshot_by_ticker: dict[str, CurrentSnapshot] = {
-            snapshot.ticker: snapshot
-            for snapshot in session.execute(
-                select(CurrentSnapshot).where(CurrentSnapshot.ticker.in_(ticker_codes))
-            )
-            .scalars()
-            .all()
         }
 
         rows = [

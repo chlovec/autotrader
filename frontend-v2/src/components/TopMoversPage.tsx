@@ -1,7 +1,14 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api, type TickerTypeOption, type TopMarketMoverRow } from '../api'
+import { loadReportParams, saveReportParams } from '../reportParams'
 import { ReportGrid, type ReportColumn } from './ReportGrid'
 import { SearchableSelect, type SelectOption } from './SearchableSelect'
+
+const REPORT_PARAMS_ID = 'top-movers'
+
+type SavedParams = {
+  tickerTypes: string[]
+}
 
 // Backend caps /ticker-types/search's limit at 50 (see app/main.py's search_ticker_types) -
 // ticker_types is a short, mostly-static reference list (db/models.py's TickerType
@@ -66,7 +73,9 @@ function rowKey(row: TopMarketMoverRow): string {
 
 export function TopMoversPage() {
   const [tickerTypeOptions, setTickerTypeOptions] = useState<SelectOption[]>([])
-  const [tickerTypes, setTickerTypes] = useState<string[]>([])
+  const [tickerTypes, setTickerTypes] = useState<string[]>(
+    () => loadReportParams<SavedParams>(REPORT_PARAMS_ID)?.tickerTypes ?? [],
+  )
   const [rows, setRows] = useState<TopMarketMoverRow[] | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -92,6 +101,21 @@ export function TopMoversPage() {
     }
   }
 
+  // Persists the current draft controls so the next visit to this page restores them -
+  // separate from ReportGrid's own "Save view", which only covers sort/filter/freeze/
+  // hide/width on the grid itself, not these report-level controls.
+  const [paramsJustSaved, setParamsJustSaved] = useState(false)
+  const paramsSavedFlashTimeout = useRef<number | null>(null)
+  useEffect(() => () => {
+    if (paramsSavedFlashTimeout.current) window.clearTimeout(paramsSavedFlashTimeout.current)
+  }, [])
+  const saveParams = () => {
+    saveReportParams<SavedParams>(REPORT_PARAMS_ID, { tickerTypes })
+    setParamsJustSaved(true)
+    if (paramsSavedFlashTimeout.current) window.clearTimeout(paramsSavedFlashTimeout.current)
+    paramsSavedFlashTimeout.current = window.setTimeout(() => setParamsJustSaved(false), 1500)
+  }
+
   return (
     <div className="report-page">
       <h1 className="jobs-page-title">Top Movers</h1>
@@ -100,19 +124,26 @@ export function TopMoversPage() {
       </p>
 
       <div className="report-controls">
-        <div className="job-field report-ticker-type-field">
-          <span className="job-field-label">Ticker types</span>
-          <SearchableSelect
-            multiple
-            selected={tickerTypes}
-            onChange={setTickerTypes}
-            options={tickerTypeOptions}
-            placeholder="Search ticker types... (leave blank for all)"
-          />
+        <div className="report-controls-fields">
+          <div className="job-field report-ticker-type-field">
+            <span className="job-field-label">Ticker types</span>
+            <SearchableSelect
+              multiple
+              selected={tickerTypes}
+              onChange={setTickerTypes}
+              options={tickerTypeOptions}
+              placeholder="Search ticker types... (leave blank for all)"
+            />
+          </div>
         </div>
-        <button type="button" className="job-button job-button-primary" disabled={loading} onClick={runReport}>
-          {loading ? 'Running...' : 'Run report'}
-        </button>
+        <div className="report-controls-actions">
+          <button type="button" className="job-button job-button-primary" disabled={loading} onClick={runReport}>
+            {loading ? 'Running...' : 'Run report'}
+          </button>
+          <button type="button" className="job-button" onClick={saveParams}>
+            {paramsJustSaved ? 'Saved' : 'Save parameters'}
+          </button>
+        </div>
       </div>
 
       {error && <p className="jobs-error">{error}</p>}

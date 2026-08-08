@@ -942,10 +942,21 @@ body {
 
 .report-controls {
   display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.report-controls-fields {
+  display: flex;
   align-items: flex-end;
   gap: 12px;
   flex-wrap: wrap;
-  margin-bottom: 20px;
+}
+
+.report-controls-actions {
+  display: flex;
+  gap: 12px;
 }
 
 .report-ticker-type-field {
@@ -956,6 +967,109 @@ body {
 .report-page-size-field {
   flex: none;
   width: 120px;
+}
+
+.report-order-by-field {
+  min-width: 260px;
+  max-width: 420px;
+}
+
+/* Order-by picker (Trading Symbols report) - a priority-ordered list of fields the
+   report is sorted by, built up via the "Add sort field..." select below it. */
+.order-by-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.order-by-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.order-by-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--page);
+}
+
+.order-by-priority {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--surface-1);
+  color: var(--text-secondary);
+  font-size: 10px;
+  flex: none;
+}
+
+.order-by-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.order-by-dir-toggle,
+.order-by-move,
+.order-by-remove {
+  flex: none;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--page);
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.order-by-move,
+.order-by-remove {
+  width: 24px;
+  padding: 0;
+}
+
+.order-by-dir-toggle:hover,
+.order-by-move:not(:disabled):hover,
+.order-by-remove:hover {
+  color: var(--text-primary);
+  border-color: var(--text-secondary);
+}
+
+.order-by-move:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.order-by-add {
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--page);
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.order-by-add:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .report-pager {
