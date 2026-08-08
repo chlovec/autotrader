@@ -11,12 +11,21 @@ Two ways to trigger a sync, both built on fetch_and_store_bars:
 
 Both accept an optional ticker_types or tickers filter (mutually exclusive); if neither
 is given, every ticker in the tickers table is selected.
+
+Same shape as jobs/sync_snapshots.py/jobs/sync_indicators.py: a run selecting many
+tickers fans out across a ThreadPoolExecutor rather than fetching one ticker at a time,
+so a large selection still finishes in reasonable time. Each worker thread opens its own
+DataClient (bound to its own asyncio event loop, via asyncio.run) and its own DB
+session, so no state - HTTP connection or otherwise - is shared across threads; one
+ticker's failure is isolated and logged rather than aborting the rest.
 """
 
+import asyncio
+import concurrent.futures
 import datetime as dt
 import logging
 import os
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote
 
 from sqlalchemy import select
@@ -26,13 +35,14 @@ from sqlalchemy.orm import Session
 from data.client import DataClient
 from db.models import OhlcBar, Ticker, TickerBarSyncState
 from db.session import SessionLocal, init_db
-from jobs.control import JobControl
+from jobs.control import JobCancelled, JobControl
 
 logger = logging.getLogger("backend_v2.jobs.sync_bars")
 
 DEFAULT_MULTIPLIER = 1
 DEFAULT_TIMESPAN = "day"
 DEFAULT_BACKFILL_DAYS = int(os.environ.get("BARS_DEFAULT_BACKFILL_DAYS", "730"))
+DEFAULT_MAX_WORKERS = 8
 PAGE_LIMIT = 50_000
 
 # Polygon-style aggs result field -> OhlcBar column.
@@ -130,8 +140,82 @@ def _resolve_tickers(session: Session, ticker_types: list[str] | None, tickers: 
     return list(session.scalars(query))
 
 
-async def sync_bars_manual(
-    client: DataClient,
+def _fetch_and_store_one(
+    ticker: str,
+    start_date: dt.date,
+    end_date: dt.date,
+    multiplier: int,
+    timespan: str,
+    client_factory: Callable[[], DataClient],
+    control: JobControl | None = None,
+) -> int:
+    """Runs in a worker thread - mirrors jobs/sync_snapshots.py's _fetch_and_store_one:
+    `client_factory` builds a fresh DataClient bound to the event loop asyncio.run()
+    spins up here, so it can't be shared with another thread's loop, and this opens its
+    own DB session, committed independently of every other ticker's fetch.
+
+    `control`, if given, is checked before doing anything else (safe to block here since
+    this runs off the event loop) - a pause blocks this worker right here until resumed;
+    a cancel raises JobCancelled, which the caller below treats as "stop the whole run"
+    rather than "this ticker failed" the way every other exception here is treated.
+    """
+    if control is not None:
+        control.checkpoint_sync()
+
+    async def _fetch(session: Session) -> int:
+        async with client_factory() as client:
+            return await fetch_and_store_bars(
+                client, session, ticker, start_date, end_date, multiplier=multiplier, timespan=timespan
+            )
+
+    session = SessionLocal()
+    try:
+        return asyncio.run(_fetch(session))
+    finally:
+        session.close()
+
+
+def _run_pool(
+    jobs: dict[str, dt.date],
+    end_date: dt.date,
+    multiplier: int,
+    timespan: str,
+    max_workers: int,
+    client_factory: Callable[[], DataClient],
+    control: JobControl | None,
+    log_label: str,
+) -> dict[str, int]:
+    """Shared executor-driving loop for sync_bars_manual/sync_bars_nightly below - see
+    jobs/sync_snapshots.py's sync_snapshots, which this mirrors including its
+    JobCancelled handling: once any worker raises it, the rest of the
+    (already-submitted) queue is cancelled outright rather than left to run down one
+    near-instant checkpoint-raise at a time, and it's re-raised here so the caller
+    (app/main.py's _run_job) marks the run cancelled instead of completed. `jobs` maps
+    each selected ticker to its own start_date."""
+    results: dict[str, int] = {}
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+    try:
+        futures = {
+            executor.submit(
+                _fetch_and_store_one, ticker, start_date, end_date, multiplier, timespan, client_factory, control
+            ): ticker
+            for ticker, start_date in jobs.items()
+        }
+        for future in concurrent.futures.as_completed(futures):
+            ticker = futures[future]
+            try:
+                results[ticker] = future.result()
+            except JobCancelled:
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            except Exception:
+                logger.exception("%s bars sync failed for %s", log_label, ticker)
+    finally:
+        executor.shutdown(wait=True)
+    return results
+
+
+def sync_bars_manual(
     session: Session,
     start_date: dt.date,
     end_date: dt.date,
@@ -139,70 +223,53 @@ async def sync_bars_manual(
     tickers: list[str] | None = None,
     multiplier: int = DEFAULT_MULTIPLIER,
     timespan: str = DEFAULT_TIMESPAN,
+    max_workers: int = DEFAULT_MAX_WORKERS,
+    client_factory: Callable[[], DataClient] = DataClient,
     control: JobControl | None = None,
 ) -> dict[str, int]:
     """Fetches [start_date, end_date] for every selected ticker, regardless of what's
-    already synced. One ticker's failure doesn't stop the rest - see
-    engine/multi_runner.py at the repo root for the same per-item isolation pattern.
-
-    `control`, if given, is checked before each ticker (see jobs/control.py) - a pause
-    blocks right here until resumed, and a cancel raises JobCancelled, which is
-    deliberately *not* caught by the try/except below (unlike a real per-ticker
-    failure) so it unwinds the whole run instead of being logged and skipped."""
+    already synced, in parallel across a thread pool of `max_workers` workers - one
+    ticker's failure doesn't stop the rest - see engine/multi_runner.py at the repo root
+    for the same per-item isolation pattern. This is a blocking call; callers on an
+    event loop should run it via asyncio.to_thread (see app/main.py's _run_job)."""
     selected = _resolve_tickers(session, ticker_types, tickers)
-    results: dict[str, int] = {}
-    for ticker in selected:
-        if control is not None:
-            await control.checkpoint_async()
-        try:
-            results[ticker] = await fetch_and_store_bars(
-                client, session, ticker, start_date, end_date, multiplier=multiplier, timespan=timespan
-            )
-        except Exception:
-            logger.exception("manual bars sync failed for %s", ticker)
-    return results
+    jobs = {ticker: start_date for ticker in selected}
+    return _run_pool(jobs, end_date, multiplier, timespan, max_workers, client_factory, control, "manual")
 
 
-async def sync_bars_nightly(
-    client: DataClient,
+def sync_bars_nightly(
     session: Session,
     ticker_types: list[str] | None = None,
     tickers: list[str] | None = None,
     multiplier: int = DEFAULT_MULTIPLIER,
     timespan: str = DEFAULT_TIMESPAN,
     backfill_days: int = DEFAULT_BACKFILL_DAYS,
+    max_workers: int = DEFAULT_MAX_WORKERS,
+    client_factory: Callable[[], DataClient] = DataClient,
     control: JobControl | None = None,
 ) -> dict[str, int]:
     """Syncs every selected ticker through yesterday, skipping any already synced
-    through yesterday. A ticker with no prior TickerBarSyncState row backfills the last
-    backfill_days days; one that has a cursor resumes the day after it.
-
-    `control`, if given, is checked before each ticker - see sync_bars_manual's
-    docstring above; the same reasoning applies here."""
+    through yesterday, in parallel across a thread pool of `max_workers` workers. A
+    ticker with no prior TickerBarSyncState row backfills the last backfill_days days;
+    one that has a cursor resumes the day after it. Each selected ticker's start date is
+    resolved up front (cheap local TickerBarSyncState lookups, not worth a checkpoint of
+    their own) before fanning out - see _fetch_and_store_one for where `control` is
+    actually checked, once per ticker, right before its (slow) HTTP fetch."""
     end_date = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)
     selected = _resolve_tickers(session, ticker_types, tickers)
 
-    results: dict[str, int] = {}
+    jobs: dict[str, dt.date] = {}
     for ticker in selected:
-        if control is not None:
-            await control.checkpoint_async()
         state = session.get(TickerBarSyncState, (ticker, multiplier, timespan))
         if state is not None and state.synced_through >= end_date:
             continue  # already up to date
-
-        start_date = (
+        jobs[ticker] = (
             state.synced_through + dt.timedelta(days=1)
             if state is not None
             else end_date - dt.timedelta(days=backfill_days)
         )
 
-        try:
-            results[ticker] = await fetch_and_store_bars(
-                client, session, ticker, start_date, end_date, multiplier=multiplier, timespan=timespan
-            )
-        except Exception:
-            logger.exception("nightly bars sync failed for %s", ticker)
-    return results
+    return _run_pool(jobs, end_date, multiplier, timespan, max_workers, client_factory, control, "nightly")
 
 
 def _env_list(var_name: str) -> list[str] | None:
@@ -217,16 +284,24 @@ async def run_manual(
     tickers: list[str] | None = None,
     multiplier: int = DEFAULT_MULTIPLIER,
     timespan: str = DEFAULT_TIMESPAN,
+    max_workers: int = DEFAULT_MAX_WORKERS,
 ) -> dict[str, int]:
     init_db()
-    async with DataClient() as client:
-        session = SessionLocal()
-        try:
-            return await sync_bars_manual(
-                client, session, start_date, end_date, ticker_types, tickers, multiplier, timespan
-            )
-        finally:
-            session.close()
+    session = SessionLocal()
+    try:
+        return await asyncio.to_thread(
+            sync_bars_manual,
+            session,
+            start_date,
+            end_date,
+            ticker_types,
+            tickers,
+            multiplier,
+            timespan,
+            max_workers,
+        )
+    finally:
+        session.close()
 
 
 async def run_nightly() -> dict[str, int]:
@@ -238,11 +313,10 @@ async def run_nightly() -> dict[str, int]:
     multiplier = int(os.environ.get("BARS_MULTIPLIER", str(DEFAULT_MULTIPLIER)))
     timespan = os.environ.get("BARS_TIMESPAN", DEFAULT_TIMESPAN)
 
-    async with DataClient() as client:
-        session = SessionLocal()
-        try:
-            return await sync_bars_nightly(
-                client, session, ticker_types, tickers, multiplier=multiplier, timespan=timespan
-            )
-        finally:
-            session.close()
+    session = SessionLocal()
+    try:
+        return await asyncio.to_thread(
+            sync_bars_nightly, session, ticker_types, tickers, multiplier=multiplier, timespan=timespan
+        )
+    finally:
+        session.close()

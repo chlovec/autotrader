@@ -1,4 +1,6 @@
 import datetime as dt
+import threading
+import time
 
 import httpx
 import pytest
@@ -6,6 +8,7 @@ import pytest
 from data.client import DataClient
 from db.models import OhlcBar, Ticker, TickerBarSyncState
 from db.session import SessionLocal, init_db
+from jobs.control import JobCancelled, JobControl
 from jobs.sync_bars import fetch_and_store_bars, sync_bars_manual, sync_bars_nightly
 
 
@@ -91,39 +94,103 @@ async def test_fetch_and_store_bars_never_rewinds_cursor():
             session.close()
 
 
-async def test_sync_bars_manual_defaults_to_all_tickers_and_isolates_failures():
+def test_sync_bars_manual_defaults_to_all_tickers_and_isolates_failures():
     session = SessionLocal()
     session.add_all([Ticker(ticker="AAA", type="CS"), Ticker(ticker="BBB", type="CS")])
     session.commit()
-    session.close()
 
     def handler(request: httpx.Request) -> httpx.Response:
         if "/ticker/AAA/" in request.url.path:
             return httpx.Response(500, json={"error": "boom"})
         return httpx.Response(200, json={"results": [_bar(dt.date(2024, 1, 1), 1.0)]})
 
-    async with _client_with_handler(handler) as client:
-        session = SessionLocal()
-        try:
-            results = await sync_bars_manual(client, session, dt.date(2024, 1, 1), dt.date(2024, 1, 1))
-        finally:
-            session.close()
+    try:
+        results = sync_bars_manual(
+            session,
+            dt.date(2024, 1, 1),
+            dt.date(2024, 1, 1),
+            client_factory=lambda: _client_with_handler(handler),
+        )
+    finally:
+        session.close()
 
     assert results == {"BBB": 1}  # AAA's failure didn't stop BBB or blow up the run
 
 
-async def test_sync_bars_manual_rejects_tickers_and_ticker_types_together():
+def test_sync_bars_manual_rejects_tickers_and_ticker_types_together():
     session = SessionLocal()
     try:
         with pytest.raises(ValueError):
-            await sync_bars_manual(
-                None, session, dt.date(2024, 1, 1), dt.date(2024, 1, 1), ticker_types=["CS"], tickers=["AAA"]
+            sync_bars_manual(
+                session, dt.date(2024, 1, 1), dt.date(2024, 1, 1), ticker_types=["CS"], tickers=["AAA"]
             )
     finally:
         session.close()
 
 
-async def test_sync_bars_nightly_skips_up_to_date_and_resumes_from_cursor():
+def test_sync_bars_manual_cancel_stops_the_run_and_raises_job_cancelled():
+    session = SessionLocal()
+    session.add_all([Ticker(ticker="AAA"), Ticker(ticker="BBB"), Ticker(ticker="CCC")])
+    session.commit()
+
+    control = JobControl()
+    control.request_cancel()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": [_bar(dt.date(2024, 1, 1), 1.0)]})
+
+    try:
+        with pytest.raises(JobCancelled):
+            sync_bars_manual(
+                session,
+                dt.date(2024, 1, 1),
+                dt.date(2024, 1, 1),
+                tickers=["AAA", "BBB", "CCC"],
+                client_factory=lambda: _client_with_handler(handler),
+                control=control,
+            )
+
+        # Cancelled before any worker's checkpoint let it through, so nothing fetched.
+        assert session.query(OhlcBar).count() == 0
+    finally:
+        session.close()
+
+
+def test_sync_bars_manual_pause_blocks_a_worker_until_resumed():
+    session = SessionLocal()
+    session.add(Ticker(ticker="AAA"))
+    session.commit()
+
+    control = JobControl()
+    control.request_pause()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": [_bar(dt.date(2024, 1, 1), 1.0)]})
+
+    def resume_shortly():
+        time.sleep(0.05)
+        control.request_resume()
+
+    resumer = threading.Thread(target=resume_shortly)
+    resumer.start()
+    try:
+        results = sync_bars_manual(
+            session,
+            dt.date(2024, 1, 1),
+            dt.date(2024, 1, 1),
+            tickers=["AAA"],
+            client_factory=lambda: _client_with_handler(handler),
+            control=control,
+        )
+
+        assert results == {"AAA": 1}
+        assert session.query(OhlcBar).count() == 1
+    finally:
+        session.close()
+        resumer.join()
+
+
+def test_sync_bars_nightly_skips_up_to_date_and_resumes_from_cursor():
     yesterday = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)
 
     session = SessionLocal()
@@ -135,23 +202,44 @@ async def test_sync_bars_nightly_skips_up_to_date_and_resumes_from_cursor():
         )
     )
     session.commit()
-    session.close()
 
+    lock = threading.Lock()
     requested_ranges: dict[str, tuple[str, str]] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         parts = request.url.path.split("/")
         ticker, start, end = parts[4], parts[-2], parts[-1]
-        requested_ranges[ticker] = (start, end)
+        with lock:
+            requested_ranges[ticker] = (start, end)
         return httpx.Response(200, json={"results": [_bar(dt.date(2024, 1, 1), 1.0)]})
 
-    async with _client_with_handler(handler) as client:
-        session = SessionLocal()
-        try:
-            results = await sync_bars_nightly(client, session, backfill_days=730)
-        finally:
-            session.close()
+    try:
+        results = sync_bars_nightly(
+            session, backfill_days=730, client_factory=lambda: _client_with_handler(handler)
+        )
+    finally:
+        session.close()
 
     assert "UPTODATE" not in results  # already synced through yesterday - skipped entirely
     assert requested_ranges["RESUME"] == ((yesterday - dt.timedelta(days=4)).isoformat(), yesterday.isoformat())
     assert requested_ranges["NEVER"] == ((yesterday - dt.timedelta(days=730)).isoformat(), yesterday.isoformat())
+
+
+def test_sync_bars_nightly_cancel_stops_the_run_and_raises_job_cancelled():
+    session = SessionLocal()
+    session.add_all([Ticker(ticker="AAA"), Ticker(ticker="BBB")])
+    session.commit()
+
+    control = JobControl()
+    control.request_cancel()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": [_bar(dt.date(2024, 1, 1), 1.0)]})
+
+    try:
+        with pytest.raises(JobCancelled):
+            sync_bars_nightly(session, client_factory=lambda: _client_with_handler(handler), control=control)
+
+        assert session.query(OhlcBar).count() == 0
+    finally:
+        session.close()

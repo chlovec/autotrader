@@ -24,14 +24,16 @@ from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from data.client import DataClient
-from db.models import JobConfig, JobRun, Ticker, TickerType, TopMarketMover
+from db.models import AverageVolume, JobConfig, JobRun, Ticker, TickerType, TopMarketMover
 from db.session import SessionLocal, init_db
+from jobs.average_volume import DEFAULT_DAYS_INTERVAL, compute_average_volume
 from jobs.control import JobCancelled, JobControl
 from jobs.registry import (
+    AVERAGE_VOLUME_JOB,
     BARS_JOB,
     DEFAULT_SCHEDULES,
     DEFAULT_START_TIME,
@@ -165,6 +167,20 @@ async def _run_job(job_name: str, trigger: str) -> None:
                 control=control,
             )
             summary = f"{count} snapshot(s) synced"
+        elif job_name == AVERAGE_VOLUME_JOB:
+            # Purely local aggregation over already-synced bars - no DataClient needed,
+            # just a blocking DB query, so this runs via asyncio.to_thread the same way
+            # the snapshots/indicator branches do to keep it off the event loop.
+            count = await asyncio.to_thread(
+                compute_average_volume,
+                session,
+                config.average_volume_start_date,
+                config.average_volume_days_interval or DEFAULT_DAYS_INTERVAL,
+                _split_csv(config.ticker_types),
+                _split_csv(config.tickers),
+                control=control,
+            )
+            summary = f"{count} ticker(s) average volume computed"
         elif job_name in INDICATOR_NAMES:
             # Same no-shared-DataClient reasoning as the snapshots branch above -
             # sync_indicator fans out across its own thread pool of per-worker clients.
@@ -178,6 +194,21 @@ async def _run_job(job_name: str, trigger: str) -> None:
                 control=control,
             )
             summary = f"{count} {indicator} value(s) synced"
+        elif job_name == BARS_JOB:
+            # No shared DataClient here - sync_bars_nightly fans out across a thread
+            # pool the same way sync_snapshots/sync_indicator do (see
+            # jobs/sync_bars.py), so this runs via asyncio.to_thread too.
+            results = await asyncio.to_thread(
+                sync_bars_nightly,
+                session,
+                _split_csv(config.ticker_types),
+                _split_csv(config.tickers),
+                multiplier=config.multiplier or DEFAULT_MULTIPLIER,
+                timespan=config.timespan or DEFAULT_TIMESPAN,
+                backfill_days=config.backfill_days or DEFAULT_BACKFILL_DAYS,
+                control=control,
+            )
+            summary = f"{len(results)} ticker(s) synced, {sum(results.values())} bar(s) fetched"
         else:
             async with DataClient() as client:
                 if job_name == TICKERS_JOB:
@@ -194,23 +225,12 @@ async def _run_job(job_name: str, trigger: str) -> None:
                 elif job_name == NEWS_JOB:
                     count = await sync_news(client, session, control=control)
                     summary = f"{count} news article(s) synced"
-                elif job_name == UNIFIED_SNAPSHOT_JOB:
+                else:
+                    assert job_name == UNIFIED_SNAPSHOT_JOB
                     results = await sync_unified_snapshot(
                         client, session, _split_csv(config.snapshot_types), control=control
                     )
                     summary = ", ".join(f"{t}: {n}" for t, n in results.items())
-                else:
-                    results = await sync_bars_nightly(
-                        client,
-                        session,
-                        _split_csv(config.ticker_types),
-                        _split_csv(config.tickers),
-                        multiplier=config.multiplier or DEFAULT_MULTIPLIER,
-                        timespan=config.timespan or DEFAULT_TIMESPAN,
-                        backfill_days=config.backfill_days or DEFAULT_BACKFILL_DAYS,
-                        control=control,
-                    )
-                    summary = f"{len(results)} ticker(s) synced, {sum(results.values())} bar(s) fetched"
         run = session.get(JobRun, run_id)
         assert run is not None
         run.status = "completed"
@@ -342,6 +362,7 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         "has_ticker_type_filter": definition.has_ticker_type_filter,
         "has_ticker_selector": definition.has_ticker_selector,
         "has_snapshot_type_filter": definition.has_snapshot_type_filter,
+        "has_average_volume_fields": definition.has_average_volume_fields,
         "snapshot_type_options": SNAPSHOT_TYPE_OPTIONS,
         "run_type": config.run_type,
         "schedule_interval_unit": config.schedule_interval_unit,
@@ -354,6 +375,10 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         "timespan": config.timespan,
         "backfill_days": config.backfill_days,
         "snapshot_types": config.snapshot_types,
+        "average_volume_start_date": (
+            config.average_volume_start_date.isoformat() if config.average_volume_start_date else None
+        ),
+        "average_volume_days_interval": config.average_volume_days_interval,
         "running": _job_locks[job_name].locked(),
         "paused": job_name in _job_controls and _job_controls[job_name].pause_requested,
         "last_run": _run_to_dict(last_run) if last_run is not None else None,
@@ -376,6 +401,8 @@ class JobConfigIn(BaseModel):
     timespan: str | None = None
     backfill_days: int | None = None
     snapshot_types: str | None = None
+    average_volume_start_date: str | None = None
+    average_volume_days_interval: int | None = None
 
 
 @app.get("/health")
@@ -424,12 +451,15 @@ def search_tickers(q: str = "", limit: int = 20) -> list[dict]:
         return [{"ticker": row.ticker, "name": row.name} for row in rows]
 
 
-def _mover_to_dict(mover: TopMarketMover, ticker: Ticker | None, asset_class: str | None) -> dict[str, Any]:
+def _mover_to_dict(
+    mover: TopMarketMover, ticker: Ticker | None, asset_class: str | None, average_volume: float | None
+) -> dict[str, Any]:
     return {
         "ticker": mover.ticker,
         "name": ticker.name if ticker else None,
         "type": ticker.type if ticker else None,
         "asset_class": asset_class,
+        "average_volume": average_volume,
         "direction": mover.direction,
         "rank": mover.rank,
         "todays_change": mover.todays_change,
@@ -462,11 +492,12 @@ def _mover_to_dict(mover: TopMarketMover, ticker: Ticker | None, asset_class: st
 @app.get("/reports/top-movers")
 def top_movers_report(ticker_types: str = "") -> list[dict]:
     """Backs the Analytics > Top Movers page's report grid: today's top_market_movers
-    rows (both directions), each joined out to its tickers row for name/type. Filtering
-    by ticker_types (0 or more, comma-separated codes from the same ticker_types
-    reference list as the Jobs page's TickerType combobox) inner-joins instead of left-
-    joins - a mover with no matching tickers row has no `type` to filter on anyway, so
-    it can never satisfy a non-empty filter."""
+    rows (both directions), each joined out to its tickers row for name/type and to its
+    most recently computed average_volumes row. Filtering by ticker_types (0 or more,
+    comma-separated codes from the same ticker_types reference list as the Jobs page's
+    TickerType combobox) inner-joins instead of left-joins - a mover with no matching
+    tickers row has no `type` to filter on anyway, so it can never satisfy a non-empty
+    filter."""
     types = _split_csv(ticker_types)
     with SessionLocal() as session:
         query = select(TopMarketMover, Ticker).join(
@@ -485,8 +516,33 @@ def top_movers_report(ticker_types: str = "") -> list[dict]:
         for code, asset_class in session.execute(select(TickerType.code, TickerType.asset_class)).all():
             asset_class_by_code.setdefault(code, asset_class)
 
+        # average_volumes accumulates one row per (ticker, start_date, days_interval) -
+        # "latest" means the row from that ticker's most recent job run, so this joins
+        # each ticker back to whichever row carries the max computed_at rather than the
+        # max start_date (which, unlike computed_at, isn't unique per run if a ticker is
+        # ever computed under more than one days_interval on the same start_date).
+        latest_computed_at = select(
+            AverageVolume.ticker, func.max(AverageVolume.computed_at).label("computed_at")
+        ).group_by(AverageVolume.ticker)
+        latest_computed_at = latest_computed_at.subquery()
+        average_volume_by_ticker: dict[str, float | None] = {
+            ticker: average_volume
+            for ticker, average_volume in session.execute(
+                select(AverageVolume.ticker, AverageVolume.average_volume).join(
+                    latest_computed_at,
+                    (AverageVolume.ticker == latest_computed_at.c.ticker)
+                    & (AverageVolume.computed_at == latest_computed_at.c.computed_at),
+                )
+            ).all()
+        }
+
         return [
-            _mover_to_dict(mover, ticker, asset_class_by_code.get(ticker.type) if ticker and ticker.type else None)
+            _mover_to_dict(
+                mover,
+                ticker,
+                asset_class_by_code.get(ticker.type) if ticker and ticker.type else None,
+                average_volume_by_ticker.get(mover.ticker),
+            )
             for mover, ticker in rows
         ]
 
@@ -517,6 +573,16 @@ def update_job_config(job_name: str, body: JobConfigIn) -> dict:
         invalid := set(_split_csv(body.snapshot_types) or []) - set(SNAPSHOT_TYPE_OPTIONS)
     ):
         raise HTTPException(status_code=400, detail=f"invalid snapshot_types: {', '.join(sorted(invalid))}")
+    if body.average_volume_days_interval is not None and body.average_volume_days_interval < 1:
+        raise HTTPException(status_code=400, detail="average_volume_days_interval must be at least 1")
+    average_volume_start_date: dt.date | None = None
+    if body.average_volume_start_date is not None:
+        try:
+            average_volume_start_date = dt.date.fromisoformat(body.average_volume_start_date)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail="average_volume_start_date must be an ISO date, e.g. '2026-08-06'"
+            ) from exc
 
     with SessionLocal() as session:
         definition = JOB_DEFINITIONS[job_name]
@@ -540,6 +606,12 @@ def update_job_config(job_name: str, body: JobConfigIn) -> dict:
             config.timespan = body.timespan
             config.backfill_days = body.backfill_days
         config.snapshot_types = body.snapshot_types if definition.has_snapshot_type_filter else None
+        if definition.has_average_volume_fields:
+            config.average_volume_start_date = average_volume_start_date
+            config.average_volume_days_interval = body.average_volume_days_interval
+        else:
+            config.average_volume_start_date = None
+            config.average_volume_days_interval = None
         config.updated_at = dt.datetime.utcnow()
         session.commit()
 

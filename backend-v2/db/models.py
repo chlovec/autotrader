@@ -310,6 +310,29 @@ class TechnicalIndicator(Base):
     fetched_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
 
 
+class AverageVolume(Base):
+    """One row per (ticker, start_date, days_interval), the mean daily `ohlc_bars.volume`
+    across the `days_interval` calendar days ending on (and including) `start_date`, for
+    daily (multiplier=1, timespan="day") bars. Computed locally by
+    jobs/average_volume.py from bars already synced by jobs/sync_bars.py - no massive.com
+    call involved. Upserted - a re-run with the same start_date/days_interval overwrites
+    the prior average rather than accumulating rows, since it's a derived statistic
+    recomputed from ohlc_bars, not a fetched time series point.
+
+    bar_count is how many of the window's daily bars actually existed for this ticker -
+    useful to tell a full 50-day average apart from one computed off a newly-listed
+    ticker with only a handful of days synced."""
+
+    __tablename__ = "average_volumes"
+
+    ticker: Mapped[str] = mapped_column(ForeignKey("tickers.ticker"), primary_key=True)
+    start_date: Mapped[dt.date] = mapped_column(Date, primary_key=True)
+    days_interval: Mapped[int] = mapped_column(Integer, primary_key=True)
+    average_volume: Mapped[float | None] = mapped_column(Float)
+    bar_count: Mapped[int] = mapped_column(Integer)
+    computed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
+
+
 class News(Base):
     """One row per article returned by GET /v2/reference/news, keyed by massive.com's
     own article `id` rather than by ticker - a single article often covers more than
@@ -372,7 +395,15 @@ class JobConfig(Base):
     snapshot job (registry.JobDefinition.has_snapshot_type_filter), filtering by
     massive.com's own asset-class `type` query param (see registry.SNAPSHOT_TYPE_OPTIONS
     and jobs/sync_unified_snapshot.py) rather than by anything in the tickers table.
-    Comma-separated; left None to sync every asset class."""
+    Comma-separated; left None to sync every asset class.
+
+    average_volume_start_date/average_volume_days_interval only apply to the average-
+    volume job (registry.JobDefinition.has_average_volume_fields). Both are left None by
+    default rather than seeded with a concrete value at config-creation time the way
+    bars' multiplier/timespan/backfill_days are - jobs/average_volume.py resolves a None
+    start date to "yesterday" and a None days interval to 50 at *run* time, so a job left
+    on defaults tracks "yesterday" on every run instead of freezing to whatever date its
+    config row happened to be created on."""
 
     __tablename__ = "job_configs"
 
@@ -387,6 +418,8 @@ class JobConfig(Base):
     timespan: Mapped[str | None] = mapped_column(String)
     backfill_days: Mapped[int | None] = mapped_column(Integer)
     snapshot_types: Mapped[str | None] = mapped_column(String)
+    average_volume_start_date: Mapped[dt.date | None] = mapped_column(Date)
+    average_volume_days_interval: Mapped[int | None] = mapped_column(Integer)
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False), default=dt.datetime.utcnow)
 
 

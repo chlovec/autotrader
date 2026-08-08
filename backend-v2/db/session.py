@@ -21,6 +21,7 @@ def init_db() -> None:
     Base.metadata.create_all(engine)
     _add_job_configs_start_time_column()
     _add_job_configs_snapshot_types_column()
+    _add_job_configs_average_volume_columns()
 
 
 def _add_job_configs_column(column: str, ddl_type: str) -> None:
@@ -48,6 +49,11 @@ def _add_job_configs_start_time_column() -> None:
 
 def _add_job_configs_snapshot_types_column() -> None:
     _add_job_configs_column("snapshot_types", "VARCHAR")
+
+
+def _add_job_configs_average_volume_columns() -> None:
+    _add_job_configs_column("average_volume_start_date", "DATE")
+    _add_job_configs_column("average_volume_days_interval", "INTEGER")
 
 
 def get_session() -> Session:

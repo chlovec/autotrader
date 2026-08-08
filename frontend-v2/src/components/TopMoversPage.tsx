@@ -18,6 +18,7 @@ const COLUMNS: ReportColumn<TopMarketMoverRow>[] = [
   { key: 'name', label: 'Name' },
   { key: 'type', label: 'Type' },
   { key: 'asset_class', label: 'Asset Class' },
+  { key: 'average_volume', label: 'Average Volume' },
   { key: 'direction', label: 'Direction' },
   { key: 'rank', label: 'Rank' },
   { key: 'todays_change', label: "Today's Change" },

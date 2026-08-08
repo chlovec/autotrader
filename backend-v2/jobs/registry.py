@@ -18,6 +18,7 @@ SMA_JOB = "sync-sma"
 EMA_JOB = "sync-ema"
 MACD_JOB = "sync-macd"
 RSI_JOB = "sync-rsi"
+AVERAGE_VOLUME_JOB = "average-volume"
 
 # job name -> massive.com indicator path segment (GET /v1/indicators/{indicator}/
 # {ticker}) - jobs/sync_indicators.py's sync_indicator takes the latter, app/main.py's
@@ -55,6 +56,7 @@ DEFAULT_SCHEDULES: dict[str, tuple[str, int]] = {
     EMA_JOB: ("days", 1),
     MACD_JOB: ("days", 1),
     RSI_JOB: ("days", 1),
+    AVERAGE_VOLUME_JOB: ("days", 1),
 }
 
 
@@ -85,6 +87,12 @@ class JobDefinition:
     # has_ticker_type_filter/has_ticker_selector this doesn't touch the tickers table
     # at all, so it's an independent flag rather than layered onto those.
     has_snapshot_type_filter: bool = False
+    # Whether this job offers the "Start date"/"Days interval" pair (see
+    # jobs/average_volume.py) - only the average-volume job takes this. Independent of
+    # the other flags: it doesn't touch the tickers table's type filter at all, though
+    # the average-volume job also layers has_ticker_selector on top to scope which
+    # tickers get computed.
+    has_average_volume_fields: bool = False
     # Seeded into JobConfig.run_type the first time this job's config row is created
     # (see app/main.py's _get_or_create_config). "auto" unless overridden below.
     default_run_type: str = "auto"
@@ -188,4 +196,20 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
         )
         for job_name, indicator in INDICATOR_NAMES.items()
     },
+    AVERAGE_VOLUME_JOB: JobDefinition(
+        name=AVERAGE_VOLUME_JOB,
+        label="Average volume",
+        description=(
+            "Computes each selected ticker's average daily ohlc_bars.volume across the "
+            "days-interval calendar days ending on start date, and stores it in the "
+            "average_volumes table. Purely local - no massive.com call, reads bars "
+            "already synced by the bars job."
+        ),
+        has_bars_fields=False,
+        has_ticker_selector=True,
+        has_average_volume_fields=True,
+        # Run-on-demand statistic over already-synced bars, no natural daily cadence of
+        # its own - manual by default, same reasoning as ticker-types/snapshots/movers.
+        default_run_type="manual",
+    ),
 }

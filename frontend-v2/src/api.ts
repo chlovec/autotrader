@@ -35,6 +35,7 @@ export interface Job {
   has_ticker_type_filter: boolean
   has_ticker_selector: boolean
   has_snapshot_type_filter: boolean
+  has_average_volume_fields: boolean
   // Always the full massive.com asset-class list (jobs/registry.py's
   // SNAPSHOT_TYPE_OPTIONS), regardless of has_snapshot_type_filter - fetched from the
   // backend rather than hardcoded here so the two never drift.
@@ -50,6 +51,10 @@ export interface Job {
   timespan: string | null
   backfill_days: number | null
   snapshot_types: string | null
+  // ISO date ("YYYY-MM-DD"), or null to default to yesterday (UTC) at run time - see
+  // backend-v2 jobs/average_volume.py's compute_average_volume.
+  average_volume_start_date: string | null
+  average_volume_days_interval: number | null
   running: boolean
   // Only meaningful while running - a job that isn't running can't be paused. Reflects
   // a pause *request*, not confirmation the run has actually parked at a checkpoint
@@ -69,6 +74,8 @@ export interface JobConfigInput {
   timespan?: string | null
   backfill_days?: number | null
   snapshot_types?: string | null
+  average_volume_start_date?: string | null
+  average_volume_days_interval?: number | null
 }
 
 export interface TickerOption {
@@ -89,6 +96,7 @@ export interface TopMarketMoverRow {
   name: string | null
   type: string | null
   asset_class: string | null
+  average_volume: number | null
   direction: string
   rank: number
   todays_change: number | null

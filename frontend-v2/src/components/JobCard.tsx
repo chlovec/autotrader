@@ -91,6 +91,8 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
   const [timespan, setTimespan] = useState(job.timespan ?? 'day')
   const [backfillDays, setBackfillDays] = useState(job.backfill_days ?? 730)
   const [snapshotTypes, setSnapshotTypes] = useState<string[]>(() => parseCsv(job.snapshot_types))
+  const [averageVolumeStartDate, setAverageVolumeStartDate] = useState(job.average_volume_start_date ?? '')
+  const [averageVolumeDaysInterval, setAverageVolumeDaysInterval] = useState(job.average_volume_days_interval ?? 50)
 
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
@@ -129,6 +131,12 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
             }
           : {}),
         ...(job.has_snapshot_type_filter ? { snapshot_types: toCsv(snapshotTypes) } : {}),
+        ...(job.has_average_volume_fields
+          ? {
+              average_volume_start_date: averageVolumeStartDate || null,
+              average_volume_days_interval: averageVolumeDaysInterval,
+            }
+          : {}),
       })
       onSaved(updated)
     } catch (err) {
@@ -379,9 +387,12 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
                 </div>
               )}
 
-              {!job.has_ticker_selector && !job.has_ticker_type_filter && !job.has_snapshot_type_filter && (
-                <p className="job-field-hint">This job has no run parameters to configure.</p>
-              )}
+              {!job.has_ticker_selector &&
+                !job.has_ticker_type_filter &&
+                !job.has_snapshot_type_filter &&
+                !job.has_average_volume_fields && (
+                  <p className="job-field-hint">This job has no run parameters to configure.</p>
+                )}
 
               {job.has_snapshot_type_filter && (
                 <>
@@ -472,6 +483,33 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
                     />
                   </label>
                 </div>
+              )}
+
+              {job.has_average_volume_fields && (
+                <>
+                  <div className="job-field-row">
+                    <label className="job-field">
+                      Start date (UTC)
+                      <input
+                        type="date"
+                        value={averageVolumeStartDate}
+                        onChange={(e) => setAverageVolumeStartDate(e.target.value)}
+                      />
+                    </label>
+                    <label className="job-field">
+                      Days interval
+                      <input
+                        type="number"
+                        min={1}
+                        value={averageVolumeDaysInterval}
+                        onChange={(e) => setAverageVolumeDaysInterval(Number(e.target.value))}
+                      />
+                    </label>
+                  </div>
+                  <p className="job-field-hint">
+                    Leave start date blank to default to yesterday (UTC) at run time. Days interval defaults to 50.
+                  </p>
+                </>
               )}
             </div>
 
