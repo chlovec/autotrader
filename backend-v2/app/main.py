@@ -379,6 +379,7 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
             config.average_volume_start_date.isoformat() if config.average_volume_start_date else None
         ),
         "average_volume_days_interval": config.average_volume_days_interval,
+        "hidden": config.hidden,
         "running": _job_locks[job_name].locked(),
         "paused": job_name in _job_controls and _job_controls[job_name].pause_requested,
         "last_run": _run_to_dict(last_run) if last_run is not None else None,
@@ -667,6 +668,26 @@ def cancel_job(job_name: str) -> dict:
     control = _require_running(job_name)
     control.request_cancel()
     return {"status": "cancel-requested"}
+
+
+@app.post("/jobs/{job_name}/hide")
+def hide_job(job_name: str) -> dict:
+    _require_job(job_name)
+    with SessionLocal() as session:
+        config = _get_or_create_config(session, job_name)
+        config.hidden = True
+        session.commit()
+        return _job_to_dict(session, job_name)
+
+
+@app.post("/jobs/{job_name}/unhide")
+def unhide_job(job_name: str) -> dict:
+    _require_job(job_name)
+    with SessionLocal() as session:
+        config = _get_or_create_config(session, job_name)
+        config.hidden = False
+        session.commit()
+        return _job_to_dict(session, job_name)
 
 
 @app.get("/jobs/{job_name}/runs")

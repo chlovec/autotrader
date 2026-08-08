@@ -55,6 +55,10 @@ export interface Job {
   // backend-v2 jobs/average_volume.py's compute_average_volume.
   average_volume_start_date: string | null
   average_volume_days_interval: number | null
+  // Persisted (JobConfig.hidden), not display-only - keeps a job off the Jobs page's
+  // default list across reloads until explicitly unhidden. Independent of running/
+  // paused: a hidden job still runs on its schedule, it's just tucked away here.
+  hidden: boolean
   running: boolean
   // Only meaningful while running - a job that isn't running can't be paused. Reflects
   // a pause *request*, not confirmation the run has actually parked at a checkpoint
@@ -169,6 +173,8 @@ export const api = {
   pauseJob: (name: string) => postJSON<{ status: string }>(`/jobs/${name}/pause`),
   resumeJob: (name: string) => postJSON<{ status: string }>(`/jobs/${name}/resume`),
   cancelJob: (name: string) => postJSON<{ status: string }>(`/jobs/${name}/cancel`),
+  hideJob: (name: string) => postJSON<Job>(`/jobs/${name}/hide`),
+  unhideJob: (name: string) => postJSON<Job>(`/jobs/${name}/unhide`),
   searchTickers: (q: string, limit = 20) =>
     getJSON<TickerOption[]>(`/tickers/search?q=${encodeURIComponent(q)}&limit=${limit}`),
   searchTickerTypes: (q: string, limit = 20) =>

@@ -22,6 +22,7 @@ def init_db() -> None:
     _add_job_configs_start_time_column()
     _add_job_configs_snapshot_types_column()
     _add_job_configs_average_volume_columns()
+    _add_job_configs_hidden_column()
 
 
 def _add_job_configs_column(column: str, ddl_type: str) -> None:
@@ -54,6 +55,10 @@ def _add_job_configs_snapshot_types_column() -> None:
 def _add_job_configs_average_volume_columns() -> None:
     _add_job_configs_column("average_volume_start_date", "DATE")
     _add_job_configs_column("average_volume_days_interval", "INTEGER")
+
+
+def _add_job_configs_hidden_column() -> None:
+    _add_job_configs_column("hidden", "BOOLEAN DEFAULT 0")
 
 
 def get_session() -> Session:

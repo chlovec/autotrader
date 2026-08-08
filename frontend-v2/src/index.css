@@ -176,12 +176,19 @@ body {
   min-height: 0;
 }
 
+/* Same tinted-surface formula as the job cards and ReportGrid's rows/wrap (see
+   .job-card and .report-table-wrap) - color-mix layers a slice of var(--series-1) over
+   the plain surface/border colors so the sidebar reads as part of the same themed
+   system instead of a neutral panel next to it. Plain declarations ship first as a
+   fallback for browsers without color-mix support (Safari <16.2, Firefox <113). */
 .side-menu {
   width: 220px;
   flex-shrink: 0;
   overflow: hidden;
   background: var(--surface-1);
+  background: color-mix(in srgb, var(--series-1) 5%, var(--surface-1));
   border-right: 1px solid var(--border);
+  border-right: 1px solid color-mix(in srgb, var(--series-1) 15%, var(--border));
   transition: width 0.18s ease;
 }
 
@@ -218,11 +225,13 @@ body {
 
 .side-menu-item:hover {
   background: var(--page);
+  background: color-mix(in srgb, var(--series-1) 6%, var(--page));
   color: var(--text-primary);
 }
 
 .side-menu-item.active {
   background: var(--page);
+  background: color-mix(in srgb, var(--series-1) 10%, var(--page));
   color: var(--text-primary);
   font-weight: 600;
 }
@@ -307,6 +316,7 @@ body {
     width: 240px;
     max-width: 80vw;
     border-right: 1px solid var(--border);
+    border-right: 1px solid color-mix(in srgb, var(--series-1) 15%, var(--border));
   }
 
   .side-menu-backdrop {
@@ -364,16 +374,39 @@ body {
   font-size: 13px;
 }
 
+/* Mirrors .report-grid-toolbar (see ReportGrid.tsx) - the "Show/hide jobs" button's own
+   row above the list. */
+.jobs-page-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 12px;
+}
+
+.jobs-visibility-button-active {
+  border-color: var(--series-1);
+  color: var(--series-1);
+  font-weight: 600;
+}
+
 .jobs-list {
   display: flex;
   flex-direction: column;
   gap: 16px;
 }
 
+/* Same tinted-surface formula as ReportGrid's row/wrap theming (see .report-table-wrap
+   and .report-table tbody tr:nth-child(even)) - color-mix layers a slice of
+   var(--series-1) over the plain surface color so a card reads as a themed block against
+   var(--page) instead of blending into it (var(--surface-1) alone is only one lightness
+   step away from --page in both themes). Plain declarations ship first as a fallback for
+   browsers without color-mix support (Safari <16.2, Firefox <113). */
 .job-card {
   border: 1px solid var(--border);
+  border: 1px solid color-mix(in srgb, var(--series-1) 15%, var(--border));
   border-radius: 12px;
   background: var(--surface-1);
+  background: color-mix(in srgb, var(--series-1) 5%, var(--surface-1));
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
   padding: 20px;
 }
 
@@ -1141,6 +1174,26 @@ body {
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+
+.report-filter-search-wrap {
+  padding: 2px 12px 6px;
+}
+
+.report-filter-search {
+  width: 100%;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--page);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.report-filter-search:focus {
+  outline: 2px solid var(--series-1);
+  outline-offset: -1px;
 }
 
 .report-filter-actions {

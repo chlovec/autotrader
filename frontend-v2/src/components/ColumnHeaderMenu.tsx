@@ -1,4 +1,5 @@
 import { createPortal } from 'react-dom'
+import { useEffect, useState } from 'react'
 import { useAnchoredDropdown } from './useAnchoredDropdown'
 
 type ColumnHeaderMenuProps = {
@@ -39,9 +40,20 @@ export function ColumnHeaderMenu({
   onFilterChange,
 }: ColumnHeaderMenuProps) {
   const { open, position, anchorRef, dropdownRef, toggleMenu, closeMenu } = useAnchoredDropdown(DROPDOWN_WIDTH)
+  const [search, setSearch] = useState('')
+
+  // Search box should start blank each time the menu reopens rather than remembering
+  // the last query, since a stale filter over a fresh list of values is more confusing
+  // than a momentary reset.
+  useEffect(() => {
+    if (!open) setSearch('')
+  }, [open])
 
   const isActive = selected !== null
   const isChecked = (value: string) => selected === null || selected.has(value)
+  const visibleValues = search.trim()
+    ? values.filter((value) => value.toLowerCase().includes(search.trim().toLowerCase()))
+    : values
 
   const toggleValue = (value: string) => {
     const current = selected ?? new Set(values)
@@ -137,6 +149,16 @@ export function ColumnHeaderMenu({
             <div className="report-menu-divider" />
 
             <div className="report-menu-section-title">Filter values</div>
+            <div className="report-filter-search-wrap">
+              <input
+                type="text"
+                className="report-filter-search"
+                placeholder="Search values..."
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                onClick={(event) => event.stopPropagation()}
+              />
+            </div>
             <div className="report-filter-actions">
               <button type="button" className="report-filter-action" onClick={() => onFilterChange(null)}>
                 Select all
@@ -146,7 +168,7 @@ export function ColumnHeaderMenu({
               </button>
             </div>
             <ul className="report-filter-list">
-              {values.map((value) => (
+              {visibleValues.map((value) => (
                 <li key={value}>
                   <label className="report-filter-option">
                     <input type="checkbox" checked={isChecked(value)} onChange={() => toggleValue(value)} />
@@ -155,6 +177,9 @@ export function ColumnHeaderMenu({
                 </li>
               ))}
               {values.length === 0 && <li className="report-filter-empty">No values</li>}
+              {values.length > 0 && visibleValues.length === 0 && (
+                <li className="report-filter-empty">No values match "{search}"</li>
+              )}
             </ul>
           </div>,
           document.body,

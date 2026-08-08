@@ -420,6 +420,9 @@ class JobConfig(Base):
     snapshot_types: Mapped[str | None] = mapped_column(String)
     average_volume_start_date: Mapped[dt.date | None] = mapped_column(Date)
     average_volume_days_interval: Mapped[int | None] = mapped_column(Integer)
+    # Hides the job's card from the Jobs page's default list (see app/main.py's
+    # list_jobs) without affecting its schedule - a hidden job still runs normally.
+    hidden: Mapped[bool] = mapped_column(default=False)
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False), default=dt.datetime.utcnow)
 
 

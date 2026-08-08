@@ -9,7 +9,7 @@ import {
   type TickerTypeOption,
 } from '../api'
 import { CancelJobModal } from './CancelJobModal'
-import { ChevronIcon, InfoIcon, PauseIcon, PlayIcon, StopIcon } from './icons'
+import { ChevronIcon, EyeIcon, InfoIcon, PauseIcon, PlayIcon, StopIcon } from './icons'
 import { RunJobModal } from './RunJobModal'
 import { SearchableSelect, type SelectOption } from './SearchableSelect'
 
@@ -172,6 +172,18 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
     }
   }
 
+  const handleHide = async () => {
+    setControlBusy(true)
+    setControlError(null)
+    try {
+      onSaved(await api.hideJob(job.name))
+    } catch (err) {
+      setControlError(err instanceof Error ? err.message : 'Failed to hide job')
+    } finally {
+      setControlBusy(false)
+    }
+  }
+
   const toggleHistory = async () => {
     const next = !showHistory
     setShowHistory(next)
@@ -212,6 +224,20 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
         </div>
         <div className="job-card-header-actions">
           <StatusBadge job={job} />
+          <span className="tooltip-anchor">
+            <button
+              type="button"
+              className="icon-button job-play-button"
+              aria-label={`Hide ${job.label} job.`}
+              disabled={controlBusy}
+              onClick={handleHide}
+            >
+              <EyeIcon className="icon" />
+            </button>
+            <span className="tooltip-bubble tooltip-bubble-right" role="tooltip">
+              Hide {job.label} job.
+            </span>
+          </span>
           {!job.running && (
             <span className="tooltip-anchor">
               <button
