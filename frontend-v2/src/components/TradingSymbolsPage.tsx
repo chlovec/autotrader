@@ -9,6 +9,7 @@ import {
 import { loadReportParams, saveReportParams } from '../reportParams'
 import { ReportGrid, type ReportColumn } from './ReportGrid'
 import { SearchableSelect, type SelectOption } from './SearchableSelect'
+import { TickerDetailsModal } from './TickerDetailsModal'
 
 const REPORT_PARAMS_ID = 'trading-symbols'
 
@@ -140,6 +141,7 @@ export function TradingSymbolsPage() {
   const [rows, setRows] = useState<TradingSymbolRow[] | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [detailsRow, setDetailsRow] = useState<TradingSymbolRow | null>(null)
 
   // Fetched once as a static list (rather than SearchableSelect's onSearch, which only
   // queries once the user types) so the dropdown opens showing every ticker type right
@@ -347,6 +349,7 @@ export function TradingSymbolsPage() {
             formatCell={formatCell}
             emptyMessage="No symbols found."
             storageKey="trading-symbols"
+            rowContextMenu={[{ label: 'View Details', onSelect: setDetailsRow }]}
           />
           <div className="report-pager">
             <button
@@ -392,6 +395,16 @@ export function TradingSymbolsPage() {
 
       {!rows && !loading && !error && (
         <p className="placeholder-note">Choose ticker types and page size (optional) and run the report.</p>
+      )}
+
+      {detailsRow && (
+        <TickerDetailsModal
+          row={detailsRow}
+          title={`${detailsRow.ticker} - ${detailsRow.name ?? 'Details'}`}
+          columns={COLUMNS}
+          formatCell={formatCell}
+          onClose={() => setDetailsRow(null)}
+        />
       )}
     </div>
   )

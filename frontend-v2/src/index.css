@@ -1271,9 +1271,12 @@ body {
 /* position/top/left/width are set inline (see ColumnHeaderMenu.tsx) - it's portaled
    to document.body and positioned from the trigger button's getBoundingClientRect
    rather than being an absolutely-positioned descendant of the th, which would get
-   clipped by .report-table-wrap's overflow: auto for columns near either edge. */
+   clipped by .report-table-wrap's overflow: auto for columns near either edge. Also
+   reused by TickerDetailsModal's "Fields" button (ColumnsMenu, exported from
+   ReportGrid.tsx) - z-index has to clear .modal-backdrop's 30 so that dropdown isn't
+   stuck behind the modal it's opened from. */
 .report-menu-dropdown {
-  z-index: 20;
+  z-index: 40;
   max-height: 480px;
   display: flex;
   flex-direction: column;
@@ -1554,4 +1557,74 @@ body {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+}
+
+/* Ticker details popup - see components/TickerDetailsModal.tsx. Wider than the base
+   .modal (sized for a short confirmation message) since it lays out a whole row's
+   worth of fields as a grid rather than a sentence or two. */
+.modal-wide {
+  max-width: 900px;
+}
+
+.modal-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.modal-header-row .modal-title {
+  margin: 0;
+}
+
+.modal-close {
+  font-size: 20px;
+  line-height: 1;
+}
+
+.detail-modal-toolbar {
+  display: flex;
+  gap: 8px;
+  margin: 12px 0;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.detail-modal-grid {
+  margin: 0;
+  max-height: 60vh;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 14px 20px;
+  overflow-y: auto;
+}
+
+.detail-modal-item dt {
+  margin: 0 0 2px;
+  color: var(--text-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.detail-modal-item dd {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+/* Fixed 4 columns (rather than auto-fill) is only readable down to .modal-wide's own
+   width - narrower viewports drop to fewer, same breakpoints as .job-last-run-grid. */
+@media (max-width: 768px) {
+  .detail-modal-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 480px) {
+  .detail-modal-grid {
+    grid-template-columns: 1fr;
+  }
 }

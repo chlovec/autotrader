@@ -3,6 +3,7 @@ import { api, type TickerTypeOption, type TopMarketMoverRow } from '../api'
 import { loadReportParams, saveReportParams } from '../reportParams'
 import { ReportGrid, type ReportColumn } from './ReportGrid'
 import { SearchableSelect, type SelectOption } from './SearchableSelect'
+import { TickerDetailsModal } from './TickerDetailsModal'
 
 const REPORT_PARAMS_ID = 'top-movers'
 
@@ -98,6 +99,7 @@ export function TopMoversPage() {
   const [rows, setRows] = useState<TopMarketMoverRow[] | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [detailsRow, setDetailsRow] = useState<TopMarketMoverRow | null>(null)
 
   // Fetched once as a static list (rather than SearchableSelect's onSearch, which only
   // queries once the user types) so the dropdown opens showing every ticker type right
@@ -175,11 +177,22 @@ export function TopMoversPage() {
           formatCell={formatCell}
           emptyMessage="No movers found."
           storageKey="top-movers"
+          rowContextMenu={[{ label: 'View Details', onSelect: setDetailsRow }]}
         />
       )}
 
       {!rows && !loading && !error && (
         <p className="placeholder-note">Choose ticker types (optional) and run the report.</p>
+      )}
+
+      {detailsRow && (
+        <TickerDetailsModal
+          row={detailsRow}
+          title={`${detailsRow.ticker} - ${detailsRow.name ?? 'Details'}`}
+          columns={COLUMNS}
+          formatCell={formatCell}
+          onClose={() => setDetailsRow(null)}
+        />
       )}
     </div>
   )

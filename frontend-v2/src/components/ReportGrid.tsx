@@ -8,6 +8,11 @@ export type ReportColumn<T> = {
   label: string
 }
 
+export type RowMenuItem<T> = {
+  label: string
+  onSelect: (row: T) => void
+}
+
 type ReportGridProps<T> = {
   columns: ReportColumn<T>[]
   rows: T[]
@@ -23,6 +28,9 @@ type ReportGridProps<T> = {
   // just new `rows` on an already-mounted grid) restores them. Omit to leave the grid
   // stateless across mounts, same as before this existed.
   storageKey?: string
+  // Right-click menu shown for any row, e.g. [{ label: 'View Details', onSelect: ... }] -
+  // omit to leave rows without a context menu (the browser's native one still shows).
+  rowContextMenu?: RowMenuItem<T>[]
 }
 
 type SortDir = 'asc' | 'desc'
@@ -99,6 +107,7 @@ function compareRows<T>(a: T, b: T, key: Extract<keyof T, string>, dir: SortDir)
 
 const COLUMNS_MENU_WIDTH = 220
 const MIN_COLUMN_WIDTH = 64
+const ROW_MENU_WIDTH = 180
 
 // Row-window virtualization: only the rows actually scrolled into view (plus this many
 // on either side, so a fast scroll doesn't flash blank space before the next render
@@ -116,14 +125,21 @@ const DEFAULT_ROW_HEIGHT = 37
 // The "Columns" toolbar button - always visible above the grid regardless of which
 // columns are currently hidden, since a hidden column's own header (and so its
 // ColumnHeaderMenu) disappears along with it. This is the only way back to unhide one.
-function ColumnsMenu<T>({
+// Exported (and given a configurable `label`/`buttonClassName`) so TickerDetailsModal
+// can reuse the exact same show/hide-checklist dropdown for its "Fields" toggle rather
+// than reimplementing it.
+export function ColumnsMenu<T>({
   columns,
   hiddenKeys,
   onToggle,
+  label = 'Columns',
+  buttonClassName = 'job-button report-columns-button',
 }: {
   columns: ReportColumn<T>[]
   hiddenKeys: Set<Extract<keyof T, string>>
   onToggle: (key: Extract<keyof T, string>) => void
+  label?: string
+  buttonClassName?: string
 }) {
   const { open, position, anchorRef, dropdownRef, toggleMenu } = useAnchoredDropdown(COLUMNS_MENU_WIDTH)
 
@@ -132,12 +148,13 @@ function ColumnsMenu<T>({
       <button
         ref={anchorRef}
         type="button"
-        className={`job-button report-columns-button${hiddenKeys.size > 0 ? ' report-columns-button-active' : ''}`}
+        className={`${buttonClassName}${hiddenKeys.size > 0 ? ' report-columns-button-active' : ''}`}
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={toggleMenu}
       >
-        Columns{hiddenKeys.size > 0 ? ` (${hiddenKeys.size} hidden)` : ''}
+        {label}
+        {hiddenKeys.size > 0 ? ` (${hiddenKeys.size} hidden)` : ''}
       </button>
       {open &&
         position &&
@@ -148,7 +165,7 @@ function ColumnsMenu<T>({
             role="menu"
             style={{ position: 'fixed', top: position.top, left: position.left, width: COLUMNS_MENU_WIDTH }}
           >
-            <div className="report-menu-section-title">Show / hide columns</div>
+            <div className="report-menu-section-title">Show / hide {label.toLowerCase()}</div>
             <ul className="report-filter-list">
               {columns.map((col) => (
                 <li key={col.key}>
@@ -170,7 +187,15 @@ function ColumnsMenu<T>({
 // per-column Excel-style value filters, freeze (pin) columns, and show/hide columns -
 // all driven by a plain columns/rows/formatCell contract so a new report page just
 // supplies its own data instead of reimplementing any of this.
-export function ReportGrid<T>({ columns, rows, rowKey, formatCell, emptyMessage, storageKey }: ReportGridProps<T>) {
+export function ReportGrid<T>({
+  columns,
+  rows,
+  rowKey,
+  formatCell,
+  emptyMessage,
+  storageKey,
+  rowContextMenu,
+}: ReportGridProps<T>) {
   type Key = Extract<keyof T, string>
 
   // Computed exactly once, on mount, and cached in a ref rather than a plain const -
@@ -208,6 +233,32 @@ export function ReportGrid<T>({ columns, rows, rowKey, formatCell, emptyMessage,
   // switch to wrapping instead of overflowing (see the report-cell-wrap class below).
   const [columnWidths, setColumnWidths] = useState<Partial<Record<Key, number>>>(initialView?.columnWidths ?? {})
   const resizingRef = useRef<{ key: Key; startX: number; startWidth: number } | null>(null)
+
+  // Right-click row menu - positioned at the cursor (unlike ColumnsMenu/
+  // ColumnHeaderMenu's useAnchoredDropdown, which anchors to a trigger button's
+  // getBoundingClientRect) since there's no button element to anchor to here.
+  const [rowMenu, setRowMenu] = useState<{ row: T; top: number; left: number } | null>(null)
+  const rowMenuRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    if (!rowMenu) return
+    const close = (event: Event) => {
+      const target = event.target as Node
+      if (rowMenuRef.current?.contains(target)) return
+      setRowMenu(null)
+    }
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setRowMenu(null)
+    }
+    document.addEventListener('mousedown', close)
+    document.addEventListener('scroll', close, true)
+    document.addEventListener('keydown', closeOnEscape)
+    return () => {
+      document.removeEventListener('mousedown', close)
+      document.removeEventListener('scroll', close, true)
+      document.removeEventListener('keydown', closeOnEscape)
+    }
+  }, [rowMenu])
 
   const [justSaved, setJustSaved] = useState(false)
   const savedFlashTimeout = useRef<number | null>(null)
@@ -499,7 +550,19 @@ export function ReportGrid<T>({ columns, rows, rowKey, formatCell, emptyMessage,
                   </tr>
                 )}
                 {visibleRows.map((row, i) => (
-                  <tr key={rowKey(row)} ref={i === 0 ? measureFirstRow : undefined}>
+                  <tr
+                    key={rowKey(row)}
+                    ref={i === 0 ? measureFirstRow : undefined}
+                    onContextMenu={
+                      rowContextMenu && rowContextMenu.length > 0
+                        ? (event) => {
+                            event.preventDefault()
+                            const left = Math.min(event.clientX, window.innerWidth - ROW_MENU_WIDTH - 4)
+                            setRowMenu({ row, top: event.clientY, left })
+                          }
+                        : undefined
+                    }
+                  >
                     {visibleColumns.map((col) => {
                       const isFrozen = frozenKeys.has(col.key)
                       const width = columnWidths[col.key]
@@ -534,6 +597,32 @@ export function ReportGrid<T>({ columns, rows, rowKey, formatCell, emptyMessage,
           </tbody>
         </table>
       </div>
+
+      {rowMenu &&
+        rowContextMenu &&
+        createPortal(
+          <div
+            ref={rowMenuRef}
+            className="report-menu-dropdown"
+            role="menu"
+            style={{ position: 'fixed', top: rowMenu.top, left: rowMenu.left, width: ROW_MENU_WIDTH }}
+          >
+            {rowContextMenu.map((item) => (
+              <button
+                key={item.label}
+                type="button"
+                className="report-menu-item"
+                onClick={() => {
+                  item.onSelect(rowMenu.row)
+                  setRowMenu(null)
+                }}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>,
+          document.body,
+        )}
     </div>
   )
 }
