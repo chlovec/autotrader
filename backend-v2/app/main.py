@@ -717,14 +717,17 @@ TRADING_SYMBOLS_DEFAULT_PAGE_SIZE = 500
 
 # order_by field keys accepted by trading_symbols_report, mapped to the column they sort
 # on. Ticker/name/type live on Ticker itself; todays_change_perc/day_volume live on
-# current_snapshots, hence the join added below - without it those two couldn't be
-# ordered on before the page is sliced out.
+# current_snapshots; abs_expected_return_pct sorts on the same abs(expected_return)
+# magnitude the API reports as a percentage (see withAbsExpectedReturnPct in
+# frontend-v2/src/api.ts) - all three of the latter are joined into base_query below so
+# they're available to order_by before LIMIT/OFFSET slices out the page.
 TRADING_SYMBOLS_ORDERABLE_FIELDS: dict[str, ColumnElement] = {
     "ticker": Ticker.ticker,
     "name": Ticker.name,
     "type": Ticker.type,
     "todays_change_perc": CurrentSnapshot.todays_change_perc,
     "day_volume": CurrentSnapshot.day_volume,
+    "abs_expected_return_pct": func.abs(MarketPrediction.expected_return),
 }
 
 
@@ -779,13 +782,26 @@ def trading_symbols_report(
         order_fields = [*order_fields, ("ticker", "asc")]
     with SessionLocal() as session:
         count_query = select(func.count(Ticker.ticker))
-        # current_snapshots is joined in (rather than looked up separately, as
-        # average_volumes still is below) so todays_change_perc/day_volume are
-        # available to order_by before LIMIT/OFFSET slices out the page - left join
-        # since a ticker that's never had sync-snapshots run against it still needs to
+        # current_snapshots and (the latest per ticker, same pattern as
+        # top_movers_report) market_predictions are joined in - rather than looked up
+        # separately, as average_volumes still is below - so todays_change_perc/
+        # day_volume/abs_expected_return_pct are available to order_by before
+        # LIMIT/OFFSET slices out the page. Left joins throughout since a ticker that's
+        # never had sync-snapshots/predict-market-state run against it still needs to
         # appear.
-        base_query = select(Ticker, CurrentSnapshot).outerjoin(
-            CurrentSnapshot, CurrentSnapshot.ticker == Ticker.ticker
+        latest_predicted_date = select(
+            MarketPrediction.ticker, func.max(MarketPrediction.predicted_date).label("predicted_date")
+        ).group_by(MarketPrediction.ticker)
+        latest_predicted_date = latest_predicted_date.subquery()
+        base_query = (
+            select(Ticker, CurrentSnapshot, MarketPrediction)
+            .outerjoin(CurrentSnapshot, CurrentSnapshot.ticker == Ticker.ticker)
+            .outerjoin(latest_predicted_date, latest_predicted_date.c.ticker == Ticker.ticker)
+            .outerjoin(
+                MarketPrediction,
+                (MarketPrediction.ticker == latest_predicted_date.c.ticker)
+                & (MarketPrediction.predicted_date == latest_predicted_date.c.predicted_date),
+            )
         )
         if types:
             base_query = base_query.where(Ticker.type.in_(types))
@@ -798,8 +814,13 @@ def trading_symbols_report(
             order_clauses.append((column.desc() if direction == "desc" else column.asc()).nulls_last())
         query = base_query.order_by(*order_clauses).limit(page_size).offset((page - 1) * page_size)
         page_rows = session.execute(query).all()
-        tickers = [ticker for ticker, _ in page_rows]
-        snapshot_by_ticker: dict[str, CurrentSnapshot | None] = {ticker.ticker: snapshot for ticker, snapshot in page_rows}
+        tickers = [ticker for ticker, _, _ in page_rows]
+        snapshot_by_ticker: dict[str, CurrentSnapshot | None] = {
+            ticker.ticker: snapshot for ticker, snapshot, _ in page_rows
+        }
+        prediction_by_ticker: dict[str, MarketPrediction | None] = {
+            ticker.ticker: prediction for ticker, _, prediction in page_rows
+        }
         ticker_codes = [ticker.ticker for ticker in tickers]
 
         # Same first-seen-per-code reasoning as top_movers_report.
@@ -825,25 +846,6 @@ def trading_symbols_report(
                     & (AverageVolume.computed_at == latest_computed_at.c.computed_at),
                 )
             ).all()
-        }
-
-        # Same "latest predicted_date per ticker" pattern as top_movers_report, scoped
-        # to this page's tickers.
-        latest_predicted_date = (
-            select(MarketPrediction.ticker, func.max(MarketPrediction.predicted_date).label("predicted_date"))
-            .where(MarketPrediction.ticker.in_(ticker_codes))
-            .group_by(MarketPrediction.ticker)
-        )
-        latest_predicted_date = latest_predicted_date.subquery()
-        prediction_by_ticker: dict[str, MarketPrediction] = {
-            prediction.ticker: prediction
-            for prediction in session.execute(
-                select(MarketPrediction).join(
-                    latest_predicted_date,
-                    (MarketPrediction.ticker == latest_predicted_date.c.ticker)
-                    & (MarketPrediction.predicted_date == latest_predicted_date.c.predicted_date),
-                )
-            ).scalars()
         }
 
         rows = [

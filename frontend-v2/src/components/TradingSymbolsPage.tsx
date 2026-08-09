@@ -35,6 +35,7 @@ const ORDER_BY_FIELDS: { key: string; label: string }[] = [
   { key: 'type', label: 'Type' },
   { key: 'todays_change_perc', label: "Today's Change %" },
   { key: 'day_volume', label: 'Day Volume' },
+  { key: 'abs_expected_return_pct', label: 'Abs Expected Return %' },
 ]
 
 function tickerTypeLabel(t: TickerTypeOption): string {
