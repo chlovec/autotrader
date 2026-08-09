@@ -18,12 +18,21 @@ top of that.
 import asyncio
 import threading
 
+from sqlalchemy.orm import Session
+
+from db.models import JobRun
+
 # How often a blocked checkpoint re-checks pause/cancel state. Polling instead of a
 # single blocking wait because there's no "wait on any of several Events" primitive in
 # the stdlib threading module - this is simple, correct, and plenty responsive for a
 # dashboard operated by a human (worst case: a fifth of a second to notice a resume or
 # a cancel requested while still paused).
 _POLL_INTERVAL_SECONDS = 0.2
+
+# How often report_job_progress actually commits, in units of work completed - a large
+# fan-out (e.g. sync-bars-nightly's ~46k tickers) would otherwise commit on every
+# single completion.
+_PROGRESS_COMMIT_INTERVAL = 25
 
 
 class JobCancelled(Exception):
@@ -85,3 +94,30 @@ class JobControl:
         while self._pause.is_set():
             if self._cancel.wait(timeout=_POLL_INTERVAL_SECONDS):
                 raise JobCancelled()
+
+
+def report_job_progress(session: Session, run_id: int | None, completed: int, total: int) -> None:
+    """Persists (completed, total) onto the JobRun row identified by run_id, so the
+    dashboard's Jobs page can show a live "N / M" progress bar (see app/main.py's
+    _run_to_dict) - throttled to every _PROGRESS_COMMIT_INTERVAL calls, plus always on
+    the final one, so a large fan-out doesn't commit on every single completion.
+
+    Called from the single consumer thread driving each of sync_bars.py/
+    sync_snapshots.py/sync_ticker_details.py/sync_indicators.py's
+    concurrent.futures.as_completed loop - `session` is the same one those functions
+    already receive for their own (non-per-ticker) reads/writes, otherwise idle for
+    the duration of that loop, so reusing it here doesn't race any worker thread's own
+    SessionLocal().
+
+    No-op if run_id is None - callers (e.g. sync_bars_manual's CLI entry point) that
+    don't have a JobRun row simply don't get progress tracked."""
+    if run_id is None:
+        return
+    if completed != total and completed % _PROGRESS_COMMIT_INTERVAL != 0:
+        return
+    run = session.get(JobRun, run_id)
+    if run is None:
+        return
+    run.progress_completed = completed
+    run.progress_total = total
+    session.commit()

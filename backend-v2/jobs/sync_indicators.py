@@ -17,6 +17,7 @@ import asyncio
 import concurrent.futures
 import datetime as dt
 import logging
+import os
 from typing import Any, Callable
 from urllib.parse import quote
 
@@ -27,12 +28,16 @@ from sqlalchemy.orm import Session
 from data.client import DataClient
 from db.models import TechnicalIndicator, Ticker
 from db.session import SessionLocal, init_db
-from jobs.control import JobCancelled, JobControl
+from jobs.control import JobCancelled, JobControl, report_job_progress
 
 logger = logging.getLogger("backend_v2.jobs.sync_indicators")
 
 INDICATOR_PATH_TEMPLATE = "/v1/indicators/{indicator}/{ticker}"
-DEFAULT_MAX_WORKERS = 8
+# Overridable via env since a lower worker count reduces the aggregate request rate
+# hitting massive.com's rate limiter (see data/client.py's MIN_REQUEST_INTERVAL_SECONDS
+# for the per-client-instance pacing knob, which this compounds with - N workers means
+# up to N near-simultaneous first requests regardless of pacing).
+DEFAULT_MAX_WORKERS = int(os.environ.get("MASSIVE_MAX_WORKERS", "8"))
 
 
 def _indicator_path(indicator: str, ticker: str) -> str:
@@ -123,6 +128,7 @@ def sync_indicator(
     max_workers: int = DEFAULT_MAX_WORKERS,
     client_factory: Callable[[], DataClient] = DataClient,
     control: JobControl | None = None,
+    run_id: int | None = None,
 ) -> int:
     """Fetches and upserts every value point for every selected ticker, in parallel
     across a thread pool of `max_workers` workers - see jobs/sync_snapshots.py's
@@ -130,9 +136,14 @@ def sync_indicator(
     worker raises it, the rest of the (already-submitted) queue is cancelled outright
     rather than left to run down one near-instant checkpoint-raise at a time, and it's
     re-raised here so the caller (app/main.py's _run_job) marks the run cancelled
-    instead of completed."""
+    instead of completed. `session` is also used to report_job_progress (see
+    jobs/control.py) as futures complete, otherwise idle for the duration of this
+    call."""
     selected = _resolve_tickers(session, ticker_types, tickers)
     fetched = 0
+    completed = 0
+    total = len(selected)
+    report_job_progress(session, run_id, completed, total)
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
     try:
         futures = {
@@ -148,6 +159,8 @@ def sync_indicator(
                 raise
             except Exception:
                 logger.exception("%s sync failed for %s", indicator, ticker)
+            completed += 1
+            report_job_progress(session, run_id, completed, total)
     finally:
         executor.shutdown(wait=True)
 

@@ -311,6 +311,19 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
           )}
         </div>
       </div>
+      {job.running && job.last_run?.progress_total != null && job.last_run.progress_completed != null && (
+        <div className="job-progress">
+          <progress
+            className="job-progress-bar"
+            value={job.last_run.progress_completed}
+            max={job.last_run.progress_total}
+          />
+          <span className="job-progress-label">
+            {job.last_run.progress_completed.toLocaleString()} / {job.last_run.progress_total.toLocaleString()} (
+            {Math.round((job.last_run.progress_completed / job.last_run.progress_total) * 100)}%)
+          </span>
+        </div>
+      )}
       {controlError && <p className="job-field-error job-control-error">{controlError}</p>}
 
       {!collapsed && (

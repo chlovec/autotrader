@@ -564,6 +564,45 @@ body {
   color: var(--status-critical);
 }
 
+.job-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 20px 12px;
+}
+
+.job-progress-bar {
+  flex: 1;
+  height: 6px;
+  border-radius: 999px;
+  overflow: hidden;
+  appearance: none;
+}
+
+.job-progress-bar::-webkit-progress-bar {
+  background: var(--page);
+  border-radius: 999px;
+}
+
+.job-progress-bar::-webkit-progress-value {
+  background: var(--series-1);
+  border-radius: 999px;
+  transition: width 0.2s ease;
+}
+
+.job-progress-bar::-moz-progress-bar {
+  background: var(--series-1);
+  border-radius: 999px;
+}
+
+.job-progress-label {
+  flex-shrink: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
 .job-status-badge.paused {
   background: rgba(201, 130, 15, 0.15);
   color: #c9820f;

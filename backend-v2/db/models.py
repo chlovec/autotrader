@@ -543,3 +543,8 @@ class JobRun(Base):
     finished_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=False))
     result_summary: Mapped[str | None] = mapped_column(String)
     error: Mapped[str | None] = mapped_column(String)
+    # Only set for jobs that know their full unit count up front and report as they go
+    # (see jobs/control.py's report_job_progress) - sync-bars-nightly, sync-snapshots,
+    # sync-ticker-details, the technical-indicator jobs. Null for every other job.
+    progress_completed: Mapped[int | None] = mapped_column(Integer)
+    progress_total: Mapped[int | None] = mapped_column(Integer)

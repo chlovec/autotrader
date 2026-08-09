@@ -195,6 +195,7 @@ async def _run_job(job_name: str, trigger: str) -> None:
                 _split_csv(config.ticker_types),
                 _split_csv(config.tickers),
                 control=control,
+                run_id=run_id,
             )
             summary = f"{count} snapshot(s) synced"
         elif job_name == TICKER_DETAILS_JOB:
@@ -206,6 +207,7 @@ async def _run_job(job_name: str, trigger: str) -> None:
                 _split_csv(config.ticker_types),
                 _split_csv(config.tickers),
                 control=control,
+                run_id=run_id,
             )
             summary = f"{count} ticker detail(s) synced"
         elif job_name == AVERAGE_VOLUME_JOB:
@@ -259,6 +261,7 @@ async def _run_job(job_name: str, trigger: str) -> None:
                 _split_csv(config.ticker_types),
                 _split_csv(config.tickers),
                 control=control,
+                run_id=run_id,
             )
             summary = f"{count} {indicator} value(s) synced"
         elif job_name == BARS_JOB:
@@ -274,6 +277,7 @@ async def _run_job(job_name: str, trigger: str) -> None:
                 timespan=config.timespan or DEFAULT_TIMESPAN,
                 backfill_days=config.backfill_days or DEFAULT_BACKFILL_DAYS,
                 control=control,
+                run_id=run_id,
             )
             summary = f"{len(results)} ticker(s) synced, {sum(results.values())} bar(s) fetched"
         else:
@@ -414,6 +418,8 @@ def _run_to_dict(run: JobRun) -> dict[str, Any]:
         "duration_seconds": duration_seconds,
         "result_summary": run.result_summary,
         "error": run.error,
+        "progress_completed": run.progress_completed,
+        "progress_total": run.progress_total,
     }
 
 

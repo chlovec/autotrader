@@ -15,6 +15,7 @@ import asyncio
 import concurrent.futures
 import datetime as dt
 import logging
+import os
 from typing import Any, Callable
 from urllib.parse import quote
 
@@ -25,13 +26,17 @@ from sqlalchemy.orm import Session
 from data.client import DataClient
 from db.models import CurrentSnapshot, Ticker
 from db.session import SessionLocal, init_db
-from jobs.control import JobCancelled, JobControl
+from jobs.control import JobCancelled, JobControl, report_job_progress
 
 logger = logging.getLogger("backend_v2.jobs.sync_snapshots")
 
 JOB_NAME = "snapshots"
 SNAPSHOT_PATH_TEMPLATE = "/v2/snapshot/locale/us/markets/stocks/tickers/{ticker}"
-DEFAULT_MAX_WORKERS = 8
+# Overridable via env since a lower worker count reduces the aggregate request rate
+# hitting massive.com's rate limiter (see data/client.py's MIN_REQUEST_INTERVAL_SECONDS
+# for the per-client-instance pacing knob, which this compounds with - N workers means
+# up to N near-simultaneous first requests regardless of pacing).
+DEFAULT_MAX_WORKERS = int(os.environ.get("MASSIVE_MAX_WORKERS", "8"))
 
 
 def _snapshot_path(ticker: str) -> str:
@@ -137,12 +142,15 @@ def sync_snapshots(
     max_workers: int = DEFAULT_MAX_WORKERS,
     client_factory: Callable[[], DataClient] = DataClient,
     control: JobControl | None = None,
+    run_id: int | None = None,
 ) -> int:
     """Fetches and upserts a current-snapshot row for every selected ticker, in
-    parallel across a thread pool of `max_workers` workers. `session` is only used here
-    to resolve the ticker selection (see _resolve_tickers) - each worker fetches and
-    commits through its own session, not this one. This is a blocking call; callers on
-    an event loop should run it via asyncio.to_thread (see app/main.py's _run_job).
+    parallel across a thread pool of `max_workers` workers. `session` is used here to
+    resolve the ticker selection (see _resolve_tickers) and to report_job_progress (see
+    jobs/control.py) as futures complete, otherwise idle for the duration of this call -
+    each worker fetches and commits through its own session, not this one. This is a
+    blocking call; callers on an event loop should run it via asyncio.to_thread (see
+    app/main.py's _run_job).
 
     `control`, if given, is handed to every worker (see _fetch_and_store_one) so each
     checks it before starting its ticker. Once any worker raises JobCancelled, the rest
@@ -153,6 +161,9 @@ def sync_snapshots(
     """
     selected = _resolve_tickers(session, ticker_types, tickers)
     fetched = 0
+    completed = 0
+    total = len(selected)
+    report_job_progress(session, run_id, completed, total)
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
     try:
         futures = {
@@ -168,6 +179,8 @@ def sync_snapshots(
                 raise
             except Exception:
                 logger.exception("snapshot sync failed for %s", ticker)
+            completed += 1
+            report_job_progress(session, run_id, completed, total)
     finally:
         executor.shutdown(wait=True)
 

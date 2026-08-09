@@ -27,6 +27,12 @@ export interface JobRun {
   duration_seconds: number | null
   result_summary: string | null
   error: string | null
+  // Only non-null for jobs that know their full unit count up front and report as
+  // they go (see backend-v2 jobs/control.py's report_job_progress) - sync-bars-nightly,
+  // sync-snapshots, sync-ticker-details, the technical-indicator jobs. null for every
+  // other job, and briefly null even for those until the first progress write lands.
+  progress_completed: number | null
+  progress_total: number | null
 }
 
 export interface Job {

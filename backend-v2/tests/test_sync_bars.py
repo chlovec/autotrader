@@ -6,10 +6,10 @@ import httpx
 import pytest
 
 from data.client import DataClient
-from db.models import OhlcBar, Ticker
+from db.models import JobRun, OhlcBar, Ticker
 from db.session import SessionLocal, init_db
 from jobs.control import JobCancelled, JobControl
-from jobs.sync_bars import fetch_and_store_bars, sync_bars_manual, sync_bars_nightly
+from jobs.sync_bars import _last_trading_day_on_or_before, fetch_and_store_bars, sync_bars_manual, sync_bars_nightly
 
 
 @pytest.fixture(autouse=True)
@@ -18,6 +18,7 @@ def _clean_db():
     session = SessionLocal()
     session.query(OhlcBar).delete()
     session.query(Ticker).delete()
+    session.query(JobRun).delete()
     session.commit()
     session.close()
     yield
@@ -167,8 +168,12 @@ def test_sync_bars_manual_pause_blocks_a_worker_until_resumed():
 
 
 def test_sync_bars_nightly_skips_up_to_date_and_resumes_from_last_bar():
+    # end_date, not raw "yesterday" - matches sync_bars_nightly's own
+    # _last_trading_day_on_or_before rollback, so this test is correct regardless of
+    # which real-world weekday it happens to run on.
     yesterday = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)
-    resume_last_bar = yesterday - dt.timedelta(days=5)
+    end_date = _last_trading_day_on_or_before(yesterday)
+    resume_last_bar = end_date - dt.timedelta(days=5)
 
     session = SessionLocal()
     session.add_all([Ticker(ticker="UPTODATE"), Ticker(ticker="RESUME"), Ticker(ticker="NEVER")])
@@ -177,7 +182,7 @@ def test_sync_bars_nightly_skips_up_to_date_and_resumes_from_last_bar():
             ticker="UPTODATE",
             multiplier=1,
             timespan="day",
-            timestamp=dt.datetime.combine(yesterday, dt.time.min),
+            timestamp=dt.datetime.combine(end_date, dt.time.min),
             close=1.0,
         )
     )
@@ -209,9 +214,9 @@ def test_sync_bars_nightly_skips_up_to_date_and_resumes_from_last_bar():
     finally:
         session.close()
 
-    assert "UPTODATE" not in results  # last bar is already yesterday - skipped entirely
-    assert requested_ranges["RESUME"] == ((resume_last_bar + dt.timedelta(days=1)).isoformat(), yesterday.isoformat())
-    assert requested_ranges["NEVER"] == ((yesterday - dt.timedelta(days=730)).isoformat(), yesterday.isoformat())
+    assert "UPTODATE" not in results  # last bar is already end_date - skipped entirely
+    assert requested_ranges["RESUME"] == ((resume_last_bar + dt.timedelta(days=1)).isoformat(), end_date.isoformat())
+    assert requested_ranges["NEVER"] == ((end_date - dt.timedelta(days=730)).isoformat(), end_date.isoformat())
 
 
 def test_sync_bars_nightly_retries_a_ticker_that_gets_no_new_bars_back():
@@ -274,5 +279,45 @@ def test_sync_bars_nightly_cancel_stops_the_run_and_raises_job_cancelled():
             sync_bars_nightly(session, client_factory=lambda: _client_with_handler(handler), control=control)
 
         assert session.query(OhlcBar).count() == 0
+    finally:
+        session.close()
+
+
+def test_last_trading_day_on_or_before_rolls_weekends_back_to_friday():
+    friday = dt.date(2026, 8, 7)
+    saturday = dt.date(2026, 8, 8)
+    sunday = dt.date(2026, 8, 9)
+    monday = dt.date(2026, 8, 10)
+
+    assert _last_trading_day_on_or_before(saturday) == friday
+    assert _last_trading_day_on_or_before(sunday) == friday
+    assert _last_trading_day_on_or_before(friday) == friday  # already a weekday - unchanged
+    assert _last_trading_day_on_or_before(monday) == monday  # already a weekday - unchanged
+
+
+def test_run_id_records_final_progress_on_job_run():
+    session = SessionLocal()
+    session.add_all([Ticker(ticker="AAA"), Ticker(ticker="BBB")])
+    run = JobRun(job_name="bars", trigger="manual", status="in_progress", started_at=dt.datetime.utcnow())
+    session.add(run)
+    session.commit()
+    run_id = run.id
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": [_bar(dt.date(2024, 1, 1), 1.0)]})
+
+    try:
+        results = sync_bars_manual(
+            session,
+            dt.date(2024, 1, 1),
+            dt.date(2024, 1, 1),
+            tickers=["AAA", "BBB"],
+            client_factory=lambda: _client_with_handler(handler),
+            run_id=run_id,
+        )
+
+        assert results == {"AAA": 1, "BBB": 1}
+        updated_run = session.get(JobRun, run_id)
+        assert (updated_run.progress_completed, updated_run.progress_total) == (2, 2)
     finally:
         session.close()

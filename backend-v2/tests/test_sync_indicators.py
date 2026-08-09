@@ -1,3 +1,4 @@
+import datetime as dt
 import threading
 import time
 
@@ -5,7 +6,7 @@ import httpx
 import pytest
 
 from data.client import DataClient
-from db.models import TechnicalIndicator, Ticker
+from db.models import JobRun, TechnicalIndicator, Ticker
 from db.session import SessionLocal, init_db
 from jobs.control import JobCancelled, JobControl
 from jobs.sync_indicators import sync_indicator
@@ -17,6 +18,7 @@ def _clean_db():
     session = SessionLocal()
     session.query(TechnicalIndicator).delete()
     session.query(Ticker).delete()
+    session.query(JobRun).delete()
     session.commit()
     session.close()
     yield
@@ -237,3 +239,26 @@ def test_pause_blocks_a_worker_until_resumed():
     finally:
         session.close()
         resumer.join()
+
+
+def test_run_id_records_final_progress_on_job_run():
+    session = SessionLocal()
+    session.add_all([Ticker(ticker="AAA"), Ticker(ticker="BBB")])
+    run = JobRun(job_name="rsi", trigger="manual", status="in_progress", started_at=dt.datetime.utcnow())
+    session.add(run)
+    session.commit()
+    run_id = run.id
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_sma_payload([{"timestamp": 1_700_000_000_000, "value": 1.0}]))
+
+    try:
+        fetched = sync_indicator(
+            "rsi", session, tickers=["AAA", "BBB"], client_factory=lambda: _client_with_handler(handler), run_id=run_id
+        )
+
+        assert fetched == 2
+        updated_run = session.get(JobRun, run_id)
+        assert (updated_run.progress_completed, updated_run.progress_total) == (2, 2)
+    finally:
+        session.close()

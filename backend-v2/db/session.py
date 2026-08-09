@@ -24,6 +24,7 @@ def init_db() -> None:
     _add_job_configs_average_volume_columns()
     _add_job_configs_hidden_column()
     _add_job_configs_backtest_columns()
+    _add_job_runs_progress_columns()
     _drop_ticker_bar_sync_state_table()
 
 
@@ -66,6 +67,25 @@ def _add_job_configs_hidden_column() -> None:
 def _add_job_configs_backtest_columns() -> None:
     _add_job_configs_column("backtest_start_date", "DATE")
     _add_job_configs_column("backtest_end_date", "DATE")
+
+
+def _add_job_runs_column(column: str, ddl_type: str) -> None:
+    """Same idempotent-ALTER-TABLE reasoning as _add_job_configs_column above, scoped
+    to job_runs instead - a database from before progress_completed/progress_total
+    existed would otherwise 500 on its first query against job_runs."""
+    inspector = inspect(engine)
+    if "job_runs" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("job_runs")}
+    if column in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(text(f"ALTER TABLE job_runs ADD COLUMN {column} {ddl_type}"))
+
+
+def _add_job_runs_progress_columns() -> None:
+    _add_job_runs_column("progress_completed", "INTEGER")
+    _add_job_runs_column("progress_total", "INTEGER")
 
 
 def _drop_ticker_bar_sync_state_table() -> None:

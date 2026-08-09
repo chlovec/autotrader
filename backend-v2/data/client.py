@@ -24,9 +24,11 @@ MAX_BACKOFF_SECONDS = 60.0
 # resolves, with no gap - that alone is enough to trip massive.com's limiter well before
 # any single request looks abusive. Spacing requests out here, once, fixes it for every
 # caller instead of the retry/backoff above having to paper over it after the fact on
-# every page. No published quota to tune this against - 0.5s (2 req/s) is a conservative
-# starting point; tighten it if 429s persist, loosen it if jobs feel unnecessarily slow.
-MIN_REQUEST_INTERVAL_SECONDS = 0.005
+# every page. No published quota to tune this against and massive.com's 429s carry no
+# Retry-After/X-RateLimit-* headers to read one off of either - 100ms (10 req/s) is a
+# conservative starting point; overridable via env since the right value is a guess
+# until massive.com's support responds with their actual limit.
+MIN_REQUEST_INTERVAL_SECONDS = float(os.environ.get("MASSIVE_MIN_REQUEST_INTERVAL_SECONDS", "0.1"))
 
 
 class DataClient:

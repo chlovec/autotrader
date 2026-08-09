@@ -38,14 +38,18 @@ from sqlalchemy.orm import Session
 from data.client import DataClient
 from db.models import OhlcBar, Ticker
 from db.session import SessionLocal, init_db
-from jobs.control import JobCancelled, JobControl
+from jobs.control import JobCancelled, JobControl, report_job_progress
 
 logger = logging.getLogger("backend_v2.jobs.sync_bars")
 
 DEFAULT_MULTIPLIER = 1
 DEFAULT_TIMESPAN = "day"
 DEFAULT_BACKFILL_DAYS = int(os.environ.get("BARS_DEFAULT_BACKFILL_DAYS", "730"))
-DEFAULT_MAX_WORKERS = 8
+# Overridable via env since a lower worker count reduces the aggregate request rate
+# hitting massive.com's rate limiter (see data/client.py's MIN_REQUEST_INTERVAL_SECONDS
+# for the per-client-instance pacing knob, which this compounds with - N workers means
+# up to N near-simultaneous first requests regardless of pacing).
+DEFAULT_MAX_WORKERS = int(os.environ.get("MASSIVE_MAX_WORKERS", "8"))
 PAGE_LIMIT = 50_000
 
 # Polygon-style aggs result field -> OhlcBar column.
@@ -134,6 +138,25 @@ def _last_bar_dates(session: Session, multiplier: int, timespan: str) -> dict[st
     return {ticker: timestamp.date() for ticker, timestamp in session.execute(query).all()}
 
 
+def _last_trading_day_on_or_before(date: dt.date) -> dt.date:
+    """Calendar-naive - rolls a weekend date back to the preceding Friday, but doesn't
+    account for market holidays, since there's no trading-calendar table to consult
+    here (same caveat as jobs/predict_market_state.py's _next_trading_day).
+
+    Without this, sync_bars_nightly's end_date lands on a non-trading Saturday/Sunday
+    whenever "yesterday" is one. massive.com never returns a bar dated a day nothing
+    traded, so every ticker's last real bar stops at the prior Friday regardless of how
+    fully synced it already is - start_date (last_bar_date + 1) then equals that
+    Saturday/Sunday end_date instead of exceeding it, so the "already caught up" skip
+    never fires and the *entire* selected population gets re-included, even tickers
+    with nothing new to fetch."""
+    if date.weekday() == 5:  # Saturday
+        return date - dt.timedelta(days=1)
+    if date.weekday() == 6:  # Sunday
+        return date - dt.timedelta(days=2)
+    return date
+
+
 def _resolve_tickers(session: Session, ticker_types: list[str] | None, tickers: list[str] | None) -> list[str]:
     if tickers and ticker_types:
         raise ValueError("specify tickers or ticker_types, not both")
@@ -189,6 +212,8 @@ def _run_pool(
     client_factory: Callable[[], DataClient],
     control: JobControl | None,
     log_label: str,
+    session: Session,
+    run_id: int | None,
 ) -> dict[str, int]:
     """Shared executor-driving loop for sync_bars_manual/sync_bars_nightly below - see
     jobs/sync_snapshots.py's sync_snapshots, which this mirrors including its
@@ -196,8 +221,15 @@ def _run_pool(
     (already-submitted) queue is cancelled outright rather than left to run down one
     near-instant checkpoint-raise at a time, and it's re-raised here so the caller
     (app/main.py's _run_job) marks the run cancelled instead of completed. `jobs` maps
-    each selected ticker to its own start_date."""
+    each selected ticker to its own start_date.
+
+    `session`/`run_id` are only used to report_job_progress (see jobs/control.py) as
+    futures complete - `session` is otherwise idle for the duration of this call, since
+    each worker commits through its own SessionLocal()."""
     results: dict[str, int] = {}
+    total = len(jobs)
+    completed = 0
+    report_job_progress(session, run_id, completed, total)
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
     try:
         futures = {
@@ -215,6 +247,8 @@ def _run_pool(
                 raise
             except Exception:
                 logger.exception("%s bars sync failed for %s", log_label, ticker)
+            completed += 1
+            report_job_progress(session, run_id, completed, total)
     finally:
         executor.shutdown(wait=True)
     return results
@@ -231,6 +265,7 @@ def sync_bars_manual(
     max_workers: int = DEFAULT_MAX_WORKERS,
     client_factory: Callable[[], DataClient] = DataClient,
     control: JobControl | None = None,
+    run_id: int | None = None,
 ) -> dict[str, int]:
     """Fetches [start_date, end_date] for every selected ticker, regardless of what's
     already synced, in parallel across a thread pool of `max_workers` workers - one
@@ -239,7 +274,9 @@ def sync_bars_manual(
     event loop should run it via asyncio.to_thread (see app/main.py's _run_job)."""
     selected = _resolve_tickers(session, ticker_types, tickers)
     jobs = {ticker: start_date for ticker in selected}
-    return _run_pool(jobs, end_date, multiplier, timespan, max_workers, client_factory, control, "manual")
+    return _run_pool(
+        jobs, end_date, multiplier, timespan, max_workers, client_factory, control, "manual", session, run_id
+    )
 
 
 def sync_bars_nightly(
@@ -252,9 +289,17 @@ def sync_bars_nightly(
     max_workers: int = DEFAULT_MAX_WORKERS,
     client_factory: Callable[[], DataClient] = DataClient,
     control: JobControl | None = None,
+    run_id: int | None = None,
 ) -> dict[str, int]:
-    """Syncs every selected ticker through yesterday, skipping any already synced
-    through yesterday, in parallel across a thread pool of `max_workers` workers.
+    """Syncs every selected ticker through the most recent trading day on or before
+    yesterday, skipping any already synced through that day, in parallel across a
+    thread pool of `max_workers` workers.
+
+    end_date is yesterday rolled back to the preceding Friday if yesterday was a
+    Saturday or Sunday (see _last_trading_day_on_or_before) - otherwise a Monday-morning
+    run would treat Sunday as the target date, which massive.com never has a bar for,
+    and every ticker (not just the ones actually behind) would get re-included forever
+    since "caught up through Friday" would never satisfy start_date > end_date.
 
     Each ticker's start date is max(its own most recent ohlc_bars date + 1,
     backfill_floor), where backfill_floor = end_date - backfill_days - the same floor a
@@ -269,7 +314,7 @@ def sync_bars_nightly(
     ohlc_bars, not a per-ticker lookup, not worth a checkpoint of its own) before
     fanning out - see _fetch_and_store_one for where `control` is actually checked,
     once per ticker, right before its (slow) HTTP fetch."""
-    end_date = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)
+    end_date = _last_trading_day_on_or_before(dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1))
     backfill_floor = end_date - dt.timedelta(days=backfill_days)
     selected = _resolve_tickers(session, ticker_types, tickers)
     last_bar_by_ticker = _last_bar_dates(session, multiplier, timespan)
@@ -282,7 +327,9 @@ def sync_bars_nightly(
             continue  # already up to date
         jobs[ticker] = start_date
 
-    return _run_pool(jobs, end_date, multiplier, timespan, max_workers, client_factory, control, "nightly")
+    return _run_pool(
+        jobs, end_date, multiplier, timespan, max_workers, client_factory, control, "nightly", session, run_id
+    )
 
 
 def _env_list(var_name: str) -> list[str] | None:
