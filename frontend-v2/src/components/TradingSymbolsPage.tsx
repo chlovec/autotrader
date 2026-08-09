@@ -53,6 +53,7 @@ const COLUMNS: ReportColumn<TradingSymbolRow>[] = [
   { key: 'type', label: 'Type' },
   { key: 'asset_class', label: 'Asset Class' },
   { key: 'average_volume', label: 'Average Volume' },
+  { key: 'market_cap', label: 'Market Cap' },
   { key: 'todays_change', label: "Today's Change" },
   { key: 'todays_change_perc', label: "Today's Change %" },
   { key: 'updated', label: 'Updated' },

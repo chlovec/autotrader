@@ -591,6 +591,7 @@ def _mover_to_dict(
     ticker: Ticker | None,
     asset_class: str | None,
     average_volume: float | None,
+    market_cap: float | None,
     prediction: MarketPrediction | None,
 ) -> dict[str, Any]:
     return {
@@ -599,6 +600,7 @@ def _mover_to_dict(
         "type": ticker.type if ticker else None,
         "asset_class": asset_class,
         "average_volume": average_volume,
+        "market_cap": market_cap,
         "direction": mover.direction,
         "rank": mover.rank,
         "todays_change": mover.todays_change,
@@ -694,12 +696,20 @@ def top_movers_report(ticker_types: str = "") -> list[dict]:
             ).scalars()
         }
 
+        # ticker_details is upserted wholesale per ticker (no history), unlike
+        # average_volumes/market_predictions above - so this is a plain lookup, no
+        # latest-row-per-ticker join needed.
+        market_cap_by_ticker: dict[str, float | None] = dict(
+            session.execute(select(TickerDetail.ticker, TickerDetail.market_cap)).all()
+        )
+
         return [
             _mover_to_dict(
                 mover,
                 ticker,
                 asset_class_by_code.get(ticker.type) if ticker and ticker.type else None,
                 average_volume_by_ticker.get(mover.ticker),
+                market_cap_by_ticker.get(mover.ticker),
                 prediction_by_ticker.get(mover.ticker),
             )
             for mover, ticker in rows
@@ -710,6 +720,7 @@ def _symbol_to_dict(
     ticker: Ticker,
     asset_class: str | None,
     average_volume: float | None,
+    market_cap: float | None,
     snapshot: CurrentSnapshot | None,
     prediction: MarketPrediction | None,
 ) -> dict[str, Any]:
@@ -719,6 +730,7 @@ def _symbol_to_dict(
         "type": ticker.type,
         "asset_class": asset_class,
         "average_volume": average_volume,
+        "market_cap": market_cap,
         "todays_change": snapshot.todays_change if snapshot else None,
         "todays_change_perc": snapshot.todays_change_perc if snapshot else None,
         "updated": snapshot.updated.isoformat() if snapshot and snapshot.updated else None,
@@ -929,11 +941,21 @@ def trading_symbols_report(
             ).all()
         }
 
+        # Same page-scoped lookup reasoning as average_volume_by_ticker above -
+        # ticker_details is upserted wholesale per ticker (no history), so no
+        # latest-row-per-ticker join is needed, just a plain WHERE ... IN.
+        market_cap_by_ticker: dict[str, float | None] = dict(
+            session.execute(
+                select(TickerDetail.ticker, TickerDetail.market_cap).where(TickerDetail.ticker.in_(ticker_codes))
+            ).all()
+        )
+
         rows = [
             _symbol_to_dict(
                 ticker,
                 asset_class_by_code.get(ticker.type) if ticker.type else None,
                 average_volume_by_ticker.get(ticker.ticker),
+                market_cap_by_ticker.get(ticker.ticker),
                 snapshot_by_ticker.get(ticker.ticker),
                 prediction_by_ticker.get(ticker.ticker),
             )

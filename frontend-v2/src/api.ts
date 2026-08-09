@@ -111,6 +111,7 @@ export interface TopMarketMoverRow {
   type: string | null
   asset_class: string | null
   average_volume: number | null
+  market_cap: number | null
   direction: string
   rank: number
   todays_change: number | null
@@ -165,6 +166,7 @@ export interface TradingSymbolRow {
   type: string | null
   asset_class: string | null
   average_volume: number | null
+  market_cap: number | null
   todays_change: number | null
   todays_change_perc: number | null
   updated: string | null
