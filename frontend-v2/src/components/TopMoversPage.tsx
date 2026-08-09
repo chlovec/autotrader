@@ -52,17 +52,36 @@ const COLUMNS: ReportColumn<TopMarketMoverRow>[] = [
   { key: 'prev_day_volume', label: 'Prev Day Volume' },
   { key: 'prev_day_vwap', label: 'Prev Day VWAP' },
   { key: 'fetched_at', label: 'Fetched At' },
+  { key: 'predicted_date', label: 'Predicted Date' },
+  { key: 'current_state', label: 'Current State' },
+  { key: 'predicted_state', label: 'Predicted State' },
+  { key: 'state_confidence', label: 'State Confidence' },
+  { key: 'expected_return', label: 'Expected Return' },
+  { key: 'abs_expected_return_pct', label: 'Abs Expected Return %' },
+  { key: 'entry_price', label: 'Entry Price' },
+  { key: 'exit_price', label: 'Exit Price' },
+  { key: 'entry_time', label: 'Entry Time' },
+  { key: 'exit_time', label: 'Exit Time' },
+  { key: 'history_days', label: 'History Days' },
+  { key: 'prediction_computed_at', label: 'Prediction Computed At' },
 ]
 
-// updated/min_timestamp/fetched_at are naive-UTC (same as JobRun.started_at) - append
-// "Z" so Date parses them as UTC instead of local time, same reasoning as JobCard's
-// formatTimestamp.
-const TIMESTAMP_FIELDS = new Set<keyof TopMarketMoverRow>(['updated', 'min_timestamp', 'fetched_at'])
+// updated/min_timestamp/fetched_at/prediction_computed_at are naive-UTC (same as
+// JobRun.started_at) - append "Z" so Date parses them as UTC instead of local time,
+// same reasoning as JobCard's formatTimestamp. predicted_date is a plain date (no
+// time component), so it's left out of this set and rendered as-is by formatCell.
+const TIMESTAMP_FIELDS = new Set<keyof TopMarketMoverRow>([
+  'updated',
+  'min_timestamp',
+  'fetched_at',
+  'prediction_computed_at',
+])
 
 function formatCell(row: TopMarketMoverRow, key: keyof TopMarketMoverRow): string {
   const value = row[key]
   if (value == null) return '–'
   if (TIMESTAMP_FIELDS.has(key)) return new Date(`${value}Z`).toLocaleString()
+  if (key === 'abs_expected_return_pct') return `${(value as number).toFixed(2)}%`
   if (typeof value === 'number') return value.toLocaleString(undefined, { maximumFractionDigits: 4 })
   return String(value)
 }

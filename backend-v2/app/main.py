@@ -532,8 +532,31 @@ def search_tickers(q: str = "", limit: int = 20) -> list[dict]:
         return [{"ticker": row.ticker, "name": row.name} for row in rows]
 
 
+def _prediction_fields(prediction: MarketPrediction | None) -> dict[str, Any]:
+    """Shared by _mover_to_dict/_symbol_to_dict - the most recently predicted_date row
+    (see the latest_prediction_by_ticker lookups below) from market_predictions, joined
+    out by ticker the same way average_volume is."""
+    return {
+        "predicted_date": prediction.predicted_date.isoformat() if prediction else None,
+        "current_state": prediction.current_state if prediction else None,
+        "predicted_state": prediction.predicted_state if prediction else None,
+        "state_confidence": prediction.state_confidence if prediction else None,
+        "expected_return": prediction.expected_return if prediction else None,
+        "entry_price": prediction.entry_price if prediction else None,
+        "exit_price": prediction.exit_price if prediction else None,
+        "entry_time": prediction.entry_time if prediction else None,
+        "exit_time": prediction.exit_time if prediction else None,
+        "history_days": prediction.history_days if prediction else None,
+        "prediction_computed_at": prediction.computed_at.isoformat() if prediction else None,
+    }
+
+
 def _mover_to_dict(
-    mover: TopMarketMover, ticker: Ticker | None, asset_class: str | None, average_volume: float | None
+    mover: TopMarketMover,
+    ticker: Ticker | None,
+    asset_class: str | None,
+    average_volume: float | None,
+    prediction: MarketPrediction | None,
 ) -> dict[str, Any]:
     return {
         "ticker": mover.ticker,
@@ -567,6 +590,7 @@ def _mover_to_dict(
         "prev_day_volume": mover.prev_day_volume,
         "prev_day_vwap": mover.prev_day_vwap,
         "fetched_at": mover.fetched_at.isoformat(),
+        **_prediction_fields(prediction),
     }
 
 
@@ -617,19 +641,42 @@ def top_movers_report(ticker_types: str = "") -> list[dict]:
             ).all()
         }
 
+        # market_predictions accumulates one row per (ticker, predicted_date) - "latest"
+        # means the row for whichever predicted_date is furthest out, same
+        # latest-row-per-ticker pattern as average_volume_by_ticker above.
+        latest_predicted_date = select(
+            MarketPrediction.ticker, func.max(MarketPrediction.predicted_date).label("predicted_date")
+        ).group_by(MarketPrediction.ticker)
+        latest_predicted_date = latest_predicted_date.subquery()
+        prediction_by_ticker: dict[str, MarketPrediction] = {
+            prediction.ticker: prediction
+            for prediction in session.execute(
+                select(MarketPrediction).join(
+                    latest_predicted_date,
+                    (MarketPrediction.ticker == latest_predicted_date.c.ticker)
+                    & (MarketPrediction.predicted_date == latest_predicted_date.c.predicted_date),
+                )
+            ).scalars()
+        }
+
         return [
             _mover_to_dict(
                 mover,
                 ticker,
                 asset_class_by_code.get(ticker.type) if ticker and ticker.type else None,
                 average_volume_by_ticker.get(mover.ticker),
+                prediction_by_ticker.get(mover.ticker),
             )
             for mover, ticker in rows
         ]
 
 
 def _symbol_to_dict(
-    ticker: Ticker, asset_class: str | None, average_volume: float | None, snapshot: CurrentSnapshot | None
+    ticker: Ticker,
+    asset_class: str | None,
+    average_volume: float | None,
+    snapshot: CurrentSnapshot | None,
+    prediction: MarketPrediction | None,
 ) -> dict[str, Any]:
     return {
         "ticker": ticker.ticker,
@@ -661,6 +708,7 @@ def _symbol_to_dict(
         "prev_day_volume": snapshot.prev_day_volume if snapshot else None,
         "prev_day_vwap": snapshot.prev_day_vwap if snapshot else None,
         "fetched_at": snapshot.fetched_at.isoformat() if snapshot and snapshot.fetched_at else None,
+        **_prediction_fields(prediction),
     }
 
 
@@ -779,12 +827,32 @@ def trading_symbols_report(
             ).all()
         }
 
+        # Same "latest predicted_date per ticker" pattern as top_movers_report, scoped
+        # to this page's tickers.
+        latest_predicted_date = (
+            select(MarketPrediction.ticker, func.max(MarketPrediction.predicted_date).label("predicted_date"))
+            .where(MarketPrediction.ticker.in_(ticker_codes))
+            .group_by(MarketPrediction.ticker)
+        )
+        latest_predicted_date = latest_predicted_date.subquery()
+        prediction_by_ticker: dict[str, MarketPrediction] = {
+            prediction.ticker: prediction
+            for prediction in session.execute(
+                select(MarketPrediction).join(
+                    latest_predicted_date,
+                    (MarketPrediction.ticker == latest_predicted_date.c.ticker)
+                    & (MarketPrediction.predicted_date == latest_predicted_date.c.predicted_date),
+                )
+            ).scalars()
+        }
+
         rows = [
             _symbol_to_dict(
                 ticker,
                 asset_class_by_code.get(ticker.type) if ticker.type else None,
                 average_volume_by_ticker.get(ticker.ticker),
                 snapshot_by_ticker.get(ticker.ticker),
+                prediction_by_ticker.get(ticker.ticker),
             )
             for ticker in tickers
         ]

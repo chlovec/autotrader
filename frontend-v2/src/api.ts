@@ -135,6 +135,22 @@ export interface TopMarketMoverRow {
   prev_day_volume: number | null
   prev_day_vwap: number | null
   fetched_at: string
+  // Fields below come from the ticker's most recent market_predictions row (jobs/predict_market_state.py) - all null if that job has never run for this ticker.
+  predicted_date: string | null
+  current_state: string | null
+  predicted_state: string | null
+  state_confidence: number | null
+  expected_return: number | null
+  // abs(expected_return) * 100 - derived client-side (see withAbsExpectedReturnPct
+  // below) rather than by the backend, since it's purely a display transform of
+  // expected_return, not new data.
+  abs_expected_return_pct: number | null
+  entry_price: number | null
+  exit_price: number | null
+  entry_time: string | null
+  exit_time: string | null
+  history_days: number | null
+  prediction_computed_at: string | null
 }
 
 // One row per tickers row, joined out to asset_class/average_volume/current_snapshots -
@@ -171,6 +187,19 @@ export interface TradingSymbolRow {
   prev_day_volume: number | null
   prev_day_vwap: number | null
   fetched_at: string | null
+  // Fields below come from the ticker's most recent market_predictions row (jobs/predict_market_state.py) - all null if that job has never run for this ticker.
+  predicted_date: string | null
+  current_state: string | null
+  predicted_state: string | null
+  state_confidence: number | null
+  expected_return: number | null
+  abs_expected_return_pct: number | null
+  entry_price: number | null
+  exit_price: number | null
+  entry_time: string | null
+  exit_time: string | null
+  history_days: number | null
+  prediction_computed_at: string | null
 }
 
 // Backend caps page_size at 1000 (see app/main.py's TRADING_SYMBOLS_MAX_PAGE_SIZE) -
@@ -252,6 +281,18 @@ async function postJSON<T>(path: string): Promise<T> {
   return res.json()
 }
 
+// Fills in abs_expected_return_pct on a report row fetched from the backend, which only
+// sends expected_return (a signed fraction, e.g. -0.29) - shared by both report fetches
+// below so the derivation lives in one place.
+function withAbsExpectedReturnPct<T extends { expected_return: number | null }>(
+  row: T,
+): T & { abs_expected_return_pct: number | null } {
+  return {
+    ...row,
+    abs_expected_return_pct: row.expected_return == null ? null : Math.abs(row.expected_return) * 100,
+  }
+}
+
 export type TriggerJobResult = { status: 'started' } | { status: 'already-running' }
 
 export const api = {
@@ -276,7 +317,9 @@ export const api = {
   searchTickerTypes: (q: string, limit = 20) =>
     getJSON<TickerTypeOption[]>(`/ticker-types/search?q=${encodeURIComponent(q)}&limit=${limit}`),
   topMoversReport: (tickerTypes: string[] = []) =>
-    getJSON<TopMarketMoverRow[]>(`/reports/top-movers?ticker_types=${encodeURIComponent(tickerTypes.join(','))}`),
+    getJSON<TopMarketMoverRow[]>(`/reports/top-movers?ticker_types=${encodeURIComponent(tickerTypes.join(','))}`).then(
+      (rows) => rows.map(withAbsExpectedReturnPct),
+    ),
   tradingSymbolsReport: (
     tickerTypes: string[] = [],
     page = 1,
@@ -286,7 +329,7 @@ export const api = {
     const orderByParam = orderBy.map(({ field, dir }) => `${field}:${dir}`).join(',')
     return getJSON<TradingSymbolsPage>(
       `/reports/trading-symbols?ticker_types=${encodeURIComponent(tickerTypes.join(','))}&page=${page}&page_size=${pageSize}&order_by=${encodeURIComponent(orderByParam)}`,
-    )
+    ).then((data) => ({ ...data, rows: data.rows.map(withAbsExpectedReturnPct) }))
   },
   staleTickersReport: (
     tickerTypes: string[] = [],
