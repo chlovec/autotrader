@@ -43,6 +43,7 @@ from db.models import (
     SyncState,
     TechnicalIndicator,
     Ticker,
+    TickerDetail,
     TickerType,
     TopMarketMover,
     UnifiedSnapshot,
@@ -66,6 +67,7 @@ from jobs.registry import (
     SNAPSHOT_TYPE_OPTIONS,
     SNAPSHOTS_JOB,
     START_TIME_OPTIONS,
+    TICKER_DETAILS_JOB,
     TICKER_TYPES_JOB,
     TICKERS_JOB,
     UNIFIED_SNAPSHOT_JOB,
@@ -74,6 +76,7 @@ from jobs.sync_bars import DEFAULT_BACKFILL_DAYS, DEFAULT_MULTIPLIER, DEFAULT_TI
 from jobs.sync_indicators import sync_indicator
 from jobs.sync_news import sync_news
 from jobs.sync_snapshots import sync_snapshots
+from jobs.sync_ticker_details import sync_ticker_details
 from jobs.sync_ticker_types import sync_ticker_types
 from jobs.sync_tickers import sync_tickers
 from jobs.sync_top_movers import sync_top_movers
@@ -112,6 +115,11 @@ _job_controls: dict[str, JobControl] = {}
 # schedule_interval_unit/schedule_interval_value takes effect immediately instead of
 # only on the next backend-v2 restart.
 _scheduler: AsyncIOScheduler | None = None
+
+# Set by lifespan on startup - holds a strong reference to the startup sync task so
+# asyncio doesn't garbage-collect it mid-run (a fire-and-forget create_task() with no
+# other reference is only weakly held). Also let's lifespan cancel it on shutdown.
+_startup_sync_task: asyncio.Task[None] | None = None
 
 
 def _get_or_create_config(session: Session, job_name: str) -> JobConfig:
@@ -189,6 +197,17 @@ async def _run_job(job_name: str, trigger: str) -> None:
                 control=control,
             )
             summary = f"{count} snapshot(s) synced"
+        elif job_name == TICKER_DETAILS_JOB:
+            # Same no-shared-DataClient, thread-pool-fan-out reasoning as the
+            # snapshots branch above (see jobs/sync_ticker_details.py).
+            count = await asyncio.to_thread(
+                sync_ticker_details,
+                session,
+                _split_csv(config.ticker_types),
+                _split_csv(config.tickers),
+                control=control,
+            )
+            summary = f"{count} ticker detail(s) synced"
         elif job_name == AVERAGE_VOLUME_JOB:
             # Purely local aggregation over already-synced bars - no DataClient needed,
             # just a blocking DB query, so this runs via asyncio.to_thread the same way
@@ -320,21 +339,33 @@ async def _scheduled_job(job_name: str) -> None:
     await _run_job(job_name, "auto")
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global _scheduler
-    init_db()
-    with SessionLocal() as session:
-        schedules = {name: _get_or_create_config(session, name) for name in JOB_DEFINITIONS}
-
+async def _run_startup_sync_chain() -> None:
     # Sequential, not parallel: the bars job selects tickers out of the tickers table,
     # so a startup run needs tickers synced first, not racing it. ticker-types has no
     # such dependency. Each call also respects that job's `run_type`, same as a
     # scheduled cron fire would - ticker-types defaults to manual, so this is normally
     # a no-op at startup.
+    #
+    # Run as a background task (see lifespan below) rather than awaited inline: this
+    # chain can take a long time (thousands of tickers, one HTTP call each, plus 429
+    # backoff) and awaiting it before `yield` would keep the ASGI app in its "starting
+    # up" state - Uvicorn won't route *any* HTTP traffic, including the Jobs page's own
+    # endpoints, until that phase reports complete. The bars job's own tickers-first
+    # dependency only needs these three calls ordered relative to each other, not
+    # ordered relative to the server accepting requests.
     await _scheduled_job(TICKER_TYPES_JOB)
     await _scheduled_job(TICKERS_JOB)
     await _scheduled_job(BARS_JOB)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _scheduler, _startup_sync_task
+    init_db()
+    with SessionLocal() as session:
+        schedules = {name: _get_or_create_config(session, name) for name in JOB_DEFINITIONS}
+
+    _startup_sync_task = asyncio.create_task(_run_startup_sync_chain())
 
     scheduler = AsyncIOScheduler()
     for name, config in schedules.items():
@@ -358,6 +389,9 @@ async def lifespan(app: FastAPI):
 
     scheduler.shutdown(wait=False)
     _scheduler = None
+    if _startup_sync_task is not None and not _startup_sync_task.done():
+        _startup_sync_task.cancel()
+    _startup_sync_task = None
 
 
 app = FastAPI(title="Autotrader Backend v2", lifespan=lifespan)
@@ -452,6 +486,7 @@ _RESET_TABLES: dict[str, list[type[Base]]] = {
     BARS_JOB: [OhlcBar],
     TICKER_TYPES_JOB: [TickerType],
     SNAPSHOTS_JOB: [CurrentSnapshot],
+    TICKER_DETAILS_JOB: [TickerDetail],
     MOVERS_JOB: [TopMarketMover],
     UNIFIED_SNAPSHOT_JOB: [UnifiedSnapshot],
     NEWS_JOB: [News],
@@ -731,6 +766,23 @@ TRADING_SYMBOLS_ORDERABLE_FIELDS: dict[str, ColumnElement] = {
 }
 
 
+# Shared with the frontend's numericFilter.ts NUMERIC_FILTER_OPS - the four comparison
+# operators trading_symbols_report accepts for entry_price_op.
+NUMERIC_FILTER_OPS = ("<", "<=", ">", ">=")
+
+
+def _numeric_condition_clause(column: ColumnElement, op: str, value: float) -> ColumnElement:
+    if op == "<":
+        return column < value
+    if op == "<=":
+        return column <= value
+    if op == ">":
+        return column > value
+    if op == ">=":
+        return column >= value
+    raise ValueError(f"unsupported numeric filter op: {op}")  # unreachable - op is validated before this is called
+
+
 def _parse_order_by(order_by: str) -> list[tuple[str, str]]:
     """Parses the `order_by` query param, e.g. "todays_change_perc:desc,ticker:asc",
     into [("todays_change_perc", "desc"), ("ticker", "asc")] - the order of entries is
@@ -755,6 +807,8 @@ def trading_symbols_report(
     page: int = 1,
     page_size: int = TRADING_SYMBOLS_DEFAULT_PAGE_SIZE,
     order_by: str = "",
+    entry_price_op: str = "",
+    entry_price_value: float | None = None,
 ) -> dict[str, Any]:
     """Backs the Analytics > Trading Symbols page's report grid: every synced tickers
     row, joined out to its asset_class, most recently computed average_volumes row, and
@@ -773,13 +827,25 @@ def trading_symbols_report(
     orders the whole filtered set rather than just the returned page. Defaults to
     ticker ascending, which is also always appended as a final tiebreaker so pagination
     stays stable when the requested fields have ties (e.g. many tickers sharing the
-    same day_volume)."""
+    same day_volume).
+
+    `entry_price_op`/`entry_price_value` (both required together, e.g. ">" / 10) filter
+    on the same market_predictions.entry_price the report already joins in for
+    abs_expected_return_pct ordering - applied as a real SQL WHERE (unlike ReportGrid's
+    client-side numeric column filters), so it narrows `total`/pagination too, not just
+    the returned page. A ticker with no market_predictions row (entry_price null) never
+    matches any condition, same null-exclusion semantics as the client-side filter."""
     types = _split_csv(ticker_types)
     page = max(1, page)
     page_size = max(1, min(page_size, TRADING_SYMBOLS_MAX_PAGE_SIZE))
     order_fields = _parse_order_by(order_by) or [("ticker", "asc")]
     if "ticker" not in {field for field, _ in order_fields}:
         order_fields = [*order_fields, ("ticker", "asc")]
+    if entry_price_op or entry_price_value is not None:
+        if not entry_price_op or entry_price_value is None:
+            raise HTTPException(422, "entry_price_op and entry_price_value must be provided together")
+        if entry_price_op not in NUMERIC_FILTER_OPS:
+            raise HTTPException(422, f"entry_price_op must be one of {', '.join(NUMERIC_FILTER_OPS)}")
     with SessionLocal() as session:
         count_query = select(func.count(Ticker.ticker))
         # current_snapshots and (the latest per ticker, same pattern as
@@ -806,6 +872,21 @@ def trading_symbols_report(
         if types:
             base_query = base_query.where(Ticker.type.in_(types))
             count_query = count_query.where(Ticker.type.in_(types))
+        if entry_price_op:
+            condition = _numeric_condition_clause(MarketPrediction.entry_price, entry_price_op, entry_price_value)
+            base_query = base_query.where(condition)
+            # count_query doesn't join market_predictions by default (nothing else it
+            # counts needs to) - only add the join here, scoped to this branch, so the
+            # common no-filter case stays as cheap as it was before this filter existed.
+            count_query = (
+                count_query.outerjoin(latest_predicted_date, latest_predicted_date.c.ticker == Ticker.ticker)
+                .outerjoin(
+                    MarketPrediction,
+                    (MarketPrediction.ticker == latest_predicted_date.c.ticker)
+                    & (MarketPrediction.predicted_date == latest_predicted_date.c.predicted_date),
+                )
+                .where(condition)
+            )
         total = session.execute(count_query).scalar_one()
 
         order_clauses = []
@@ -999,6 +1080,70 @@ def stale_tickers_report(
             for ticker in tickers
         ]
         return {"rows": rows, "total": total, "page": page, "page_size": page_size}
+
+
+# start_date's fallback when the caller omits it - see backtest_report's docstring.
+BACKTEST_REPORT_DEFAULT_DAYS = 15
+
+
+def _backtest_point_to_dict(row: MarketPredictionBacktest) -> dict[str, Any]:
+    return {
+        "evaluated_date": row.evaluated_date.isoformat(),
+        "predicted_state": row.predicted_state,
+        "actual_state": row.actual_state,
+        "predicted_correct": row.predicted_correct,
+        "expected_return": row.expected_return,
+        "entry_price": row.entry_price,
+        "predicted_exit_price": row.predicted_exit_price,
+        "actual_exit_price": row.actual_exit_price,
+        "price_error_pct": row.price_error_pct,
+    }
+
+
+@app.get("/reports/backtest")
+def backtest_report(ticker: str, start_date: str = "", end_date: str = "") -> list[dict[str, Any]]:
+    """Backs the View Details chart: a single ticker's market_prediction_backtests rows
+    (jobs/backtest_market_state.py's compute_market_state_backtest output) within
+    [start_date, end_date], ordered by evaluated_date - predicted_exit_price and
+    actual_exit_price are the two series the chart plots against each other.
+
+    `end_date` defaults to yesterday (UTC) and `start_date` to
+    BACKTEST_REPORT_DEFAULT_DAYS days before that, the same "resolve a None date at
+    request time" reasoning as compute_market_state_backtest's own defaulting - except
+    resolved here rather than left to the row data, since (unlike a job run) there's no
+    guarantee a backtest has ever been computed for the requested window."""
+    parsed_end: dt.date
+    if end_date:
+        try:
+            parsed_end = dt.date.fromisoformat(end_date)
+        except ValueError as exc:
+            raise HTTPException(422, "end_date must be an ISO date, e.g. '2026-08-06'") from exc
+    else:
+        parsed_end = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)
+
+    parsed_start: dt.date
+    if start_date:
+        try:
+            parsed_start = dt.date.fromisoformat(start_date)
+        except ValueError as exc:
+            raise HTTPException(422, "start_date must be an ISO date, e.g. '2026-08-06'") from exc
+    else:
+        parsed_start = parsed_end - dt.timedelta(days=BACKTEST_REPORT_DEFAULT_DAYS)
+
+    if parsed_start > parsed_end:
+        raise HTTPException(422, "start_date must not be after end_date")
+
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(MarketPredictionBacktest)
+            .where(
+                MarketPredictionBacktest.ticker == ticker,
+                MarketPredictionBacktest.evaluated_date >= parsed_start,
+                MarketPredictionBacktest.evaluated_date <= parsed_end,
+            )
+            .order_by(MarketPredictionBacktest.evaluated_date.asc())
+        ).scalars().all()
+        return [_backtest_point_to_dict(row) for row in rows]
 
 
 @app.get("/jobs")

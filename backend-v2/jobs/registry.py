@@ -11,6 +11,7 @@ TICKERS_JOB = "sync-tickers"
 BARS_JOB = "sync-bars-nightly"
 TICKER_TYPES_JOB = "sync-ticker-types"
 SNAPSHOTS_JOB = "sync-snapshots"
+TICKER_DETAILS_JOB = "sync-ticker-details"
 MOVERS_JOB = "sync-top-movers"
 UNIFIED_SNAPSHOT_JOB = "sync-unified-snapshot"
 NEWS_JOB = "sync-news"
@@ -51,6 +52,7 @@ DEFAULT_SCHEDULES: dict[str, tuple[str, int]] = {
     BARS_JOB: ("days", 1),
     TICKER_TYPES_JOB: ("days", 1),
     SNAPSHOTS_JOB: ("days", 1),
+    TICKER_DETAILS_JOB: ("days", 1),
     MOVERS_JOB: ("days", 1),
     UNIFIED_SNAPSHOT_JOB: ("days", 1),
     NEWS_JOB: ("days", 1),
@@ -143,6 +145,21 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
         has_ticker_selector=True,
         # Fetches one ticker at a time with no natural daily cadence of its own -
         # manual by default, same reasoning as ticker-types.
+        default_run_type="manual",
+    ),
+    TICKER_DETAILS_JOB: JobDefinition(
+        name=TICKER_DETAILS_JOB,
+        label="Sync ticker details",
+        description=(
+            "Syncs GET /v3/reference/tickers/{ticker} into the ticker_details table for "
+            "the selected tickers or ticker types - market_cap, shares outstanding, "
+            "SIC code/description, and other company fundamentals not carried by the "
+            "sync-tickers job's paged list endpoint."
+        ),
+        has_bars_fields=False,
+        has_ticker_selector=True,
+        # Fetches one ticker at a time with no natural daily cadence of its own -
+        # manual by default, same reasoning as snapshots.
         default_run_type="manual",
     ),
     MOVERS_JOB: JobDefinition(

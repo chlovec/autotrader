@@ -136,6 +136,33 @@ class CurrentSnapshot(Base):
     fetched_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
 
 
+class TickerDetail(Base):
+    """One row per ticker's company/fundamentals data from GET /v3/reference/
+    tickers/{ticker} - massive.com's *singular* ticker-details endpoint, distinct from
+    the paged list endpoint (GET /v3/reference/tickers) jobs/sync_tickers.py already
+    syncs into Ticker itself. The list endpoint's per-ticker payload doesn't carry
+    market_cap/shares-outstanding at all; this is the only sync job that fetches them.
+
+    Kept as its own table rather than added onto Ticker, same reasoning as
+    CurrentSnapshot: a separate per-ticker fetch with its own cadence, upserted
+    wholesale on every run (there's no history kept) rather than accumulated - see
+    jobs/sync_ticker_details.py."""
+
+    __tablename__ = "ticker_details"
+
+    ticker: Mapped[str] = mapped_column(ForeignKey("tickers.ticker"), primary_key=True)
+    market_cap: Mapped[float | None] = mapped_column(Float)
+    share_class_shares_outstanding: Mapped[float | None] = mapped_column(Float)
+    weighted_shares_outstanding: Mapped[float | None] = mapped_column(Float)
+    sic_code: Mapped[str | None] = mapped_column(String)
+    sic_description: Mapped[str | None] = mapped_column(String)
+    homepage_url: Mapped[str | None] = mapped_column(String)
+    total_employees: Mapped[int | None] = mapped_column(Integer)
+    list_date: Mapped[dt.date | None] = mapped_column(Date)
+    round_lot: Mapped[int | None] = mapped_column(Integer)
+    fetched_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
+
+
 class TopMarketMover(Base):
     """One row per ticker currently on the top-gainers or top-losers list from GET
     /v2/snapshot/locale/us/markets/stocks/{direction}, keyed by (ticker, direction) -

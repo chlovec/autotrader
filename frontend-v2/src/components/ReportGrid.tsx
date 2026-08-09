@@ -1,5 +1,6 @@
 import { createPortal } from 'react-dom'
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react'
+import { isNumericFilterOp, matchesCondition, type NumericCondition } from '../numericFilter'
 import { ColumnHeaderMenu } from './ColumnHeaderMenu'
 import { useAnchoredDropdown } from './useAnchoredDropdown'
 
@@ -39,6 +40,7 @@ type SavedView<Key extends string> = {
   sortKey: Key | null
   sortDir: SortDir
   filters: Partial<Record<Key, string[]>>
+  numericFilters: Partial<Record<Key, NumericCondition[]>>
   frozenKeys: Key[]
   hiddenKeys: Key[]
   columnWidths: Partial<Record<Key, number>>
@@ -63,6 +65,17 @@ function loadSavedView<Key extends string>(id: string, validKeys: Set<Key>): Sav
       filters: Object.fromEntries(Object.entries(parsed.filters ?? {}).filter(([key]) => isValidKey(key))) as Partial<
         Record<Key, string[]>
       >,
+      numericFilters: Object.fromEntries(
+        Object.entries(parsed.numericFilters ?? {})
+          .filter(([key]) => isValidKey(key))
+          .map(([key, conditions]) => [
+            key,
+            (conditions ?? []).filter(
+              (c): c is NumericCondition => isNumericFilterOp(c?.op) && typeof c?.value === 'number' && Number.isFinite(c.value),
+            ),
+          ])
+          .filter(([, conditions]) => (conditions as NumericCondition[]).length > 0),
+      ) as Partial<Record<Key, NumericCondition[]>>,
       frozenKeys: (parsed.frozenKeys ?? []).filter(isValidKey) as Key[],
       hiddenKeys: (parsed.hiddenKeys ?? []).filter(isValidKey) as Key[],
       columnWidths: Object.fromEntries(
@@ -221,6 +234,13 @@ export function ReportGrid<T>({
       Record<Key, Set<string>>
     >
   })
+  // Missing/empty for a column means "no condition applied" - numeric columns only (see
+  // numericKeys below); a value here is always ANDed with that column's value-set filter
+  // above if both happen to be set, and multiple conditions on the same column (e.g. >=10
+  // and <=50) are ANDed with each other, giving a range.
+  const [numericFilters, setNumericFilters] = useState<Partial<Record<Key, NumericCondition[]>>>(
+    initialView?.numericFilters ?? {},
+  )
   const [frozenKeys, setFrozenKeys] = useState<Set<Key>>(new Set(initialView?.frozenKeys ?? []))
   const [hiddenKeys, setHiddenKeys] = useState<Set<Key>>(new Set(initialView?.hiddenKeys ?? []))
   // Pixel offset (sum of the widths of the frozen columns before it, in visible column
@@ -274,6 +294,7 @@ export function ReportGrid<T>({
       filters: Object.fromEntries(
         Object.entries(filters).map(([key, values]) => [key, Array.from(values as Set<string>)]),
       ) as Partial<Record<Key, string[]>>,
+      numericFilters,
       frozenKeys: Array.from(frozenKeys),
       hiddenKeys: Array.from(hiddenKeys),
       columnWidths,
@@ -289,12 +310,36 @@ export function ReportGrid<T>({
     setSortKey(null)
     setSortDir('asc')
     setFilters({})
+    setNumericFilters({})
     setFrozenKeys(new Set())
     setHiddenKeys(new Set())
     setColumnWidths({})
   }
 
   const visibleColumns = useMemo(() => columns.filter((col) => !hiddenKeys.has(col.key)), [columns, hiddenKeys])
+
+  // A column counts as numeric when every non-null raw value seen for it (across the
+  // full result, same reasoning as columnValues below) is a number - gates whether
+  // ColumnHeaderMenu offers the </<=/>/>= condition filter for it, alongside (not
+  // instead of) the value checklist every column already gets.
+  const numericKeys = useMemo(() => {
+    const set = new Set<Key>()
+    for (const col of columns) {
+      let sawNumber = false
+      let sawNonNumber = false
+      for (const row of rows) {
+        const value = row[col.key]
+        if (value == null) continue
+        if (typeof value === 'number') sawNumber = true
+        else {
+          sawNonNumber = true
+          break
+        }
+      }
+      if (sawNumber && !sawNonNumber) set.add(col.key)
+    }
+    return set
+  }, [columns, rows])
 
   // Every distinct formatted value per column, computed from the full result (not the
   // filtered/sorted view) so a column's own filter dropdown always offers every value
@@ -312,10 +357,19 @@ export function ReportGrid<T>({
   }, [columns, rows, formatCell])
 
   const filteredRows = useMemo(() => {
-    const active = Object.entries(filters) as [Key, Set<string>][]
-    if (active.length === 0) return rows
-    return rows.filter((row) => active.every(([key, allowed]) => allowed.has(formatCell(row, key))))
-  }, [rows, filters, formatCell])
+    const activeValues = Object.entries(filters) as [Key, Set<string>][]
+    const activeNumeric = (Object.entries(numericFilters) as [Key, NumericCondition[]][]).filter(
+      ([, conditions]) => conditions.length > 0,
+    )
+    if (activeValues.length === 0 && activeNumeric.length === 0) return rows
+    return rows.filter((row) => {
+      if (!activeValues.every(([key, allowed]) => allowed.has(formatCell(row, key)))) return false
+      return activeNumeric.every(([key, conditions]) => {
+        const value = row[key]
+        return typeof value === 'number' && conditions.every((condition) => matchesCondition(value, condition))
+      })
+    })
+  }, [rows, filters, numericFilters, formatCell])
 
   const sortedRows = useMemo(() => {
     if (!sortKey) return filteredRows
@@ -331,6 +385,18 @@ export function ReportGrid<T>({
     setFilters((prev) => {
       const copy = { ...prev }
       if (next === null) {
+        delete copy[key]
+      } else {
+        copy[key] = next
+      }
+      return copy
+    })
+  }
+
+  const setNumericColumnFilter = (key: Key, next: NumericCondition[] | null) => {
+    setNumericFilters((prev) => {
+      const copy = { ...prev }
+      if (next === null || next.length === 0) {
         delete copy[key]
       } else {
         copy[key] = next
@@ -512,11 +578,14 @@ export function ReportGrid<T>({
                       frozen={isFrozen}
                       values={columnValues[col.key] ?? []}
                       selected={filters[col.key] ?? null}
+                      numeric={numericKeys.has(col.key)}
+                      numericConditions={numericFilters[col.key] ?? null}
                       onSortAsc={() => setSort(col.key, 'asc')}
                       onSortDesc={() => setSort(col.key, 'desc')}
                       onToggleFrozen={() => toggleFrozen(col.key)}
                       onHide={() => toggleHidden(col.key)}
                       onFilterChange={(next) => setColumnFilter(col.key, next)}
+                      onNumericFilterChange={(next) => setNumericColumnFilter(col.key, next)}
                     />
                     {/* mousedown-only drag target - not a <button>, so it doesn't also
                         register as a click on ColumnHeaderMenu's own trigger next to it. */}

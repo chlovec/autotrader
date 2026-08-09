@@ -1,3 +1,5 @@
+import type { NumericFilterOp } from './numericFilter'
+
 // backend-v2's API (app/main.py), launched via bin/restart-v2.sh's run_jobs.py -
 // separate from v1's frontend/src/api.ts, which points at the repo-root backend instead.
 export const API_BASE = import.meta.env.VITE_BACKEND_V2_URL ?? 'http://localhost:8001'
@@ -222,6 +224,15 @@ export interface TradingSymbolOrderField {
   dir: 'asc' | 'desc'
 }
 
+// A real SQL WHERE, unlike ReportGrid's client-side numeric column filters - see
+// app/main.py's trading_symbols_report. Both fields are required together; there's no
+// "no filter" value here because the caller (TradingSymbolsPage) only constructs one of
+// these once the operator and value are both set, passing `undefined` otherwise.
+export interface NumericFilter {
+  op: NumericFilterOp
+  value: number
+}
+
 // One row per ticker whose most recent daily ohlc_bars row is stale or missing - backs
 // the Analytics > Stale Tickers report grid (see app/main.py's stale_tickers_report).
 // type_class/type_description are resolved from the ticker_types table the same
@@ -251,6 +262,20 @@ export interface StaleTickersReport {
 export interface StaleTickerOrderField {
   field: string
   dir: 'asc' | 'desc'
+}
+
+// One row per (ticker, evaluated_date) from backend-v2's market_prediction_backtests
+// table - backs the View Details chart's backtest-vs-actual price series.
+export interface BacktestPoint {
+  evaluated_date: string
+  predicted_state: string
+  actual_state: string
+  predicted_correct: boolean
+  expected_return: number
+  entry_price: number
+  predicted_exit_price: number
+  actual_exit_price: number
+  price_error_pct: number
 }
 
 async function getJSON<T>(path: string): Promise<T> {
@@ -325,10 +350,14 @@ export const api = {
     page = 1,
     pageSize = TRADING_SYMBOLS_MAX_PAGE_SIZE,
     orderBy: TradingSymbolOrderField[] = [],
+    entryPriceFilter?: NumericFilter,
   ) => {
     const orderByParam = orderBy.map(({ field, dir }) => `${field}:${dir}`).join(',')
+    const entryPriceParam = entryPriceFilter
+      ? `&entry_price_op=${encodeURIComponent(entryPriceFilter.op)}&entry_price_value=${entryPriceFilter.value}`
+      : ''
     return getJSON<TradingSymbolsPage>(
-      `/reports/trading-symbols?ticker_types=${encodeURIComponent(tickerTypes.join(','))}&page=${page}&page_size=${pageSize}&order_by=${encodeURIComponent(orderByParam)}`,
+      `/reports/trading-symbols?ticker_types=${encodeURIComponent(tickerTypes.join(','))}&page=${page}&page_size=${pageSize}&order_by=${encodeURIComponent(orderByParam)}${entryPriceParam}`,
     ).then((data) => ({ ...data, rows: data.rows.map(withAbsExpectedReturnPct) }))
   },
   staleTickersReport: (
@@ -343,4 +372,11 @@ export const api = {
       `/reports/stale-tickers?ticker_types=${encodeURIComponent(tickerTypes.join(','))}&stale_after_days=${staleAfterDays}&page=${page}&page_size=${pageSize}&order_by=${encodeURIComponent(orderByParam)}`,
     )
   },
+  // startDate/endDate are ISO dates ("YYYY-MM-DD"); omit either to let the backend
+  // default to its trailing-15-day window ending yesterday (UTC) - see app/main.py's
+  // backtest_report.
+  backtestReport: (ticker: string, startDate?: string, endDate?: string) =>
+    getJSON<BacktestPoint[]>(
+      `/reports/backtest?ticker=${encodeURIComponent(ticker)}&start_date=${encodeURIComponent(startDate ?? '')}&end_date=${encodeURIComponent(endDate ?? '')}`,
+    ),
 }

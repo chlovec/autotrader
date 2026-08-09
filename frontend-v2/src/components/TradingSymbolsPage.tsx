@@ -6,6 +6,7 @@ import {
   type TradingSymbolOrderField,
   type TradingSymbolRow,
 } from '../api'
+import { NUMERIC_FILTER_OPS, type NumericFilterOp } from '../numericFilter'
 import { loadReportParams, saveReportParams } from '../reportParams'
 import { ReportGrid, type ReportColumn } from './ReportGrid'
 import { SearchableSelect, type SelectOption } from './SearchableSelect'
@@ -17,6 +18,8 @@ type SavedParams = {
   tickerTypes: string[]
   pageSize: number
   orderBy: TradingSymbolOrderField[]
+  entryPriceOp: NumericFilterOp | ''
+  entryPriceValue: string
 }
 
 // Backend caps /ticker-types/search's limit at 50 (see app/main.py's search_ticker_types) -
@@ -126,6 +129,13 @@ export function TradingSymbolsPage() {
   // sort key), same convention as SearchableSelect's chip order. Sent to the backend
   // as-is on the next fetch, same as tickerTypes below.
   const [orderBy, setOrderBy] = useState<TradingSymbolOrderField[]>(() => loadSavedParams()?.orderBy ?? [])
+  // A real backend filter (see app/main.py's trading_symbols_report), unlike
+  // ReportGrid's client-side numeric column filters - '' means "no operator chosen
+  // yet", distinct from a chosen operator with a blank/unparseable value (see
+  // entryPriceFilter below), so the two inputs can be edited independently without one
+  // half silently clearing the other.
+  const [entryPriceOp, setEntryPriceOp] = useState<NumericFilterOp | ''>(() => loadSavedParams()?.entryPriceOp ?? '')
+  const [entryPriceValue, setEntryPriceValue] = useState(() => loadSavedParams()?.entryPriceValue ?? '')
   // Draft value bound to the page-size input, distinct from `pageSize` below (the
   // value the currently-displayed page was actually fetched with) - editing this
   // doesn't affect what's on screen, or what Prev/Next page through, until "Run
@@ -152,11 +162,19 @@ export function TradingSymbolsPage() {
       .then((matches) => setTickerTypeOptions(matches.map((t) => ({ value: t.code, label: tickerTypeLabel(t) }))))
   }, [])
 
+  // undefined (not sent to the backend at all) until both an operator is chosen and a
+  // parseable value typed - matches ColumnHeaderMenu's numeric condition rows, where a
+  // half-filled row is treated as not-yet-active rather than an error.
+  const entryPriceFilter =
+    entryPriceOp && entryPriceValue.trim() !== '' && Number.isFinite(Number(entryPriceValue))
+      ? { op: entryPriceOp, value: Number(entryPriceValue) }
+      : undefined
+
   const fetchPage = async (targetPage: number, requestedPageSize: number) => {
     setLoading(true)
     setError(null)
     try {
-      const result = await api.tradingSymbolsReport(tickerTypes, targetPage, requestedPageSize, orderBy)
+      const result = await api.tradingSymbolsReport(tickerTypes, targetPage, requestedPageSize, orderBy, entryPriceFilter)
       setRows(result.rows)
       setTotal(result.total)
       setPage(result.page)
@@ -185,7 +203,13 @@ export function TradingSymbolsPage() {
     if (paramsSavedFlashTimeout.current) window.clearTimeout(paramsSavedFlashTimeout.current)
   }, [])
   const saveParams = () => {
-    saveReportParams<SavedParams>(REPORT_PARAMS_ID, { tickerTypes, pageSize: pageSizeInput, orderBy })
+    saveReportParams<SavedParams>(REPORT_PARAMS_ID, {
+      tickerTypes,
+      pageSize: pageSizeInput,
+      orderBy,
+      entryPriceOp,
+      entryPriceValue,
+    })
     setParamsJustSaved(true)
     if (paramsSavedFlashTimeout.current) window.clearTimeout(paramsSavedFlashTimeout.current)
     paramsSavedFlashTimeout.current = window.setTimeout(() => setParamsJustSaved(false), 1500)
@@ -236,6 +260,27 @@ export function TradingSymbolsPage() {
               placeholder="Search ticker types... (leave blank for all)"
             />
           </div>
+          <div className="job-field report-entry-price-field">
+            <span className="job-field-label">Entry price</span>
+            <div className="report-entry-price-inputs">
+              <select value={entryPriceOp} onChange={(event) => setEntryPriceOp(event.target.value as NumericFilterOp | '')}>
+                <option value="">Any</option>
+                {NUMERIC_FILTER_OPS.map((op) => (
+                  <option key={op} value={op}>
+                    {op}
+                  </option>
+                ))}
+              </select>
+              <input
+                type="number"
+                placeholder="Value"
+                value={entryPriceValue}
+                onChange={(event) => setEntryPriceValue(event.target.value)}
+              />
+            </div>
+          </div>
+        </div>
+        <div className="report-controls-fields">
           <div className="job-field report-page-size-field">
             <span className="job-field-label">Page size</span>
             <input

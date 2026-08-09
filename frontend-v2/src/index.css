@@ -8,6 +8,7 @@
   --gridline: #e1e0d9;
   --border: rgba(11, 11, 11, 0.1);
   --series-1: #2a78d6;
+  --series-2: #eb6834;
   --status-critical: #d03b3b;
 }
 
@@ -22,6 +23,7 @@
     --gridline: #2c2c2a;
     --border: rgba(255, 255, 255, 0.1);
     --series-1: #3987e5;
+    --series-2: #d95926;
     --status-critical: #d03b3b;
   }
 }
@@ -36,6 +38,7 @@
   --gridline: #2c2c2a;
   --border: rgba(255, 255, 255, 0.1);
   --series-1: #3987e5;
+  --series-2: #d95926;
   --status-critical: #d03b3b;
 }
 
@@ -969,6 +972,30 @@ body {
   width: 120px;
 }
 
+/* Entry price report filter (Trading Symbols) - a real backend WHERE, unlike
+   ReportGrid's client-side numeric column filters. Same op-select + value-input pair
+   shape as ColumnHeaderMenu's "Filter by condition" rows, just wider since it sits
+   inline with the other report-level fields rather than in a narrow dropdown. */
+.report-entry-price-field {
+  flex: none;
+  width: 200px;
+}
+
+.report-entry-price-inputs {
+  display: flex;
+  gap: 8px;
+}
+
+.report-entry-price-inputs select {
+  flex: 0 0 auto;
+  width: 72px;
+}
+
+.report-entry-price-inputs input {
+  flex: 1;
+  min-width: 0;
+}
+
 .report-order-by-field {
   min-width: 260px;
   max-width: 420px;
@@ -1287,6 +1314,13 @@ body {
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
   color: var(--text-primary);
   font-size: 13px;
+  /* Without this, .report-filter-list's own min-height (160px) can force the flex
+     column taller than max-height once enough sections are stacked below it (e.g. a
+     numeric column's "Filter by condition" rows, added below "Filter values") -
+     max-height alone doesn't clip a flex container's children, so content below the
+     fold would be genuinely unreachable on a position: fixed element. Scrolling the
+     whole dropdown, not just the inner list, keeps every section reachable. */
+  overflow-y: auto;
 }
 
 .report-menu-item {
@@ -1421,6 +1455,60 @@ body {
   padding: 8px;
   color: var(--text-muted);
   font-size: 12px;
+}
+
+/* </<=/>/>= condition filter, offered alongside the value checklist above for numeric
+   columns only - see ColumnHeaderMenu.tsx's `numeric` prop. */
+.report-numeric-filter {
+  padding: 2px 12px 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.report-numeric-filter-row {
+  display: flex;
+  gap: 6px;
+}
+
+.report-numeric-filter-select {
+  flex: 0 0 auto;
+  width: 56px;
+  height: 28px;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--page);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.report-numeric-filter-input {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--page);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.report-numeric-filter-select:focus,
+.report-numeric-filter-input:focus {
+  outline: 2px solid var(--series-1);
+  outline-offset: -1px;
+}
+
+.report-numeric-filter-hint {
+  margin: 2px 0 0;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.report-numeric-filter-actions {
+  padding-top: 0;
 }
 
 .report-filter-apply-wrap {
@@ -1626,5 +1714,172 @@ body {
 @media (max-width: 480px) {
   .detail-modal-grid {
     grid-template-columns: 1fr;
+  }
+}
+
+/* Backtest-vs-actual chart at the top of TickerDetailsModal - see
+   components/BacktestChart.tsx. --series-1 (blue, the app's one existing accent) reads
+   as "actual" (ground truth); --series-2 (orange) as "predicted" (a forecast/estimate) -
+   fixed categorical order per the dataviz palette (slot 1, slot 2), plus a dashed stroke
+   on the predicted line so the two are never distinguished by color alone. */
+.backtest-chart {
+  position: relative;
+  margin-bottom: 16px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.backtest-chart-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.backtest-chart-toolbar .job-field {
+  flex: 0 0 auto;
+  width: 160px;
+}
+
+.backtest-chart-legend {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-left: auto;
+  padding-bottom: 6px;
+}
+
+.backtest-chart-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.backtest-chart-svg {
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+
+.gridline {
+  stroke: var(--gridline);
+  stroke-width: 1;
+}
+
+.axis-label {
+  fill: var(--text-muted);
+  font-size: 11px;
+}
+
+.crosshair {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.link-button {
+  background: none;
+  border: none;
+  color: var(--series-1);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 8px 0 0;
+}
+
+.link-button:hover {
+  text-decoration: underline;
+}
+
+.backtest-actual-line {
+  stroke: var(--series-1);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.backtest-predicted-line {
+  stroke: var(--series-2);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  stroke-dasharray: 5 4;
+}
+
+.backtest-actual-dot {
+  fill: var(--series-1);
+  stroke: var(--surface-1);
+  stroke-width: 2;
+}
+
+.backtest-predicted-dot {
+  fill: var(--series-2);
+  stroke: var(--surface-1);
+  stroke-width: 2;
+}
+
+.backtest-chart-tooltip {
+  position: absolute;
+  top: 8px;
+  transform: translateX(-50%);
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  pointer-events: none;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  white-space: nowrap;
+}
+
+.backtest-chart-tooltip strong {
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.backtest-chart-tooltip span {
+  color: var(--text-secondary);
+}
+
+.backtest-chart-table {
+  width: 100%;
+  margin-top: 10px;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.backtest-chart-table th,
+.backtest-chart-table td {
+  padding: 6px 10px;
+  text-align: right;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-secondary);
+}
+
+.backtest-chart-table th:first-child,
+.backtest-chart-table td:first-child {
+  text-align: left;
+}
+
+.backtest-chart-table th {
+  color: var(--text-muted);
+  font-weight: 500;
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+
+.backtest-chart-table td.emphasis {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+@media (max-width: 768px) {
+  .backtest-chart-legend {
+    margin-left: 0;
   }
 }

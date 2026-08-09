@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { BacktestChart } from './BacktestChart'
 import { ColumnsMenu, type ReportColumn } from './ReportGrid'
 
 const HIDDEN_FIELDS_STORAGE_KEY = 'view-details-hidden-fields'
@@ -49,7 +50,17 @@ type TickerDetailsModalProps<T> = {
 // multi-column field grid instead of one wide table row. Which fields are hidden is
 // persisted globally (loadHiddenFields/saveHiddenFields above), independent of
 // ReportGrid's own per-report "Save view" (which only covers the grid itself).
-export function TickerDetailsModal<T>({ row, title, columns, formatCell, onClose }: TickerDetailsModalProps<T>) {
+//
+// T is constrained to { ticker: string } (rather than left fully generic) so the
+// backtest-vs-actual chart at the top can be keyed off the row's ticker - every caller
+// so far (TopMarketMoverRow, TradingSymbolRow) already satisfies this.
+export function TickerDetailsModal<T extends { ticker: string }>({
+  row,
+  title,
+  columns,
+  formatCell,
+  onClose,
+}: TickerDetailsModalProps<T>) {
   type Key = Extract<keyof T, string>
 
   const initialHiddenRef = useRef<Set<string> | undefined>(undefined)
@@ -110,6 +121,8 @@ export function TickerDetailsModal<T>({ row, title, columns, formatCell, onClose
             ×
           </button>
         </div>
+
+        <BacktestChart ticker={row.ticker} />
 
         <div className="detail-modal-toolbar">
           <ColumnsMenu
