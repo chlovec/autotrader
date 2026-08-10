@@ -45,6 +45,7 @@ export interface Job {
   has_snapshot_type_filter: boolean
   has_average_volume_fields: boolean
   has_backtest_fields: boolean
+  has_prediction_start_date_field: boolean
   // Always the full massive.com asset-class list (jobs/registry.py's
   // SNAPSHOT_TYPE_OPTIONS), regardless of has_snapshot_type_filter - fetched from the
   // backend rather than hardcoded here so the two never drift.
@@ -69,6 +70,9 @@ export interface Job {
   // compute_market_state_backtest.
   backtest_start_date: string | null
   backtest_end_date: string | null
+  // ISO date ("YYYY-MM-DD"), or null to default to tomorrow (UTC) at run time - see
+  // backend-v2 jobs/predict_market_state_10_day.py's compute_10_day_market_state_predictions.
+  prediction_start_date: string | null
   // Persisted (JobConfig.hidden), not display-only - keeps a job off the Jobs page's
   // default list across reloads until explicitly unhidden. Independent of running/
   // paused: a hidden job still runs on its schedule, it's just tucked away here.
@@ -96,6 +100,7 @@ export interface JobConfigInput {
   average_volume_days_interval?: number | null
   backtest_start_date?: string | null
   backtest_end_date?: string | null
+  prediction_start_date?: string | null
 }
 
 export interface TickerOption {
@@ -272,6 +277,117 @@ export interface StaleTickerOrderField {
   dir: 'asc' | 'desc'
 }
 
+// One row per ticker's most recent market_predictions_10_day run (jobs/
+// predict_market_state_10_day.py) - backs the Analytics > Next 10 Day Predictions
+// report grid. Unlike TradingSymbolRow, a ticker with no 10-day prediction never
+// appears here at all (see app/main.py's next_10_day_predictions_report) rather than
+// showing up with every dayN_* field null.
+export interface Next10DayPredictionRow {
+  ticker: string
+  name: string | null
+  type: string | null
+  asset_class: string | null
+  average_volume: number | null
+  market_cap: number | null
+  // ISO date ("YYYY-MM-DD") - the prediction's own start date, not necessarily today.
+  start_date: string
+  current_state: string
+  day1_predicted_state: string
+  day1_state_confidence: number
+  day1_entry_price: number
+  day1_exit_price: number
+  day1_expected_return_pct: number
+  day1_entry_time: string
+  day1_exit_time: string
+  day2_predicted_state: string
+  day2_state_confidence: number
+  day2_entry_price: number
+  day2_exit_price: number
+  day2_expected_return_pct: number
+  day2_entry_time: string
+  day2_exit_time: string
+  day3_predicted_state: string
+  day3_state_confidence: number
+  day3_entry_price: number
+  day3_exit_price: number
+  day3_expected_return_pct: number
+  day3_entry_time: string
+  day3_exit_time: string
+  day4_predicted_state: string
+  day4_state_confidence: number
+  day4_entry_price: number
+  day4_exit_price: number
+  day4_expected_return_pct: number
+  day4_entry_time: string
+  day4_exit_time: string
+  day5_predicted_state: string
+  day5_state_confidence: number
+  day5_entry_price: number
+  day5_exit_price: number
+  day5_expected_return_pct: number
+  day5_entry_time: string
+  day5_exit_time: string
+  day6_predicted_state: string
+  day6_state_confidence: number
+  day6_entry_price: number
+  day6_exit_price: number
+  day6_expected_return_pct: number
+  day6_entry_time: string
+  day6_exit_time: string
+  day7_predicted_state: string
+  day7_state_confidence: number
+  day7_entry_price: number
+  day7_exit_price: number
+  day7_expected_return_pct: number
+  day7_entry_time: string
+  day7_exit_time: string
+  day8_predicted_state: string
+  day8_state_confidence: number
+  day8_entry_price: number
+  day8_exit_price: number
+  day8_expected_return_pct: number
+  day8_entry_time: string
+  day8_exit_time: string
+  day9_predicted_state: string
+  day9_state_confidence: number
+  day9_entry_price: number
+  day9_exit_price: number
+  day9_expected_return_pct: number
+  day9_entry_time: string
+  day9_exit_time: string
+  day10_predicted_state: string
+  day10_state_confidence: number
+  day10_entry_price: number
+  day10_exit_price: number
+  day10_expected_return_pct: number
+  day10_entry_time: string
+  day10_exit_time: string
+  // ABS(exit - entry) * 100 / exit over the given day range - a non-negative
+  // magnitude-of-move percentage normalized against the range's exit price, computed
+  // server-side (see app/main.py's _next_10_day_prediction_fields), not a signed return.
+  net_return_pct_days_1_5: number
+  net_return_pct_days_6_10: number
+  net_return_pct_days_1_10: number
+  computed_at: string
+}
+
+// Backend caps page_size at 1000 (see app/main.py's NEXT_10_DAY_PREDICTIONS_MAX_PAGE_SIZE).
+export const NEXT_10_DAY_PREDICTIONS_MAX_PAGE_SIZE = 1000
+
+export interface Next10DayPredictionsReport {
+  rows: Next10DayPredictionRow[]
+  total: number
+  page: number
+  page_size: number
+}
+
+// Sort priority for the Next 10 Day Predictions report - same shape/reasoning as
+// TradingSymbolOrderField, against NEXT_10_DAY_PREDICTIONS_ORDERABLE_FIELDS instead.
+export interface Next10DayPredictionOrderField {
+  field: string
+  dir: 'asc' | 'desc'
+}
+
 // One row per (ticker, evaluated_date) from backend-v2's market_prediction_backtests
 // table - backs the View Details chart's backtest-vs-actual price series.
 export interface BacktestPoint {
@@ -359,14 +475,35 @@ export const api = {
     pageSize = TRADING_SYMBOLS_MAX_PAGE_SIZE,
     orderBy: TradingSymbolOrderField[] = [],
     entryPriceFilter?: NumericFilter,
+    marketCapFilter?: NumericFilter,
+    tickers: string[] = [],
   ) => {
     const orderByParam = orderBy.map(({ field, dir }) => `${field}:${dir}`).join(',')
     const entryPriceParam = entryPriceFilter
       ? `&entry_price_op=${encodeURIComponent(entryPriceFilter.op)}&entry_price_value=${entryPriceFilter.value}`
       : ''
+    const marketCapParam = marketCapFilter
+      ? `&market_cap_op=${encodeURIComponent(marketCapFilter.op)}&market_cap_value=${marketCapFilter.value}`
+      : ''
     return getJSON<TradingSymbolsPage>(
-      `/reports/trading-symbols?ticker_types=${encodeURIComponent(tickerTypes.join(','))}&page=${page}&page_size=${pageSize}&order_by=${encodeURIComponent(orderByParam)}${entryPriceParam}`,
+      `/reports/trading-symbols?ticker_types=${encodeURIComponent(tickerTypes.join(','))}&tickers=${encodeURIComponent(tickers.join(','))}&page=${page}&page_size=${pageSize}&order_by=${encodeURIComponent(orderByParam)}${entryPriceParam}${marketCapParam}`,
     ).then((data) => ({ ...data, rows: data.rows.map(withAbsExpectedReturnPct) }))
+  },
+  next10DayPredictionsReport: (
+    tickerTypes: string[] = [],
+    tickers: string[] = [],
+    page = 1,
+    pageSize = NEXT_10_DAY_PREDICTIONS_MAX_PAGE_SIZE,
+    orderBy: Next10DayPredictionOrderField[] = [],
+    marketCapFilter?: NumericFilter,
+  ) => {
+    const orderByParam = orderBy.map(({ field, dir }) => `${field}:${dir}`).join(',')
+    const marketCapParam = marketCapFilter
+      ? `&market_cap_op=${encodeURIComponent(marketCapFilter.op)}&market_cap_value=${marketCapFilter.value}`
+      : ''
+    return getJSON<Next10DayPredictionsReport>(
+      `/reports/next-10-day-predictions?ticker_types=${encodeURIComponent(tickerTypes.join(','))}&tickers=${encodeURIComponent(tickers.join(','))}&page=${page}&page_size=${pageSize}&order_by=${encodeURIComponent(orderByParam)}${marketCapParam}`,
+    )
   },
   staleTickersReport: (
     tickerTypes: string[] = [],

@@ -1011,26 +1011,27 @@ body {
   width: 120px;
 }
 
-/* Entry price report filter (Trading Symbols) - a real backend WHERE, unlike
-   ReportGrid's client-side numeric column filters. Same op-select + value-input pair
-   shape as ColumnHeaderMenu's "Filter by condition" rows, just wider since it sits
-   inline with the other report-level fields rather than in a narrow dropdown. */
-.report-entry-price-field {
+/* Numeric report filters (Trading Symbols' entry price/market cap) - a real backend
+   WHERE, unlike ReportGrid's client-side numeric column filters. Same op-select +
+   value-input pair shape as ColumnHeaderMenu's "Filter by condition" rows, just wider
+   since it sits inline with the other report-level fields rather than in a narrow
+   dropdown. Shared by every such field rather than duplicated per field. */
+.report-numeric-filter-field {
   flex: none;
   width: 200px;
 }
 
-.report-entry-price-inputs {
+.report-numeric-filter-inputs {
   display: flex;
   gap: 8px;
 }
 
-.report-entry-price-inputs select {
+.report-numeric-filter-inputs select {
   flex: 0 0 auto;
   width: 72px;
 }
 
-.report-entry-price-inputs input {
+.report-numeric-filter-inputs input {
   flex: 1;
   min-width: 0;
 }

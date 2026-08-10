@@ -1,14 +1,17 @@
 #!/bin/bash
-# Stops the v2 processes this repo can start: backend-v2's scheduled data-sync jobs
-# (run_jobs.py) and the frontend-v2 Vite dashboard dev server. Matches by command line
-# (pgrep -f) rather than tracking PIDs, so it works no matter how the processes were
-# started (restart-v2.sh, run by hand, `make backend-v2`, ...). Mirrors bin/stop.sh's
-# shape for v1; entirely independent of it - stopping v2 never touches v1's backend,
-# dashboard, trading loop, or research run, and vice versa.
+# Stops the v2 processes this repo can start: backend-v2's dashboard API (run_jobs.py),
+# its job-execution process (job_runner.py - runs every sync/compute job on its own
+# schedule, separate from the API so a heavy job's CPU/DB usage never makes the
+# dashboard unresponsive; see backend-v2/jobs/engine.py's module docstring), and the
+# frontend-v2 Vite dashboard dev server. Matches by command line (pgrep -f) rather than
+# tracking PIDs, so it works no matter how the processes were started (restart-v2.sh,
+# run by hand, `make backend-v2`, ...). Mirrors bin/stop.sh's shape for v1; entirely
+# independent of it - stopping v2 never touches v1's backend, dashboard, trading loop,
+# or research run, and vice versa.
 #
-# Usage: ./bin/stop-v2.sh [--skip-backend] [--skip-dashboard] [--yes]
+# Usage: ./bin/stop-v2.sh [--skip-backend] [--skip-jobs] [--skip-dashboard] [--yes]
 # With no --skip-*/--yes flags, asks about each service one by one (Stop backend-v2?
-# [Y/n], etc.) so you can leave either one running. A --skip-* flag answers that one
+# [Y/n], etc.) so you can leave any of them running. A --skip-* flag answers that one
 # service's question in advance without being asked; --yes suppresses all prompts
 # (including the final "stop these processes?" list confirmation) - restart-v2.sh uses
 # --yes since it already asked the same questions itself before calling here.
@@ -17,16 +20,18 @@ set -euo pipefail
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
 SKIP_BACKEND=0; BACKEND_SET=0
+SKIP_JOBS=0; JOBS_SET=0
 SKIP_DASHBOARD=0; DASHBOARD_SET=0
 ASSUME_YES=0
 
 usage() {
-  echo "Usage: $0 [--skip-backend] [--skip-dashboard] [--yes]"
+  echo "Usage: $0 [--skip-backend] [--skip-jobs] [--skip-dashboard] [--yes]"
 }
 
 for arg in "$@"; do
   case "$arg" in
     --skip-backend) SKIP_BACKEND=1; BACKEND_SET=1 ;;
+    --skip-jobs) SKIP_JOBS=1; JOBS_SET=1 ;;
     --skip-dashboard) SKIP_DASHBOARD=1; DASHBOARD_SET=1 ;;
     --yes) ASSUME_YES=1 ;;
     -h|--help) usage; exit 0 ;;
@@ -51,16 +56,20 @@ if [ "$ASSUME_YES" -eq 0 ]; then
   if [ "$BACKEND_SET" -eq 0 ]; then
     if ask_yes_no "Stop backend-v2 (run_jobs.py)?" "y"; then SKIP_BACKEND=0; else SKIP_BACKEND=1; fi
   fi
+  if [ "$JOBS_SET" -eq 0 ]; then
+    if ask_yes_no "Stop backend-v2's job runner (job_runner.py)?" "y"; then SKIP_JOBS=0; else SKIP_JOBS=1; fi
+  fi
   if [ "$DASHBOARD_SET" -eq 0 ]; then
     if ask_yes_no "Stop dashboard-v2?" "y"; then SKIP_DASHBOARD=0; else SKIP_DASHBOARD=1; fi
   fi
 fi
 
-# Not anchored to this repo's absolute path - run_jobs.py is commonly launched with a
-# relative path (cwd already at backend-v2/), which wouldn't match an absolute-path
-# pattern.
+# Not anchored to this repo's absolute path - run_jobs.py/job_runner.py are commonly
+# launched with a relative path (cwd already at backend-v2/), which wouldn't match an
+# absolute-path pattern.
 PATTERNS=()
 if [ "$SKIP_BACKEND" -eq 0 ]; then PATTERNS+=("run_jobs\.py"); fi
+if [ "$SKIP_JOBS" -eq 0 ]; then PATTERNS+=("job_runner\.py"); fi
 if [ "$SKIP_DASHBOARD" -eq 0 ]; then PATTERNS+=("frontend-v2/node_modules/.bin/vite"); fi
 
 if [ ${#PATTERNS[@]} -eq 0 ]; then

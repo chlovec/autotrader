@@ -1,34 +1,29 @@
-"""backend-v2's API + scheduled-jobs process. Combines what a bare run_jobs.py used to
-do (run sync-tickers and sync-bars-nightly once on startup, then keep them on a
-recurring interval schedule - see jobs/registry.py's DEFAULT_SCHEDULES) with a REST API the dashboard's
-Jobs page uses to view/edit each job's config, trigger a manual run, and see run
-history. Launched via run_jobs.py (uvicorn.run("app.main:app", ...)) so
-bin/restart-v2.sh's invocation doesn't need to change.
+"""backend-v2's dashboard API - HTTP only. Job execution (sync-tickers,
+sync-bars-nightly, predict-market-state, etc.) runs in a separate process,
+job_runner.py, on its own schedule; this process never runs a job directly. The two
+coordinate purely through the database - see jobs/engine.py's module docstring and
+jobs/config_store.py (job_is_active, interval_trigger) for how. Launched via
+run_jobs.py (uvicorn.run("app.main:app", ...)) so bin/restart-v2.sh's invocation
+doesn't need to change.
 
-Mirrors backend/app/main.py's shape at the repo root (v1) for the equivalent research
-job: a per-job threading.Lock guards against overlapping runs of the same job, a
-BackgroundTasks-triggered run releases its lock in a finally block, and a dashboard
-run-type ("manual" vs "auto") gates the *scheduled* trigger without blocking a manual one.
+This split used to be one process (this file also ran the scheduler and every job
+directly) - see db/session.py's WAL-mode comment for why that stopped being viable
+(a heavy job's CPU/DB usage could make the dashboard unresponsive while it ran).
 """
 
-import asyncio
 import datetime as dt
 import logging
 import os
-import threading
 from contextlib import asynccontextmanager
 from typing import Any, Literal
 
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.interval import IntervalTrigger
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.orm import Session
 
-from data.client import DataClient
 from db.models import (
     AverageVolume,
     Base,
@@ -36,6 +31,7 @@ from db.models import (
     JobConfig,
     JobRun,
     MarketPrediction,
+    MarketPrediction10Day,
     MarketPredictionBacktest,
     News,
     OhlcBar,
@@ -49,20 +45,17 @@ from db.models import (
     UnifiedSnapshot,
 )
 from db.session import SessionLocal, init_db
-from jobs.average_volume import DEFAULT_DAYS_INTERVAL, compute_average_volume
-from jobs.backtest_market_state import compute_market_state_backtest
-from jobs.control import JobCancelled, JobControl
-from jobs.predict_market_state import DEFAULT_MIN_HISTORY_DAYS, compute_market_state_predictions
+from jobs.config_store import get_or_create_config, interval_trigger, job_is_active, split_csv
 from jobs.registry import (
     AVERAGE_VOLUME_JOB,
     BACKTEST_MARKET_STATE_JOB,
     BARS_JOB,
-    DEFAULT_SCHEDULES,
     DEFAULT_START_TIME,
     INDICATOR_NAMES,
     JOB_DEFINITIONS,
     MOVERS_JOB,
     NEWS_JOB,
+    PREDICT_10_DAY_MARKET_STATE_JOB,
     PREDICT_MARKET_STATE_JOB,
     SNAPSHOT_TYPE_OPTIONS,
     SNAPSHOTS_JOB,
@@ -72,15 +65,7 @@ from jobs.registry import (
     TICKERS_JOB,
     UNIFIED_SNAPSHOT_JOB,
 )
-from jobs.sync_bars import DEFAULT_BACKFILL_DAYS, DEFAULT_MULTIPLIER, DEFAULT_TIMESPAN, sync_bars_nightly
-from jobs.sync_indicators import sync_indicator
-from jobs.sync_news import sync_news
-from jobs.sync_snapshots import sync_snapshots
-from jobs.sync_ticker_details import sync_ticker_details
-from jobs.sync_ticker_types import sync_ticker_types
-from jobs.sync_tickers import sync_tickers
-from jobs.sync_top_movers import sync_top_movers
-from jobs.sync_unified_snapshot import sync_unified_snapshot
+from jobs.sync_bars import DEFAULT_MULTIPLIER, DEFAULT_TIMESPAN
 
 logger = logging.getLogger("backend_v2.app")
 
@@ -96,306 +81,11 @@ _cors_origins = [origin.strip() for origin in _cors_origins_raw.split(",") if or
 if not _cors_origins:
     raise RuntimeError("CORS_ORIGINS is set but empty after parsing - check its value in backend-v2/.env.")
 
-# One lock per job name - guards against a scheduled fire overlapping a manual "run
-# now" (or two manual runs) of the *same* job. The two jobs run independently of each
-# other's locks.
-_job_locks: dict[str, threading.Lock] = {name: threading.Lock() for name in JOB_DEFINITIONS}
-
-# Populated with a fresh JobControl (see jobs/control.py) for the duration of each
-# job's run - present in this dict for exactly as long as _job_locks[job_name] is held.
-# pause_job/resume_job/cancel_job below look a job up here rather than through the lock
-# since the lock alone can't carry a pause/cancel signal into the running job's loop.
-# Plain dict, not a Lock-guarded one: entries are only ever set/popped by _run_job on
-# the event loop thread, and read (via .get()) from FastAPI's sync-endpoint threadpool -
-# CPython dict reads/writes are atomic per-operation under the GIL, same assumption
-# _job_locks itself already relies on.
-_job_controls: dict[str, JobControl] = {}
-
-# Set by lifespan on startup. update_job_config reschedules through this so an edited
-# schedule_interval_unit/schedule_interval_value takes effect immediately instead of
-# only on the next backend-v2 restart.
-_scheduler: AsyncIOScheduler | None = None
-
-# Set by lifespan on startup - holds a strong reference to the startup sync task so
-# asyncio doesn't garbage-collect it mid-run (a fire-and-forget create_task() with no
-# other reference is only weakly held). Also let's lifespan cancel it on shutdown.
-_startup_sync_task: asyncio.Task[None] | None = None
-
-
-def _get_or_create_config(session: Session, job_name: str) -> JobConfig:
-    config = session.get(JobConfig, job_name)
-    if config is not None:
-        return config
-    unit, value = DEFAULT_SCHEDULES[job_name]
-    config = JobConfig(
-        job_name=job_name,
-        run_type=JOB_DEFINITIONS[job_name].default_run_type,
-        schedule_interval_unit=unit,
-        schedule_interval_value=value,
-        start_time=DEFAULT_START_TIME,
-        multiplier=DEFAULT_MULTIPLIER if job_name == BARS_JOB else None,
-        timespan=DEFAULT_TIMESPAN if job_name == BARS_JOB else None,
-        backfill_days=DEFAULT_BACKFILL_DAYS if job_name == BARS_JOB else None,
-    )
-    session.add(config)
-    session.commit()
-    return config
-
-
-def _interval_trigger(unit: str, value: int, start_time: str) -> IntervalTrigger:
-    """`unit` ("minutes"/"hours"/"days") doubles as the IntervalTrigger keyword arg name -
-    see db/models.py's JobConfig.schedule_interval_unit. `start_time` ("HH:MM" UTC, one
-    of registry.START_TIME_OPTIONS) anchors the trigger's phase via start_date: combined
-    with *today's* UTC date, since only the time-of-day component matters here -
-    APScheduler's IntervalTrigger walks forward from start_date in `value`-`unit` steps
-    to find the next fire time >= now regardless of whether start_date itself is in the
-    past, so "today" is just as good an anchor date as the literal day the schedule was
-    first configured."""
-    hour, minute = (int(part) for part in start_time.split(":"))
-    today = dt.datetime.now(dt.timezone.utc).date()
-    start_date = dt.datetime.combine(today, dt.time(hour, minute), tzinfo=dt.timezone.utc)
-    return IntervalTrigger(**{unit: value}, start_date=start_date, timezone="UTC")
-
-
-def _split_csv(value: str | None) -> list[str] | None:
-    if not value:
-        return None
-    items = [item.strip() for item in value.split(",") if item.strip()]
-    return items or None
-
-
-async def _run_job(job_name: str, trigger: str) -> None:
-    """Assumes the caller already holds _job_locks[job_name]; releases it when done.
-    `trigger` is "manual" or "auto" - see db/models.py's JobRun.
-
-    Publishes a fresh JobControl to _job_controls for the run's duration - pause_job/
-    resume_job/cancel_job below signal through it, and every sync_* call is handed it
-    so it can check in between units of work (see jobs/control.py). A pause blocks
-    inside that call, still holding this job's lock, so nothing here needs to change to
-    support it. A cancel raises JobCancelled, caught separately below so a
-    user-requested stop is recorded as "cancelled" rather than logged and stored as a
-    "failed" run."""
-    session = SessionLocal()
-    run = JobRun(job_name=job_name, trigger=trigger, status="in_progress", started_at=dt.datetime.utcnow())
-    session.add(run)
-    session.commit()
-    run_id = run.id
-    control = JobControl()
-    _job_controls[job_name] = control
-    try:
-        config = _get_or_create_config(session, job_name)
-        if job_name == SNAPSHOTS_JOB:
-            # No shared DataClient here - sync_snapshots fans out across a thread pool
-            # where each worker opens its own DataClient bound to its own event loop
-            # (see jobs/sync_snapshots.py). Runs via asyncio.to_thread so this blocking
-            # call doesn't stall the server's event loop.
-            count = await asyncio.to_thread(
-                sync_snapshots,
-                session,
-                _split_csv(config.ticker_types),
-                _split_csv(config.tickers),
-                control=control,
-                run_id=run_id,
-            )
-            summary = f"{count} snapshot(s) synced"
-        elif job_name == TICKER_DETAILS_JOB:
-            # Same no-shared-DataClient, thread-pool-fan-out reasoning as the
-            # snapshots branch above (see jobs/sync_ticker_details.py).
-            count = await asyncio.to_thread(
-                sync_ticker_details,
-                session,
-                _split_csv(config.ticker_types),
-                _split_csv(config.tickers),
-                control=control,
-                run_id=run_id,
-            )
-            summary = f"{count} ticker detail(s) synced"
-        elif job_name == AVERAGE_VOLUME_JOB:
-            # Purely local aggregation over already-synced bars - no DataClient needed,
-            # just a blocking DB query, so this runs via asyncio.to_thread the same way
-            # the snapshots/indicator branches do to keep it off the event loop.
-            count = await asyncio.to_thread(
-                compute_average_volume,
-                session,
-                config.average_volume_start_date,
-                config.average_volume_days_interval or DEFAULT_DAYS_INTERVAL,
-                _split_csv(config.ticker_types),
-                _split_csv(config.tickers),
-                control=control,
-            )
-            summary = f"{count} ticker(s) average volume computed"
-        elif job_name == PREDICT_MARKET_STATE_JOB:
-            # Same reasoning as the average-volume branch above - purely local, off
-            # the event loop via asyncio.to_thread.
-            count = await asyncio.to_thread(
-                compute_market_state_predictions,
-                session,
-                _split_csv(config.ticker_types),
-                _split_csv(config.tickers),
-                DEFAULT_MIN_HISTORY_DAYS,
-                control=control,
-            )
-            summary = f"{count} ticker(s) market state predicted"
-        elif job_name == BACKTEST_MARKET_STATE_JOB:
-            # Same reasoning as the average-volume/predict-market-state branches above -
-            # purely local, off the event loop via asyncio.to_thread.
-            count = await asyncio.to_thread(
-                compute_market_state_backtest,
-                session,
-                config.backtest_start_date,
-                config.backtest_end_date,
-                _split_csv(config.ticker_types),
-                _split_csv(config.tickers),
-                DEFAULT_MIN_HISTORY_DAYS,
-                control=control,
-            )
-            summary = f"{count} result(s) backtested"
-        elif job_name in INDICATOR_NAMES:
-            # Same no-shared-DataClient reasoning as the snapshots branch above -
-            # sync_indicator fans out across its own thread pool of per-worker clients.
-            indicator = INDICATOR_NAMES[job_name]
-            count = await asyncio.to_thread(
-                sync_indicator,
-                indicator,
-                session,
-                _split_csv(config.ticker_types),
-                _split_csv(config.tickers),
-                control=control,
-                run_id=run_id,
-            )
-            summary = f"{count} {indicator} value(s) synced"
-        elif job_name == BARS_JOB:
-            # No shared DataClient here - sync_bars_nightly fans out across a thread
-            # pool the same way sync_snapshots/sync_indicator do (see
-            # jobs/sync_bars.py), so this runs via asyncio.to_thread too.
-            results = await asyncio.to_thread(
-                sync_bars_nightly,
-                session,
-                _split_csv(config.ticker_types),
-                _split_csv(config.tickers),
-                multiplier=config.multiplier or DEFAULT_MULTIPLIER,
-                timespan=config.timespan or DEFAULT_TIMESPAN,
-                backfill_days=config.backfill_days or DEFAULT_BACKFILL_DAYS,
-                control=control,
-                run_id=run_id,
-            )
-            summary = f"{len(results)} ticker(s) synced, {sum(results.values())} bar(s) fetched"
-        else:
-            async with DataClient() as client:
-                if job_name == TICKERS_JOB:
-                    count = await sync_tickers(
-                        client, session, ticker_type=config.ticker_types or None, control=control
-                    )
-                    summary = f"{count} ticker(s) synced"
-                elif job_name == TICKER_TYPES_JOB:
-                    count = await sync_ticker_types(client, session, control=control)
-                    summary = f"{count} ticker type(s) synced"
-                elif job_name == MOVERS_JOB:
-                    results = await sync_top_movers(client, session, control=control)
-                    summary = f"{results.get('gainers', 0)} gainer(s), {results.get('losers', 0)} loser(s) synced"
-                elif job_name == NEWS_JOB:
-                    count = await sync_news(client, session, control=control)
-                    summary = f"{count} news article(s) synced"
-                else:
-                    assert job_name == UNIFIED_SNAPSHOT_JOB
-                    results = await sync_unified_snapshot(
-                        client, session, _split_csv(config.snapshot_types), control=control
-                    )
-                    summary = ", ".join(f"{t}: {n}" for t, n in results.items())
-        run = session.get(JobRun, run_id)
-        assert run is not None
-        run.status = "completed"
-        run.result_summary = summary
-        run.finished_at = dt.datetime.utcnow()
-        session.commit()
-    except JobCancelled:
-        logger.info("%s job cancelled", job_name)
-        session.rollback()
-        run = session.get(JobRun, run_id)
-        assert run is not None
-        run.status = "cancelled"
-        run.finished_at = dt.datetime.utcnow()
-        session.commit()
-    except Exception as exc:
-        logger.exception("%s job failed", job_name)
-        session.rollback()
-        run = session.get(JobRun, run_id)
-        assert run is not None
-        run.status = "failed"
-        run.error = str(exc)
-        run.finished_at = dt.datetime.utcnow()
-        session.commit()
-    finally:
-        session.close()
-        _job_controls.pop(job_name, None)
-        _job_locks[job_name].release()
-
-
-async def _scheduled_job(job_name: str) -> None:
-    with SessionLocal() as session:
-        run_type = _get_or_create_config(session, job_name).run_type
-    if run_type != "auto":
-        logger.info("%s is manual-only, skipping scheduled run", job_name)
-        return
-    if not _job_locks[job_name].acquire(blocking=False):
-        logger.info("%s already running, skipping scheduled trigger", job_name)
-        return
-    await _run_job(job_name, "auto")
-
-
-async def _run_startup_sync_chain() -> None:
-    # Sequential, not parallel: the bars job selects tickers out of the tickers table,
-    # so a startup run needs tickers synced first, not racing it. ticker-types has no
-    # such dependency. Each call also respects that job's `run_type`, same as a
-    # scheduled cron fire would - ticker-types defaults to manual, so this is normally
-    # a no-op at startup.
-    #
-    # Run as a background task (see lifespan below) rather than awaited inline: this
-    # chain can take a long time (thousands of tickers, one HTTP call each, plus 429
-    # backoff) and awaiting it before `yield` would keep the ASGI app in its "starting
-    # up" state - Uvicorn won't route *any* HTTP traffic, including the Jobs page's own
-    # endpoints, until that phase reports complete. The bars job's own tickers-first
-    # dependency only needs these three calls ordered relative to each other, not
-    # ordered relative to the server accepting requests.
-    await _scheduled_job(TICKER_TYPES_JOB)
-    await _scheduled_job(TICKERS_JOB)
-    await _scheduled_job(BARS_JOB)
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _scheduler, _startup_sync_task
     init_db()
-    with SessionLocal() as session:
-        schedules = {name: _get_or_create_config(session, name) for name in JOB_DEFINITIONS}
-
-    _startup_sync_task = asyncio.create_task(_run_startup_sync_chain())
-
-    scheduler = AsyncIOScheduler()
-    for name, config in schedules.items():
-        scheduler.add_job(
-            _scheduled_job,
-            _interval_trigger(config.schedule_interval_unit, config.schedule_interval_value, config.start_time),
-            args=[name],
-            id=name,
-        )
-        logger.info(
-            "scheduled %s every %d %s starting %s UTC",
-            name,
-            config.schedule_interval_value,
-            config.schedule_interval_unit,
-            config.start_time,
-        )
-    scheduler.start()
-    _scheduler = scheduler
-
     yield
-
-    scheduler.shutdown(wait=False)
-    _scheduler = None
-    if _startup_sync_task is not None and not _startup_sync_task.done():
-        _startup_sync_task.cancel()
-    _startup_sync_task = None
 
 
 app = FastAPI(title="Autotrader Backend v2", lifespan=lifespan)
@@ -423,22 +113,34 @@ def _run_to_dict(run: JobRun) -> dict[str, Any]:
     }
 
 
-def _next_run_time(job_name: str, run_type: str) -> str | None:
-    """None for a "manual" job even though it's still registered with APScheduler (see
-    lifespan) - its trigger would otherwise report a next fire time that's really just
-    going to be skipped by _scheduled_job's run_type check, which would be misleading
-    on the dashboard."""
-    if run_type != "auto" or _scheduler is None:
+def _next_run_time(config: JobConfig) -> str | None:
+    """None for a "manual" job even though job_runner.py still keeps a schedule
+    registered for it - its trigger would otherwise report a next fire time that's
+    really just going to be skipped by job_runner.py's scheduled_job run_type check,
+    which would be misleading on the dashboard.
+
+    Computed independently of job_runner.py's live scheduler - this process doesn't
+    have one - via the identical interval_trigger(config) both processes build from the
+    same JobConfig row (see jobs/config_store.py's interval_trigger docstring for why
+    that's guaranteed to agree with job_runner.py's actual schedule). get_next_fire_time
+    with previous_fire_time=None is a pure computation APScheduler's IntervalTrigger
+    supports without a running scheduler - it walks forward from start_date."""
+    if config.run_type != "auto":
         return None
-    job = _scheduler.get_job(job_name)
-    if job is None or job.next_run_time is None:
-        return None
-    return job.next_run_time.isoformat()
+    next_fire = interval_trigger(config).get_next_fire_time(None, dt.datetime.now(dt.timezone.utc))
+    return next_fire.isoformat() if next_fire else None
+
+
+def _in_progress_run(session: Session, job_name: str) -> JobRun | None:
+    return session.execute(
+        select(JobRun).where(JobRun.job_name == job_name, JobRun.status == "in_progress").limit(1)
+    ).scalar_one_or_none()
 
 
 def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
     definition = JOB_DEFINITIONS[job_name]
-    config = _get_or_create_config(session, job_name)
+    config = get_or_create_config(session, job_name)
+    run = _in_progress_run(session, job_name)
     last_run = session.execute(
         select(JobRun).where(JobRun.job_name == job_name).order_by(JobRun.started_at.desc()).limit(1)
     ).scalar_one_or_none()
@@ -452,12 +154,13 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         "has_snapshot_type_filter": definition.has_snapshot_type_filter,
         "has_average_volume_fields": definition.has_average_volume_fields,
         "has_backtest_fields": definition.has_backtest_fields,
+        "has_prediction_start_date_field": definition.has_prediction_start_date_field,
         "snapshot_type_options": SNAPSHOT_TYPE_OPTIONS,
         "run_type": config.run_type,
         "schedule_interval_unit": config.schedule_interval_unit,
         "schedule_interval_value": config.schedule_interval_value,
         "start_time": config.start_time,
-        "next_run_time": _next_run_time(job_name, config.run_type),
+        "next_run_time": _next_run_time(config),
         "ticker_types": config.ticker_types,
         "tickers": config.tickers,
         "multiplier": config.multiplier,
@@ -470,9 +173,12 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         "average_volume_days_interval": config.average_volume_days_interval,
         "backtest_start_date": config.backtest_start_date.isoformat() if config.backtest_start_date else None,
         "backtest_end_date": config.backtest_end_date.isoformat() if config.backtest_end_date else None,
+        "prediction_start_date": (
+            config.prediction_start_date.isoformat() if config.prediction_start_date else None
+        ),
         "hidden": config.hidden,
-        "running": _job_locks[job_name].locked(),
-        "paused": job_name in _job_controls and _job_controls[job_name].pause_requested,
+        "running": config.run_requested_at is not None or run is not None,
+        "paused": run.pause_requested if run is not None else False,
         "last_run": _run_to_dict(last_run) if last_run is not None else None,
     }
 
@@ -498,6 +204,7 @@ _RESET_TABLES: dict[str, list[type[Base]]] = {
     NEWS_JOB: [News],
     AVERAGE_VOLUME_JOB: [AverageVolume],
     PREDICT_MARKET_STATE_JOB: [MarketPrediction],
+    PREDICT_10_DAY_MARKET_STATE_JOB: [MarketPrediction10Day],
     BACKTEST_MARKET_STATE_JOB: [MarketPredictionBacktest],
 }
 
@@ -525,6 +232,7 @@ class JobConfigIn(BaseModel):
     average_volume_days_interval: int | None = None
     backtest_start_date: str | None = None
     backtest_end_date: str | None = None
+    prediction_start_date: str | None = None
 
 
 @app.get("/health")
@@ -646,7 +354,7 @@ def top_movers_report(ticker_types: str = "") -> list[dict]:
     TickerType combobox) inner-joins instead of left-joins - a mover with no matching
     tickers row has no `type` to filter on anyway, so it can never satisfy a non-empty
     filter."""
-    types = _split_csv(ticker_types)
+    types = split_csv(ticker_types)
     with SessionLocal() as session:
         query = select(TopMarketMover, Ticker).join(
             Ticker, Ticker.ticker == TopMarketMover.ticker, isouter=not types
@@ -785,7 +493,7 @@ TRADING_SYMBOLS_ORDERABLE_FIELDS: dict[str, ColumnElement] = {
 
 
 # Shared with the frontend's numericFilter.ts NUMERIC_FILTER_OPS - the four comparison
-# operators trading_symbols_report accepts for entry_price_op.
+# operators trading_symbols_report accepts for entry_price_op/market_cap_op.
 NUMERIC_FILTER_OPS = ("<", "<=", ">", ">=")
 
 
@@ -808,7 +516,7 @@ def _parse_order_by(order_by: str) -> list[tuple[str, str]]:
     rather than silently ignoring it, since this drives a paginated SQL ORDER BY and a
     silently-dropped clause would be confusing (the report would just look unsorted)."""
     fields: list[tuple[str, str]] = []
-    for entry in _split_csv(order_by) or []:
+    for entry in split_csv(order_by) or []:
         field, _, direction = entry.partition(":")
         direction = direction.lower() or "asc"
         if field not in TRADING_SYMBOLS_ORDERABLE_FIELDS:
@@ -822,11 +530,14 @@ def _parse_order_by(order_by: str) -> list[tuple[str, str]]:
 @app.get("/reports/trading-symbols")
 def trading_symbols_report(
     ticker_types: str = "",
+    tickers: str = "",
     page: int = 1,
     page_size: int = TRADING_SYMBOLS_DEFAULT_PAGE_SIZE,
     order_by: str = "",
     entry_price_op: str = "",
     entry_price_value: float | None = None,
+    market_cap_op: str = "",
+    market_cap_value: float | None = None,
 ) -> dict[str, Any]:
     """Backs the Analytics > Trading Symbols page's report grid: every synced tickers
     row, joined out to its asset_class, most recently computed average_volumes row, and
@@ -840,6 +551,14 @@ def trading_symbols_report(
     full, so page_size bounds the work done per request the same way it bounds the
     response size.
 
+    `tickers` (comma-separated symbols, e.g. "AAPL,MSFT") narrows to just those tickers -
+    combined with `ticker_types` as an AND, not mutually exclusive the way jobs' own
+    tickers/ticker_types config fields are (see jobs/average_volume.py's
+    _apply_ticker_filter): this is a report filter narrowing an already-fetched result
+    set, not a job's "which population to run against" selector, so there's no
+    ambiguity in letting both apply at once (e.g. "AAPL,MSFT" scoped to type "CS" is a
+    perfectly sensible combination, just possibly redundant).
+
     `order_by` (see _parse_order_by) picks the sort priority among
     TRADING_SYMBOLS_ORDERABLE_FIELDS, applied before the page is sliced out so it
     orders the whole filtered set rather than just the returned page. Defaults to
@@ -852,8 +571,16 @@ def trading_symbols_report(
     abs_expected_return_pct ordering - applied as a real SQL WHERE (unlike ReportGrid's
     client-side numeric column filters), so it narrows `total`/pagination too, not just
     the returned page. A ticker with no market_predictions row (entry_price null) never
-    matches any condition, same null-exclusion semantics as the client-side filter."""
-    types = _split_csv(ticker_types)
+    matches any condition, same null-exclusion semantics as the client-side filter.
+
+    `market_cap_op`/`market_cap_value` are the same shape, filtering on
+    ticker_details.market_cap - unlike entry_price's MarketPrediction join, base_query
+    doesn't otherwise join TickerDetail in (market_cap is normally resolved separately
+    below, page-scoped, purely for display), so this filter adds that join itself,
+    scoped to this branch, the same "only pay for it when it's actually used" reasoning
+    entry_price's count_query join already uses."""
+    types = split_csv(ticker_types)
+    selected_tickers = split_csv(tickers)
     page = max(1, page)
     page_size = max(1, min(page_size, TRADING_SYMBOLS_MAX_PAGE_SIZE))
     order_fields = _parse_order_by(order_by) or [("ticker", "asc")]
@@ -864,6 +591,11 @@ def trading_symbols_report(
             raise HTTPException(422, "entry_price_op and entry_price_value must be provided together")
         if entry_price_op not in NUMERIC_FILTER_OPS:
             raise HTTPException(422, f"entry_price_op must be one of {', '.join(NUMERIC_FILTER_OPS)}")
+    if market_cap_op or market_cap_value is not None:
+        if not market_cap_op or market_cap_value is None:
+            raise HTTPException(422, "market_cap_op and market_cap_value must be provided together")
+        if market_cap_op not in NUMERIC_FILTER_OPS:
+            raise HTTPException(422, f"market_cap_op must be one of {', '.join(NUMERIC_FILTER_OPS)}")
     with SessionLocal() as session:
         count_query = select(func.count(Ticker.ticker))
         # current_snapshots and (the latest per ticker, same pattern as
@@ -890,6 +622,9 @@ def trading_symbols_report(
         if types:
             base_query = base_query.where(Ticker.type.in_(types))
             count_query = count_query.where(Ticker.type.in_(types))
+        if selected_tickers:
+            base_query = base_query.where(Ticker.ticker.in_(selected_tickers))
+            count_query = count_query.where(Ticker.ticker.in_(selected_tickers))
         if entry_price_op:
             condition = _numeric_condition_clause(MarketPrediction.entry_price, entry_price_op, entry_price_value)
             base_query = base_query.where(condition)
@@ -905,6 +640,15 @@ def trading_symbols_report(
                 )
                 .where(condition)
             )
+        if market_cap_op:
+            condition = _numeric_condition_clause(TickerDetail.market_cap, market_cap_op, market_cap_value)
+            # Neither query joins ticker_details by default (market_cap is normally
+            # resolved separately below, page-scoped, purely for display) - add it here,
+            # scoped to this branch, same reasoning as entry_price's join above. A plain
+            # join (not a "latest per ticker" subquery like MarketPrediction's): unlike
+            # market_predictions, ticker_details has one row per ticker already.
+            base_query = base_query.outerjoin(TickerDetail, TickerDetail.ticker == Ticker.ticker).where(condition)
+            count_query = count_query.outerjoin(TickerDetail, TickerDetail.ticker == Ticker.ticker).where(condition)
         total = session.execute(count_query).scalar_one()
 
         order_clauses = []
@@ -999,7 +743,7 @@ def _parse_stale_tickers_order_by(order_by: str) -> list[tuple[str, str]]:
     parameterizing _parse_order_by over an allowed-fields dict, since no report so far
     has needed more than one set of orderable fields."""
     fields: list[tuple[str, str]] = []
-    for entry in _split_csv(order_by) or []:
+    for entry in split_csv(order_by) or []:
         field, _, direction = entry.partition(":")
         direction = direction.lower() or "asc"
         if field not in STALE_TICKERS_ORDERABLE_FIELDS:
@@ -1047,7 +791,7 @@ def stale_tickers_report(
     Paginated/ordered the same way trading_symbols_report is - see that function's
     docstring for the shared reasoning (page/page_size/order_by semantics, ticker
     always appended as a final tiebreaker)."""
-    types = _split_csv(ticker_types)
+    types = split_csv(ticker_types)
     if stale_after_days < 0:
         raise HTTPException(422, "stale_after_days must not be negative")
     page = max(1, page)
@@ -1174,6 +918,230 @@ def backtest_report(ticker: str, start_date: str = "", end_date: str = "") -> li
         return [_backtest_point_to_dict(row) for row in rows]
 
 
+NEXT_10_DAY_PREDICTIONS_MAX_PAGE_SIZE = 1000
+NEXT_10_DAY_PREDICTIONS_DEFAULT_PAGE_SIZE = 500
+
+# order_by field keys accepted by next_10_day_predictions_report. net_return_pct_days_1_10
+# is the same ABS(day10_exit_price - day1_entry_price)*100/day10_exit_price expression
+# _next_10_day_prediction_fields computes for display - defined once here as a SQL
+# expression (rather than only in Python) so it's available to ORDER BY before
+# LIMIT/OFFSET slices out the page, same reasoning as TRADING_SYMBOLS_ORDERABLE_FIELDS'
+# abs_expected_return_pct.
+_NET_RETURN_PCT_DAYS_1_10 = (
+    func.abs(MarketPrediction10Day.day10_exit_price - MarketPrediction10Day.day1_entry_price)
+    * 100
+    / MarketPrediction10Day.day10_exit_price
+)
+
+NEXT_10_DAY_PREDICTIONS_ORDERABLE_FIELDS: dict[str, ColumnElement] = {
+    "ticker": Ticker.ticker,
+    "name": Ticker.name,
+    "type": Ticker.type,
+    "net_return_pct_days_1_10": _NET_RETURN_PCT_DAYS_1_10,
+}
+
+
+def _parse_next_10_day_order_by(order_by: str) -> list[tuple[str, str]]:
+    """Same shape as _parse_stale_tickers_order_by, against
+    NEXT_10_DAY_PREDICTIONS_ORDERABLE_FIELDS instead."""
+    fields: list[tuple[str, str]] = []
+    for entry in split_csv(order_by) or []:
+        field, _, direction = entry.partition(":")
+        direction = direction.lower() or "asc"
+        if field not in NEXT_10_DAY_PREDICTIONS_ORDERABLE_FIELDS:
+            raise HTTPException(422, f"Unknown order_by field: {field}")
+        if direction not in ("asc", "desc"):
+            raise HTTPException(422, f"Unknown order_by direction: {direction}")
+        fields.append((field, direction))
+    return fields
+
+
+def _next_10_day_prediction_fields(prediction: MarketPrediction10Day) -> dict[str, Any]:
+    """Every market_predictions_10_day column (bar ticker, which the report already
+    carries as its own top-level field) plus the 3 net-return summary fields - each
+    computed straight from the day1/day5/day6/day10 entry/exit prices already on the
+    row rather than by compounding the per-day expected_return_pct values, since the
+    price path itself (day N's entry_price is day N-1's exit_price - see
+    jobs/predict_market_state_10_day.py) already *is* the compounding walk.
+
+    Each is ABS(exit - entry) * 100 / exit - a magnitude-of-move percentage (always
+    non-negative, and normalized against the *exit* price rather than the entry price),
+    not a signed return - matches _NET_RETURN_PCT_DAYS_1_10's SQL expression above."""
+    fields: dict[str, Any] = {
+        "start_date": prediction.start_date.isoformat(),
+        "current_state": prediction.current_state,
+    }
+    for day in range(1, 11):
+        for suffix in (
+            "predicted_state",
+            "state_confidence",
+            "entry_price",
+            "exit_price",
+            "expected_return_pct",
+            "entry_time",
+            "exit_time",
+        ):
+            key = f"day{day}_{suffix}"
+            fields[key] = getattr(prediction, key)
+    fields["net_return_pct_days_1_5"] = (
+        abs(prediction.day5_exit_price - prediction.day1_entry_price) * 100 / prediction.day5_exit_price
+    )
+    fields["net_return_pct_days_6_10"] = (
+        abs(prediction.day10_exit_price - prediction.day6_entry_price) * 100 / prediction.day10_exit_price
+    )
+    fields["net_return_pct_days_1_10"] = (
+        abs(prediction.day10_exit_price - prediction.day1_entry_price) * 100 / prediction.day10_exit_price
+    )
+    fields["computed_at"] = prediction.computed_at.isoformat()
+    return fields
+
+
+def _next_10_day_row_to_dict(
+    prediction: MarketPrediction10Day,
+    ticker: Ticker,
+    asset_class: str | None,
+    average_volume: float | None,
+    market_cap: float | None,
+) -> dict[str, Any]:
+    return {
+        "ticker": prediction.ticker,
+        "name": ticker.name,
+        "type": ticker.type,
+        "asset_class": asset_class,
+        "average_volume": average_volume,
+        "market_cap": market_cap,
+        **_next_10_day_prediction_fields(prediction),
+    }
+
+
+@app.get("/reports/next-10-day-predictions")
+def next_10_day_predictions_report(
+    ticker_types: str = "",
+    tickers: str = "",
+    market_cap_op: str = "",
+    market_cap_value: float | None = None,
+    page: int = 1,
+    page_size: int = NEXT_10_DAY_PREDICTIONS_DEFAULT_PAGE_SIZE,
+    order_by: str = "",
+) -> dict[str, Any]:
+    """Backs the Analytics > Next 10 Day Predictions page's report grid: one row per
+    ticker's *most recent* market_predictions_10_day run (jobs/predict_market_state_10_day.py) -
+    a ticker with more than one historical start_date only ever shows its latest, same
+    "latest row per ticker" pattern trading_symbols_report uses for market_predictions.
+    Driven by market_predictions_10_day itself (inner join), unlike trading_symbols_report's
+    every-synced-ticker sweep - a ticker this job has never run against has nothing to
+    show here, so it's left out entirely rather than appearing as a blank row.
+
+    Paginated/ordered/filtered the same way trading_symbols_report is - see that
+    function's docstring for the shared `page`/`page_size`/`order_by` reasoning.
+    `ticker_types`/`tickers` (comma-separated, AND-combined - same reasoning as
+    trading_symbols_report's `tickers` param) and `market_cap_op`/`market_cap_value`
+    (same shape as trading_symbols_report's) narrow the result set as a real SQL WHERE.
+
+    Unlike trading_symbols_report, ticker_details is always joined in (not only when
+    filtering) since market_cap is a mandatory display column here, not an optional
+    page-scoped lookup."""
+    types = split_csv(ticker_types)
+    selected_tickers = split_csv(tickers)
+    page = max(1, page)
+    page_size = max(1, min(page_size, NEXT_10_DAY_PREDICTIONS_MAX_PAGE_SIZE))
+    order_fields = _parse_next_10_day_order_by(order_by) or [("ticker", "asc")]
+    if "ticker" not in {field for field, _ in order_fields}:
+        order_fields = [*order_fields, ("ticker", "asc")]
+    if market_cap_op or market_cap_value is not None:
+        if not market_cap_op or market_cap_value is None:
+            raise HTTPException(422, "market_cap_op and market_cap_value must be provided together")
+        if market_cap_op not in NUMERIC_FILTER_OPS:
+            raise HTTPException(422, f"market_cap_op must be one of {', '.join(NUMERIC_FILTER_OPS)}")
+
+    with SessionLocal() as session:
+        latest_start_date = (
+            select(MarketPrediction10Day.ticker, func.max(MarketPrediction10Day.start_date).label("start_date"))
+            .group_by(MarketPrediction10Day.ticker)
+            .subquery()
+        )
+        base_query = (
+            select(MarketPrediction10Day, Ticker, TickerDetail)
+            .join(
+                latest_start_date,
+                (MarketPrediction10Day.ticker == latest_start_date.c.ticker)
+                & (MarketPrediction10Day.start_date == latest_start_date.c.start_date),
+            )
+            .join(Ticker, Ticker.ticker == MarketPrediction10Day.ticker)
+            .outerjoin(TickerDetail, TickerDetail.ticker == MarketPrediction10Day.ticker)
+        )
+        count_query = (
+            select(func.count(MarketPrediction10Day.ticker))
+            .select_from(MarketPrediction10Day)
+            .join(
+                latest_start_date,
+                (MarketPrediction10Day.ticker == latest_start_date.c.ticker)
+                & (MarketPrediction10Day.start_date == latest_start_date.c.start_date),
+            )
+            .join(Ticker, Ticker.ticker == MarketPrediction10Day.ticker)
+        )
+        if types:
+            base_query = base_query.where(Ticker.type.in_(types))
+            count_query = count_query.where(Ticker.type.in_(types))
+        if selected_tickers:
+            base_query = base_query.where(Ticker.ticker.in_(selected_tickers))
+            count_query = count_query.where(Ticker.ticker.in_(selected_tickers))
+        if market_cap_op:
+            condition = _numeric_condition_clause(TickerDetail.market_cap, market_cap_op, market_cap_value)
+            base_query = base_query.where(condition)
+            # Unlike base_query, count_query doesn't join ticker_details by default -
+            # only add it here, scoped to this branch, so the common no-filter case
+            # stays as cheap as it was before this filter existed (same reasoning as
+            # trading_symbols_report's market_cap_op branch).
+            count_query = count_query.outerjoin(TickerDetail, TickerDetail.ticker == MarketPrediction10Day.ticker).where(
+                condition
+            )
+        total = session.execute(count_query).scalar_one()
+
+        order_clauses = []
+        for field, direction in order_fields:
+            column = NEXT_10_DAY_PREDICTIONS_ORDERABLE_FIELDS[field]
+            order_clauses.append((column.desc() if direction == "desc" else column.asc()).nulls_last())
+        query = base_query.order_by(*order_clauses).limit(page_size).offset((page - 1) * page_size)
+        page_rows = session.execute(query).all()
+        ticker_codes = [prediction.ticker for prediction, _, _ in page_rows]
+
+        # Same first-seen-per-code reasoning as trading_symbols_report.
+        asset_class_by_code: dict[str, str] = {}
+        for code, asset_class in session.execute(select(TickerType.code, TickerType.asset_class)).all():
+            asset_class_by_code.setdefault(code, asset_class)
+
+        # Same page-scoped "latest run per ticker" pattern as trading_symbols_report.
+        latest_computed_at = (
+            select(AverageVolume.ticker, func.max(AverageVolume.computed_at).label("computed_at"))
+            .where(AverageVolume.ticker.in_(ticker_codes))
+            .group_by(AverageVolume.ticker)
+        )
+        latest_computed_at = latest_computed_at.subquery()
+        average_volume_by_ticker: dict[str, float | None] = {
+            ticker: average_volume
+            for ticker, average_volume in session.execute(
+                select(AverageVolume.ticker, AverageVolume.average_volume).join(
+                    latest_computed_at,
+                    (AverageVolume.ticker == latest_computed_at.c.ticker)
+                    & (AverageVolume.computed_at == latest_computed_at.c.computed_at),
+                )
+            ).all()
+        }
+
+        rows = [
+            _next_10_day_row_to_dict(
+                prediction,
+                ticker,
+                asset_class_by_code.get(ticker.type) if ticker.type else None,
+                average_volume_by_ticker.get(prediction.ticker),
+                detail.market_cap if detail else None,
+            )
+            for prediction, ticker, detail in page_rows
+        ]
+        return {"rows": rows, "total": total, "page": page, "page_size": page_size}
+
+
 @app.get("/jobs")
 def list_jobs() -> list[dict]:
     with SessionLocal() as session:
@@ -1197,7 +1165,7 @@ def update_job_config(job_name: str, body: JobConfigIn) -> dict:
     if body.start_time not in START_TIME_OPTIONS:
         raise HTTPException(status_code=400, detail="start_time must be a quarter-hour UTC time, e.g. '00:15'")
     if body.snapshot_types and (
-        invalid := set(_split_csv(body.snapshot_types) or []) - set(SNAPSHOT_TYPE_OPTIONS)
+        invalid := set(split_csv(body.snapshot_types) or []) - set(SNAPSHOT_TYPE_OPTIONS)
     ):
         raise HTTPException(status_code=400, detail=f"invalid snapshot_types: {', '.join(sorted(invalid))}")
     if body.average_volume_days_interval is not None and body.average_volume_days_interval < 1:
@@ -1228,10 +1196,18 @@ def update_job_config(job_name: str, body: JobConfigIn) -> dict:
             ) from exc
     if backtest_start_date is not None and backtest_end_date is not None and backtest_start_date > backtest_end_date:
         raise HTTPException(status_code=400, detail="backtest_start_date must not be after backtest_end_date")
+    prediction_start_date: dt.date | None = None
+    if body.prediction_start_date is not None:
+        try:
+            prediction_start_date = dt.date.fromisoformat(body.prediction_start_date)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail="prediction_start_date must be an ISO date, e.g. '2026-08-06'"
+            ) from exc
 
     with SessionLocal() as session:
         definition = JOB_DEFINITIONS[job_name]
-        config = _get_or_create_config(session, job_name)
+        config = get_or_create_config(session, job_name)
         config.run_type = body.run_type
         config.schedule_interval_unit = body.schedule_interval_unit
         config.schedule_interval_value = body.schedule_interval_value
@@ -1263,60 +1239,83 @@ def update_job_config(job_name: str, body: JobConfigIn) -> dict:
         else:
             config.backtest_start_date = None
             config.backtest_end_date = None
+        if definition.has_prediction_start_date_field:
+            config.prediction_start_date = prediction_start_date
+        else:
+            config.prediction_start_date = None
         config.updated_at = dt.datetime.utcnow()
         session.commit()
 
-        # Reschedule before building the response dict - _job_to_dict reads the live
-        # scheduler's next_run_time (see _next_run_time), so doing this after would
-        # hand the caller a stale pre-reschedule value until their next GET /jobs.
-        if _scheduler is not None:
-            _scheduler.reschedule_job(
-                job_name,
-                trigger=_interval_trigger(body.schedule_interval_unit, body.schedule_interval_value, body.start_time),
-            )
+        # No live scheduler to reschedule here anymore - job_runner.py's separate
+        # process owns that. It notices this edit (updated_at changed) via its own
+        # resync_schedules poll (jobs/engine.py) within that poll's interval instead of
+        # instantly - see jobs/engine.py's module docstring for why polling is enough.
         result = _job_to_dict(session, job_name)
 
     return result
 
 
 @app.post("/jobs/{job_name}/run")
-def trigger_job(job_name: str, background_tasks: BackgroundTasks) -> dict:
+def trigger_job(job_name: str) -> dict:
+    """Doesn't run anything itself - job execution lives in job_runner.py's separate
+    process. Setting run_requested_at here is the request; job_runner.py's
+    poll_run_requests (jobs/engine.py) picks it up, typically within a couple of
+    seconds, clears it, and starts the run.
+
+    The UPDATE ... WHERE run_requested_at IS NULL is atomic at the DB row level, so two
+    near-simultaneous clicks (e.g. two dashboard tabs) can't both queue a request - only
+    one succeeds (rowcount 1), the other sees rowcount 0 and gets the same 409 a
+    genuinely-already-running job would give."""
     _require_job(job_name)
-    if not _job_locks[job_name].acquire(blocking=False):
-        raise HTTPException(status_code=409, detail=f"{job_name} is already running")
-    background_tasks.add_task(_run_job, job_name, "manual")
+    with SessionLocal() as session:
+        if job_is_active(session, job_name):
+            raise HTTPException(status_code=409, detail=f"{job_name} is already running")
+        result = session.execute(
+            update(JobConfig)
+            .where(JobConfig.job_name == job_name, JobConfig.run_requested_at.is_(None))
+            .values(run_requested_at=dt.datetime.utcnow())
+        )
+        session.commit()
+        if result.rowcount == 0:
+            raise HTTPException(status_code=409, detail=f"{job_name} is already running")
     return {"status": "started"}
 
 
-def _require_running(job_name: str) -> JobControl:
-    """Shared guard for pause/resume/cancel below - all three only make sense against
-    a run that's actually in flight (see _run_job, which is the only thing that ever
-    populates _job_controls)."""
+def _require_running(job_name: str, session: Session) -> JobRun:
+    """Shared guard for pause/resume/cancel below - all three only make sense against a
+    run that's actually in flight. job_runner.py's poll_control_relay (jobs/engine.py)
+    is what actually relays the flags this sets into the running job's JobControl."""
     _require_job(job_name)
-    control = _job_controls.get(job_name)
-    if control is None:
+    run = _in_progress_run(session, job_name)
+    if run is None:
         raise HTTPException(status_code=409, detail=f"{job_name} is not running")
-    return control
+    return run
 
 
 @app.post("/jobs/{job_name}/pause")
 def pause_job(job_name: str) -> dict:
-    control = _require_running(job_name)
-    control.request_pause()
+    with SessionLocal() as session:
+        run = _require_running(job_name, session)
+        run.pause_requested = True
+        session.commit()
     return {"status": "pause-requested"}
 
 
 @app.post("/jobs/{job_name}/resume")
 def resume_job(job_name: str) -> dict:
-    control = _require_running(job_name)
-    control.request_resume()
+    with SessionLocal() as session:
+        run = _require_running(job_name, session)
+        run.pause_requested = False
+        session.commit()
     return {"status": "resumed"}
 
 
 @app.post("/jobs/{job_name}/cancel")
 def cancel_job(job_name: str) -> dict:
-    control = _require_running(job_name)
-    control.request_cancel()
+    with SessionLocal() as session:
+        run = _require_running(job_name, session)
+        run.cancel_requested = True
+        session.commit()
     return {"status": "cancel-requested"}
 
 
@@ -1324,7 +1323,7 @@ def cancel_job(job_name: str) -> dict:
 def hide_job(job_name: str) -> dict:
     _require_job(job_name)
     with SessionLocal() as session:
-        config = _get_or_create_config(session, job_name)
+        config = get_or_create_config(session, job_name)
         config.hidden = True
         session.commit()
         return _job_to_dict(session, job_name)
@@ -1334,7 +1333,7 @@ def hide_job(job_name: str) -> dict:
 def unhide_job(job_name: str) -> dict:
     _require_job(job_name)
     with SessionLocal() as session:
-        config = _get_or_create_config(session, job_name)
+        config = get_or_create_config(session, job_name)
         config.hidden = False
         session.commit()
         return _job_to_dict(session, job_name)
@@ -1346,30 +1345,31 @@ def reset_job(job_name: str) -> dict:
     _RESET_SYNC_STATE_KEYS above - and wipes its job_runs history so the dashboard's
     status badge/last-run panel goes back to "Never run" instead of continuing to show
     a stale "Succeeded" run whose summary (e.g. "36266 ticker(s) synced") no longer
-    matches the now-empty table. Acquires that job's run lock (same non-blocking
-    acquire trigger_job uses) so a reset can't race a concurrent run of the same job
-    reading/writing that table, and so a run can't start mid-reset either - both see
-    the lock as held and get the same 409 a genuinely-running job would give."""
+    matches the now-empty table.
+
+    Checks job_is_active (same check trigger_job uses) rather than acquiring a lock -
+    there's no lock to acquire in this process anymore, execution lives in
+    job_runner.py. This leaves a small window (check, then delete) where a run could
+    start between the two - acceptable for a dashboard operated by a human, same
+    "polling is enough" trade-off as everywhere else this split touches (see
+    jobs/engine.py's module docstring)."""
     _require_job(job_name)
-    if not _job_locks[job_name].acquire(blocking=False):
-        raise HTTPException(status_code=409, detail=f"{job_name} is running - stop it before resetting")
-    try:
-        with SessionLocal() as session:
-            if job_name in INDICATOR_NAMES:
-                session.execute(
-                    delete(TechnicalIndicator).where(TechnicalIndicator.indicator == INDICATOR_NAMES[job_name])
-                )
-            else:
-                for model in _RESET_TABLES[job_name]:
-                    session.execute(delete(model))
-            if (sync_key := _RESET_SYNC_STATE_KEYS.get(job_name)) is not None:
-                session.execute(delete(SyncState).where(SyncState.job_name == sync_key))
-                session.execute(delete(SyncProgress).where(SyncProgress.job_name == sync_key))
-            session.execute(delete(JobRun).where(JobRun.job_name == job_name))
-            session.commit()
-            return _job_to_dict(session, job_name)
-    finally:
-        _job_locks[job_name].release()
+    with SessionLocal() as session:
+        if job_is_active(session, job_name):
+            raise HTTPException(status_code=409, detail=f"{job_name} is running - stop it before resetting")
+        if job_name in INDICATOR_NAMES:
+            session.execute(
+                delete(TechnicalIndicator).where(TechnicalIndicator.indicator == INDICATOR_NAMES[job_name])
+            )
+        else:
+            for model in _RESET_TABLES[job_name]:
+                session.execute(delete(model))
+        if (sync_key := _RESET_SYNC_STATE_KEYS.get(job_name)) is not None:
+            session.execute(delete(SyncState).where(SyncState.job_name == sync_key))
+            session.execute(delete(SyncProgress).where(SyncProgress.job_name == sync_key))
+        session.execute(delete(JobRun).where(JobRun.job_name == job_name))
+        session.commit()
+        return _job_to_dict(session, job_name)
 
 
 @app.get("/jobs/{job_name}/runs")

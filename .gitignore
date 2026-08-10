@@ -3,6 +3,9 @@
 questrade_token.json
 questrade_token_*.json
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
 *.db.bak-*
 __pycache__/
 *.pyc

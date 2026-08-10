@@ -424,6 +424,127 @@ class MarketPredictionBacktest(Base):
     computed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
 
 
+class MarketPrediction10Day(Base):
+    """One row per (ticker, start_date) - a 10-trading-day-ahead projection produced by
+    jobs/predict_market_state_10_day.py's compute_10_day_market_state_predictions.
+    Purely local, same reasoning as MarketPrediction; reuses that module's fitted
+    per-ticker Markov chain (STATE_LABELS, quantile buckets, transition matrix) rather
+    than fitting its own.
+
+    Unlike MarketPrediction (which always predicts off the *latest* synced bar),
+    start_date is caller-chosen (dashboard default: tomorrow, UTC) and the chain is fit
+    only on ohlc_bars strictly before it - current_state is the bucket of the last such
+    bar's return, matching MarketPrediction's current_state semantics but anchored to
+    start_date's cutoff instead of "now".
+
+    day1_* is predicted the same way MarketPrediction's single prediction is (from
+    current_state, via the transition matrix). day2_* through day10_* are NOT re-fit
+    against new data - there isn't any yet for a start_date that's usually in the
+    future - each is a further one-step walk of the *same* transition matrix, starting
+    from the *previous* day's predicted_state, exactly like a Markov chain's stationary
+    forward simulation. entry_price/exit_price compound along that same walk (day N's
+    entry_price is day N-1's exit_price; day 1's is the last close before start_date).
+    entry_time/exit_time are fixed per day (regular session open/close), same reasoning
+    as MarketPrediction's columns of the same name - no intraday path to predict from.
+
+    expected_return_pct is a percentage (e.g. -2.5), NOT a fraction - unlike
+    MarketPrediction.expected_return, which is a fraction converted to a percent only
+    client-side. There's no per-day date column: "Day N" is implicitly start_date
+    walked forward N-1 trading days (see predict_market_state.py's _next_trading_day),
+    not persisted.
+
+    Upserted - a re-run for the same (ticker, start_date) overwrites the prior
+    prediction rather than accumulating rows, same semantics as MarketPrediction."""
+
+    __tablename__ = "market_predictions_10_day"
+
+    ticker: Mapped[str] = mapped_column(ForeignKey("tickers.ticker"), primary_key=True)
+    start_date: Mapped[dt.date] = mapped_column(Date, primary_key=True)
+    current_state: Mapped[str] = mapped_column(String)
+
+    day1_predicted_state: Mapped[str] = mapped_column(String)
+    day1_state_confidence: Mapped[float] = mapped_column(Float)
+    day1_entry_price: Mapped[float] = mapped_column(Float)
+    day1_exit_price: Mapped[float] = mapped_column(Float)
+    day1_expected_return_pct: Mapped[float] = mapped_column(Float)
+    day1_entry_time: Mapped[str] = mapped_column(String)
+    day1_exit_time: Mapped[str] = mapped_column(String)
+
+    day2_predicted_state: Mapped[str] = mapped_column(String)
+    day2_state_confidence: Mapped[float] = mapped_column(Float)
+    day2_entry_price: Mapped[float] = mapped_column(Float)
+    day2_exit_price: Mapped[float] = mapped_column(Float)
+    day2_expected_return_pct: Mapped[float] = mapped_column(Float)
+    day2_entry_time: Mapped[str] = mapped_column(String)
+    day2_exit_time: Mapped[str] = mapped_column(String)
+
+    day3_predicted_state: Mapped[str] = mapped_column(String)
+    day3_state_confidence: Mapped[float] = mapped_column(Float)
+    day3_entry_price: Mapped[float] = mapped_column(Float)
+    day3_exit_price: Mapped[float] = mapped_column(Float)
+    day3_expected_return_pct: Mapped[float] = mapped_column(Float)
+    day3_entry_time: Mapped[str] = mapped_column(String)
+    day3_exit_time: Mapped[str] = mapped_column(String)
+
+    day4_predicted_state: Mapped[str] = mapped_column(String)
+    day4_state_confidence: Mapped[float] = mapped_column(Float)
+    day4_entry_price: Mapped[float] = mapped_column(Float)
+    day4_exit_price: Mapped[float] = mapped_column(Float)
+    day4_expected_return_pct: Mapped[float] = mapped_column(Float)
+    day4_entry_time: Mapped[str] = mapped_column(String)
+    day4_exit_time: Mapped[str] = mapped_column(String)
+
+    day5_predicted_state: Mapped[str] = mapped_column(String)
+    day5_state_confidence: Mapped[float] = mapped_column(Float)
+    day5_entry_price: Mapped[float] = mapped_column(Float)
+    day5_exit_price: Mapped[float] = mapped_column(Float)
+    day5_expected_return_pct: Mapped[float] = mapped_column(Float)
+    day5_entry_time: Mapped[str] = mapped_column(String)
+    day5_exit_time: Mapped[str] = mapped_column(String)
+
+    day6_predicted_state: Mapped[str] = mapped_column(String)
+    day6_state_confidence: Mapped[float] = mapped_column(Float)
+    day6_entry_price: Mapped[float] = mapped_column(Float)
+    day6_exit_price: Mapped[float] = mapped_column(Float)
+    day6_expected_return_pct: Mapped[float] = mapped_column(Float)
+    day6_entry_time: Mapped[str] = mapped_column(String)
+    day6_exit_time: Mapped[str] = mapped_column(String)
+
+    day7_predicted_state: Mapped[str] = mapped_column(String)
+    day7_state_confidence: Mapped[float] = mapped_column(Float)
+    day7_entry_price: Mapped[float] = mapped_column(Float)
+    day7_exit_price: Mapped[float] = mapped_column(Float)
+    day7_expected_return_pct: Mapped[float] = mapped_column(Float)
+    day7_entry_time: Mapped[str] = mapped_column(String)
+    day7_exit_time: Mapped[str] = mapped_column(String)
+
+    day8_predicted_state: Mapped[str] = mapped_column(String)
+    day8_state_confidence: Mapped[float] = mapped_column(Float)
+    day8_entry_price: Mapped[float] = mapped_column(Float)
+    day8_exit_price: Mapped[float] = mapped_column(Float)
+    day8_expected_return_pct: Mapped[float] = mapped_column(Float)
+    day8_entry_time: Mapped[str] = mapped_column(String)
+    day8_exit_time: Mapped[str] = mapped_column(String)
+
+    day9_predicted_state: Mapped[str] = mapped_column(String)
+    day9_state_confidence: Mapped[float] = mapped_column(Float)
+    day9_entry_price: Mapped[float] = mapped_column(Float)
+    day9_exit_price: Mapped[float] = mapped_column(Float)
+    day9_expected_return_pct: Mapped[float] = mapped_column(Float)
+    day9_entry_time: Mapped[str] = mapped_column(String)
+    day9_exit_time: Mapped[str] = mapped_column(String)
+
+    day10_predicted_state: Mapped[str] = mapped_column(String)
+    day10_state_confidence: Mapped[float] = mapped_column(Float)
+    day10_entry_price: Mapped[float] = mapped_column(Float)
+    day10_exit_price: Mapped[float] = mapped_column(Float)
+    day10_expected_return_pct: Mapped[float] = mapped_column(Float)
+    day10_entry_time: Mapped[str] = mapped_column(String)
+    day10_exit_time: Mapped[str] = mapped_column(String)
+
+    computed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
+
+
 class News(Base):
     """One row per article returned by GET /v2/reference/news, keyed by massive.com's
     own article `id` rather than by ticker - a single article often covers more than
@@ -499,7 +620,19 @@ class JobConfig(Base):
     backtest_start_date/backtest_end_date only apply to the backtest job
     (registry.JobDefinition.has_backtest_fields), same "left None, resolved at run time"
     reasoning as average_volume_start_date - jobs/backtest_market_state.py resolves a
-    None end date to "yesterday" and a None start date to 90 days before that."""
+    None end date to "yesterday" and a None start date to 90 days before that.
+
+    prediction_start_date only applies to the predict-10-day-market-state job
+    (registry.JobDefinition.has_prediction_start_date_field), same "left None, resolved
+    at run time" reasoning as average_volume_start_date -
+    jobs/predict_market_state_10_day.py resolves a None start date to tomorrow (UTC).
+
+    run_requested_at is how app/main.py (the API process) asks job_runner.py (the
+    separate process that actually executes jobs - see jobs/engine.py) to run this job
+    now: POST /jobs/{name}/run sets it, job_runner.py's poll_run_requests clears it
+    once it picks the request up and starts the run. The two processes coordinate
+    purely through this DB row rather than a direct call/socket - see jobs/engine.py's
+    module docstring for why polling is enough here."""
 
     __tablename__ = "job_configs"
 
@@ -518,10 +651,12 @@ class JobConfig(Base):
     average_volume_days_interval: Mapped[int | None] = mapped_column(Integer)
     backtest_start_date: Mapped[dt.date | None] = mapped_column(Date)
     backtest_end_date: Mapped[dt.date | None] = mapped_column(Date)
+    prediction_start_date: Mapped[dt.date | None] = mapped_column(Date)
     # Hides the job's card from the Jobs page's default list (see app/main.py's
     # list_jobs) without affecting its schedule - a hidden job still runs normally.
     hidden: Mapped[bool] = mapped_column(default=False)
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False), default=dt.datetime.utcnow)
+    run_requested_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=False))
 
 
 class JobRun(Base):
@@ -531,7 +666,15 @@ class JobRun(Base):
     "completed" or "failed" when it finishes.
 
     `trigger` is "manual" (dashboard "Run now"/play-button run) or "auto" (fired by
-    the schedule) - this doubles as the dashboard's "last run mode" display."""
+    the schedule) - this doubles as the dashboard's "last run mode" display.
+
+    pause_requested/cancel_requested are how app/main.py's POST /jobs/{name}/pause|
+    resume|cancel signal a run in progress in job_runner.py's separate process: the API
+    process UPDATEs these directly on the job's current in_progress row, and
+    job_runner.py's poll_control_relay polls them and mirrors them into that run's
+    in-memory JobControl (see jobs/control.py) - only the relay poll touches the DB;
+    JobControl's own checkpoint_sync/checkpoint_async (called once per unit of work,
+    potentially tens of thousands of times per run) stay a plain in-memory check."""
 
     __tablename__ = "job_runs"
 
@@ -548,3 +691,5 @@ class JobRun(Base):
     # sync-ticker-details, the technical-indicator jobs. Null for every other job.
     progress_completed: Mapped[int | None] = mapped_column(Integer)
     progress_total: Mapped[int | None] = mapped_column(Integer)
+    pause_requested: Mapped[bool] = mapped_column(default=False)
+    cancel_requested: Mapped[bool] = mapped_column(default=False)

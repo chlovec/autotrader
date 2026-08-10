@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
 import {
   api,
-  TRADING_SYMBOLS_MAX_PAGE_SIZE,
+  NEXT_10_DAY_PREDICTIONS_MAX_PAGE_SIZE,
+  type Next10DayPredictionOrderField,
+  type Next10DayPredictionRow,
   type TickerTypeOption,
-  type TradingSymbolOrderField,
-  type TradingSymbolRow,
 } from '../api'
 import { NUMERIC_FILTER_OPS, type NumericFilterOp } from '../numericFilter'
 import { loadReportParams, saveReportParams } from '../reportParams'
@@ -12,37 +12,30 @@ import { ReportGrid, type ReportColumn } from './ReportGrid'
 import { SearchableSelect, type SelectOption } from './SearchableSelect'
 import { TickerDetailsModal } from './TickerDetailsModal'
 
-const REPORT_PARAMS_ID = 'trading-symbols'
+const REPORT_PARAMS_ID = 'next-10-day-predictions'
 
 type SavedParams = {
   tickerTypes: string[]
   tickers: string[]
   pageSize: number
-  orderBy: TradingSymbolOrderField[]
-  entryPriceOp: NumericFilterOp | ''
-  entryPriceValue: string
+  orderBy: Next10DayPredictionOrderField[]
   marketCapOp: NumericFilterOp | ''
   marketCapValue: string
 }
 
 // Backend caps /ticker-types/search's limit at 50 (see app/main.py's search_ticker_types) -
-// ticker_types is a short, mostly-static reference list (db/models.py's TickerType
-// docstring), so that's comfortably the whole thing in one page.
+// same reasoning as TradingSymbolsPage.
 const TICKER_TYPE_OPTIONS_LIMIT = 50
 
 const DEFAULT_PAGE_SIZE = 500
 
-// Fields the backend accepts in `order_by` (see TRADING_SYMBOLS_ORDERABLE_FIELDS in
-// app/main.py) - a subset of COLUMNS below, since ordering runs as a SQL ORDER BY
-// against the full filtered set (not just the fetched page), so it's limited to
-// fields that are cheap to sort on at the database level.
+// Fields the backend accepts in `order_by` (see NEXT_10_DAY_PREDICTIONS_ORDERABLE_FIELDS
+// in app/main.py).
 const ORDER_BY_FIELDS: { key: string; label: string }[] = [
   { key: 'ticker', label: 'Ticker' },
   { key: 'name', label: 'Name' },
   { key: 'type', label: 'Type' },
-  { key: 'todays_change_perc', label: "Today's Change %" },
-  { key: 'day_volume', label: 'Day Volume' },
-  { key: 'abs_expected_return_pct', label: 'Abs Expected Return %' },
+  { key: 'net_return_pct_days_1_10', label: 'Net Return % (1-10 Days)' },
 ]
 
 function tickerTypeLabel(t: TickerTypeOption): string {
@@ -50,138 +43,162 @@ function tickerTypeLabel(t: TickerTypeOption): string {
   return detail ? `${t.code} — ${detail}` : t.code
 }
 
-const COLUMNS: ReportColumn<TradingSymbolRow>[] = [
+// One column entry per market_predictions_10_day field (see db/models.py's
+// MarketPrediction10Day) plus the base ticker/reference columns and the 3 net-return
+// summary fields - written out explicitly, same "no metaprogrammed columns" reasoning
+// as db/models.py's own column definitions.
+const COLUMNS: ReportColumn<Next10DayPredictionRow>[] = [
   { key: 'ticker', label: 'Ticker' },
   { key: 'name', label: 'Name' },
   { key: 'type', label: 'Type' },
   { key: 'asset_class', label: 'Asset Class' },
   { key: 'average_volume', label: 'Average Volume' },
   { key: 'market_cap', label: 'Market Cap' },
-  { key: 'todays_change', label: "Today's Change" },
-  { key: 'todays_change_perc', label: "Today's Change %" },
-  { key: 'updated', label: 'Updated' },
-  { key: 'day_open', label: 'Day Open' },
-  { key: 'day_high', label: 'Day High' },
-  { key: 'day_low', label: 'Day Low' },
-  { key: 'day_close', label: 'Day Close' },
-  { key: 'day_volume', label: 'Day Volume' },
-  { key: 'day_vwap', label: 'Day VWAP' },
-  { key: 'min_open', label: 'Min Open' },
-  { key: 'min_high', label: 'Min High' },
-  { key: 'min_low', label: 'Min Low' },
-  { key: 'min_close', label: 'Min Close' },
-  { key: 'min_volume', label: 'Min Volume' },
-  { key: 'min_vwap', label: 'Min VWAP' },
-  { key: 'min_accumulated_volume', label: 'Min Accumulated Volume' },
-  { key: 'min_timestamp', label: 'Min Timestamp' },
-  { key: 'prev_day_open', label: 'Prev Day Open' },
-  { key: 'prev_day_high', label: 'Prev Day High' },
-  { key: 'prev_day_low', label: 'Prev Day Low' },
-  { key: 'prev_day_close', label: 'Prev Day Close' },
-  { key: 'prev_day_volume', label: 'Prev Day Volume' },
-  { key: 'prev_day_vwap', label: 'Prev Day VWAP' },
-  { key: 'fetched_at', label: 'Fetched At' },
-  { key: 'predicted_date', label: 'Predicted Date' },
+  { key: 'start_date', label: 'Start Date' },
   { key: 'current_state', label: 'Current State' },
-  { key: 'predicted_state', label: 'Predicted State' },
-  { key: 'state_confidence', label: 'State Confidence' },
-  { key: 'expected_return', label: 'Expected Return' },
-  { key: 'abs_expected_return_pct', label: 'Abs Expected Return %' },
-  { key: 'entry_price', label: 'Entry Price' },
-  { key: 'exit_price', label: 'Exit Price' },
-  { key: 'entry_time', label: 'Entry Time' },
-  { key: 'exit_time', label: 'Exit Time' },
-  { key: 'history_days', label: 'History Days' },
-  { key: 'prediction_computed_at', label: 'Prediction Computed At' },
+  { key: 'day1_predicted_state', label: 'Day 1 Predicted State' },
+  { key: 'day1_state_confidence', label: 'Day 1 State Confidence' },
+  { key: 'day1_entry_price', label: 'Day 1 Entry Price' },
+  { key: 'day1_exit_price', label: 'Day 1 Exit Price' },
+  { key: 'day1_expected_return_pct', label: 'Day 1 Expected Return %' },
+  { key: 'day1_entry_time', label: 'Day 1 Entry Time' },
+  { key: 'day1_exit_time', label: 'Day 1 Exit Time' },
+  { key: 'day2_predicted_state', label: 'Day 2 Predicted State' },
+  { key: 'day2_state_confidence', label: 'Day 2 State Confidence' },
+  { key: 'day2_entry_price', label: 'Day 2 Entry Price' },
+  { key: 'day2_exit_price', label: 'Day 2 Exit Price' },
+  { key: 'day2_expected_return_pct', label: 'Day 2 Expected Return %' },
+  { key: 'day2_entry_time', label: 'Day 2 Entry Time' },
+  { key: 'day2_exit_time', label: 'Day 2 Exit Time' },
+  { key: 'day3_predicted_state', label: 'Day 3 Predicted State' },
+  { key: 'day3_state_confidence', label: 'Day 3 State Confidence' },
+  { key: 'day3_entry_price', label: 'Day 3 Entry Price' },
+  { key: 'day3_exit_price', label: 'Day 3 Exit Price' },
+  { key: 'day3_expected_return_pct', label: 'Day 3 Expected Return %' },
+  { key: 'day3_entry_time', label: 'Day 3 Entry Time' },
+  { key: 'day3_exit_time', label: 'Day 3 Exit Time' },
+  { key: 'day4_predicted_state', label: 'Day 4 Predicted State' },
+  { key: 'day4_state_confidence', label: 'Day 4 State Confidence' },
+  { key: 'day4_entry_price', label: 'Day 4 Entry Price' },
+  { key: 'day4_exit_price', label: 'Day 4 Exit Price' },
+  { key: 'day4_expected_return_pct', label: 'Day 4 Expected Return %' },
+  { key: 'day4_entry_time', label: 'Day 4 Entry Time' },
+  { key: 'day4_exit_time', label: 'Day 4 Exit Time' },
+  { key: 'day5_predicted_state', label: 'Day 5 Predicted State' },
+  { key: 'day5_state_confidence', label: 'Day 5 State Confidence' },
+  { key: 'day5_entry_price', label: 'Day 5 Entry Price' },
+  { key: 'day5_exit_price', label: 'Day 5 Exit Price' },
+  { key: 'day5_expected_return_pct', label: 'Day 5 Expected Return %' },
+  { key: 'day5_entry_time', label: 'Day 5 Entry Time' },
+  { key: 'day5_exit_time', label: 'Day 5 Exit Time' },
+  { key: 'day6_predicted_state', label: 'Day 6 Predicted State' },
+  { key: 'day6_state_confidence', label: 'Day 6 State Confidence' },
+  { key: 'day6_entry_price', label: 'Day 6 Entry Price' },
+  { key: 'day6_exit_price', label: 'Day 6 Exit Price' },
+  { key: 'day6_expected_return_pct', label: 'Day 6 Expected Return %' },
+  { key: 'day6_entry_time', label: 'Day 6 Entry Time' },
+  { key: 'day6_exit_time', label: 'Day 6 Exit Time' },
+  { key: 'day7_predicted_state', label: 'Day 7 Predicted State' },
+  { key: 'day7_state_confidence', label: 'Day 7 State Confidence' },
+  { key: 'day7_entry_price', label: 'Day 7 Entry Price' },
+  { key: 'day7_exit_price', label: 'Day 7 Exit Price' },
+  { key: 'day7_expected_return_pct', label: 'Day 7 Expected Return %' },
+  { key: 'day7_entry_time', label: 'Day 7 Entry Time' },
+  { key: 'day7_exit_time', label: 'Day 7 Exit Time' },
+  { key: 'day8_predicted_state', label: 'Day 8 Predicted State' },
+  { key: 'day8_state_confidence', label: 'Day 8 State Confidence' },
+  { key: 'day8_entry_price', label: 'Day 8 Entry Price' },
+  { key: 'day8_exit_price', label: 'Day 8 Exit Price' },
+  { key: 'day8_expected_return_pct', label: 'Day 8 Expected Return %' },
+  { key: 'day8_entry_time', label: 'Day 8 Entry Time' },
+  { key: 'day8_exit_time', label: 'Day 8 Exit Time' },
+  { key: 'day9_predicted_state', label: 'Day 9 Predicted State' },
+  { key: 'day9_state_confidence', label: 'Day 9 State Confidence' },
+  { key: 'day9_entry_price', label: 'Day 9 Entry Price' },
+  { key: 'day9_exit_price', label: 'Day 9 Exit Price' },
+  { key: 'day9_expected_return_pct', label: 'Day 9 Expected Return %' },
+  { key: 'day9_entry_time', label: 'Day 9 Entry Time' },
+  { key: 'day9_exit_time', label: 'Day 9 Exit Time' },
+  { key: 'day10_predicted_state', label: 'Day 10 Predicted State' },
+  { key: 'day10_state_confidence', label: 'Day 10 State Confidence' },
+  { key: 'day10_entry_price', label: 'Day 10 Entry Price' },
+  { key: 'day10_exit_price', label: 'Day 10 Exit Price' },
+  { key: 'day10_expected_return_pct', label: 'Day 10 Expected Return %' },
+  { key: 'day10_entry_time', label: 'Day 10 Entry Time' },
+  { key: 'day10_exit_time', label: 'Day 10 Exit Time' },
+  { key: 'net_return_pct_days_1_5', label: 'Net Return % (Days 1-5)' },
+  { key: 'net_return_pct_days_6_10', label: 'Net Return % (Days 6-10)' },
+  { key: 'net_return_pct_days_1_10', label: 'Net Return % (Days 1-10)' },
+  { key: 'computed_at', label: 'Computed At' },
 ]
 
-// updated/min_timestamp/fetched_at/prediction_computed_at are naive-UTC (same as
-// JobRun.started_at) - append "Z" so Date parses them as UTC instead of local time,
-// same reasoning as JobCard's formatTimestamp. predicted_date is a plain date (no
-// time component), so it's left out of this set and rendered as-is by formatCell.
-const TIMESTAMP_FIELDS = new Set<keyof TradingSymbolRow>([
-  'updated',
-  'min_timestamp',
-  'fetched_at',
-  'prediction_computed_at',
+// computed_at is naive-UTC (same as JobRun.started_at) - append "Z" so Date parses it
+// as UTC instead of local time, same reasoning as JobCard's formatTimestamp.
+// start_date is a plain date (no time component), so it's left out of this set and
+// rendered as-is by formatCell, same as TradingSymbolsPage's predicted_date.
+const TIMESTAMP_FIELDS = new Set<keyof Next10DayPredictionRow>(['computed_at'])
+
+// Every field this report reports as an actual percentage (server-computed, see
+// app/main.py's _next_10_day_prediction_fields) - formatted with a trailing "%",
+// same reasoning as TradingSymbolsPage's abs_expected_return_pct.
+const PERCENT_FIELDS = new Set<keyof Next10DayPredictionRow>([
+  'day1_expected_return_pct',
+  'day2_expected_return_pct',
+  'day3_expected_return_pct',
+  'day4_expected_return_pct',
+  'day5_expected_return_pct',
+  'day6_expected_return_pct',
+  'day7_expected_return_pct',
+  'day8_expected_return_pct',
+  'day9_expected_return_pct',
+  'day10_expected_return_pct',
+  'net_return_pct_days_1_5',
+  'net_return_pct_days_6_10',
+  'net_return_pct_days_1_10',
 ])
 
-function formatCell(row: TradingSymbolRow, key: keyof TradingSymbolRow): string {
+function formatCell(row: Next10DayPredictionRow, key: keyof Next10DayPredictionRow): string {
   const value = row[key]
   if (value == null) return '–'
   if (TIMESTAMP_FIELDS.has(key)) return new Date(`${value}Z`).toLocaleString()
-  if (key === 'abs_expected_return_pct') return `${(value as number).toFixed(2)}%`
+  if (PERCENT_FIELDS.has(key)) return `${(value as number).toFixed(2)}%`
   if (typeof value === 'number') return value.toLocaleString(undefined, { maximumFractionDigits: 4 })
   return String(value)
 }
 
-function rowKey(row: TradingSymbolRow): string {
+function rowKey(row: Next10DayPredictionRow): string {
   return row.ticker
 }
 
-// Computed once on module load (not per-mount) purely so the lazy useState
-// initializers below - which all need the same saved blob - don't each re-read and
-// re-parse localStorage independently.
+// Computed once on module load (not per-mount) - same reasoning as TradingSymbolsPage's
+// loadSavedParams.
 function loadSavedParams(): Partial<SavedParams> | null {
   return loadReportParams<SavedParams>(REPORT_PARAMS_ID)
 }
 
-export function TradingSymbolsPage() {
+export function Next10DayPredictionsPage() {
   const [tickerTypeOptions, setTickerTypeOptions] = useState<SelectOption[]>([])
   const [tickerTypes, setTickerTypes] = useState<string[]>(() => loadSavedParams()?.tickerTypes ?? [])
-  // Combined with tickerTypes as an AND (see app/main.py's trading_symbols_report
-  // docstring) - unlike JobCard's mutually-exclusive Tickers/Ticker types pair, this is
-  // a report filter narrowing an already-fetched result set, not a job's "which
-  // population to run against" selector, so there's no ambiguity in allowing both.
   const [tickers, setTickers] = useState<string[]>(() => loadSavedParams()?.tickers ?? [])
-  // Sort priority for the report - array order is priority order (index 0 = primary
-  // sort key), same convention as SearchableSelect's chip order. Sent to the backend
-  // as-is on the next fetch, same as tickerTypes below.
-  const [orderBy, setOrderBy] = useState<TradingSymbolOrderField[]>(() => loadSavedParams()?.orderBy ?? [])
-  // A real backend filter (see app/main.py's trading_symbols_report), unlike
-  // ReportGrid's client-side numeric column filters - '' means "no operator chosen
-  // yet", distinct from a chosen operator with a blank/unparseable value (see
-  // entryPriceFilter below), so the two inputs can be edited independently without one
-  // half silently clearing the other.
-  const [entryPriceOp, setEntryPriceOp] = useState<NumericFilterOp | ''>(() => loadSavedParams()?.entryPriceOp ?? '')
-  const [entryPriceValue, setEntryPriceValue] = useState(() => loadSavedParams()?.entryPriceValue ?? '')
-  // Same shape/reasoning as entryPriceOp/entryPriceValue above, filtering on market_cap
-  // instead.
+  const [orderBy, setOrderBy] = useState<Next10DayPredictionOrderField[]>(() => loadSavedParams()?.orderBy ?? [])
   const [marketCapOp, setMarketCapOp] = useState<NumericFilterOp | ''>(() => loadSavedParams()?.marketCapOp ?? '')
   const [marketCapValue, setMarketCapValue] = useState(() => loadSavedParams()?.marketCapValue ?? '')
-  // Draft value bound to the page-size input, distinct from `pageSize` below (the
-  // value the currently-displayed page was actually fetched with) - editing this
-  // doesn't affect what's on screen, or what Prev/Next page through, until "Run
-  // report" is clicked again.
   const [pageSizeInput, setPageSizeInput] = useState(() => loadSavedParams()?.pageSize ?? DEFAULT_PAGE_SIZE)
   const [page, setPage] = useState(1)
-  // Draft value bound to the "Page X of N" jump-to-page input - same pattern as
-  // pageSizeInput, but synced back to `page` on every successful fetch (including
-  // Prev/Next) so it doesn't go stale sitting there mid-browse.
   const [pageInput, setPageInput] = useState(1)
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE)
   const [total, setTotal] = useState(0)
-  const [rows, setRows] = useState<TradingSymbolRow[] | null>(null)
+  const [rows, setRows] = useState<Next10DayPredictionRow[] | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [detailsRow, setDetailsRow] = useState<TradingSymbolRow | null>(null)
+  const [detailsRow, setDetailsRow] = useState<Next10DayPredictionRow | null>(null)
 
-  // Fetched once as a static list (rather than SearchableSelect's onSearch, which only
-  // queries once the user types) so the dropdown opens showing every ticker type right
-  // away - client-side filtered from there as the user types, same component.
   useEffect(() => {
     api
       .searchTickerTypes('', TICKER_TYPE_OPTIONS_LIMIT)
       .then((matches) => setTickerTypeOptions(matches.map((t) => ({ value: t.code, label: tickerTypeLabel(t) }))))
   }, [])
 
-  // undefined (not sent to the backend at all) until both an operator is chosen and a
-  // parseable value typed - matches ColumnHeaderMenu's numeric condition rows, where a
-  // half-filled row is treated as not-yet-active rather than an error.
-  const entryPriceFilter =
-    entryPriceOp && entryPriceValue.trim() !== '' && Number.isFinite(Number(entryPriceValue))
-      ? { op: entryPriceOp, value: Number(entryPriceValue) }
-      : undefined
   const marketCapFilter =
     marketCapOp && marketCapValue.trim() !== '' && Number.isFinite(Number(marketCapValue))
       ? { op: marketCapOp, value: Number(marketCapValue) }
@@ -191,22 +208,18 @@ export function TradingSymbolsPage() {
     setLoading(true)
     setError(null)
     try {
-      const result = await api.tradingSymbolsReport(
+      const result = await api.next10DayPredictionsReport(
         tickerTypes,
+        tickers,
         targetPage,
         requestedPageSize,
         orderBy,
-        entryPriceFilter,
         marketCapFilter,
-        tickers,
       )
       setRows(result.rows)
       setTotal(result.total)
       setPage(result.page)
       setPageInput(result.page)
-      // Reflects back whatever the backend actually used (it clamps page_size too) -
-      // Prev/Next below page off of this, not pageSizeInput, so mid-browse edits to
-      // the input can't desync the offset math from what's actually on screen.
       setPageSize(result.page_size)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load report')
@@ -218,10 +231,6 @@ export function TradingSymbolsPage() {
   const runReport = () => fetchPage(1, pageSizeInput)
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
 
-  // Persists the current draft controls (not necessarily the ones the on-screen page
-  // was fetched with) so the next visit to this page restores them - separate from
-  // ReportGrid's own "Save view", which only covers sort/filter/freeze/hide/width on
-  // the grid itself, not these report-level controls.
   const [paramsJustSaved, setParamsJustSaved] = useState(false)
   const paramsSavedFlashTimeout = useRef<number | null>(null)
   useEffect(() => () => {
@@ -233,8 +242,6 @@ export function TradingSymbolsPage() {
       tickers,
       pageSize: pageSizeInput,
       orderBy,
-      entryPriceOp,
-      entryPriceValue,
       marketCapOp,
       marketCapValue,
     })
@@ -270,10 +277,10 @@ export function TradingSymbolsPage() {
 
   return (
     <div className="report-page">
-      <h1 className="jobs-page-title">Trading Symbols</h1>
+      <h1 className="jobs-page-title">Next 10 Day Predictions</h1>
       <p className="jobs-page-subtitle">
-        Every synced ticker with its reference data, average volume, and latest snapshot. Optionally filter by
-        ticker type or specific tickers before running.
+        Each ticker's most recent 10-trading-day-ahead projection (predict-10-day-market-state job). Optionally
+        filter by ticker type, specific tickers, or market cap before running.
       </p>
 
       <div className="report-controls">
@@ -303,25 +310,6 @@ export function TradingSymbolsPage() {
             />
           </div>
           <div className="job-field report-numeric-filter-field">
-            <span className="job-field-label">Entry price</span>
-            <div className="report-numeric-filter-inputs">
-              <select value={entryPriceOp} onChange={(event) => setEntryPriceOp(event.target.value as NumericFilterOp | '')}>
-                <option value="">Any</option>
-                {NUMERIC_FILTER_OPS.map((op) => (
-                  <option key={op} value={op}>
-                    {op}
-                  </option>
-                ))}
-              </select>
-              <input
-                type="number"
-                placeholder="Value"
-                value={entryPriceValue}
-                onChange={(event) => setEntryPriceValue(event.target.value)}
-              />
-            </div>
-          </div>
-          <div className="job-field report-numeric-filter-field">
             <span className="job-field-label">Market cap</span>
             <div className="report-numeric-filter-inputs">
               <select value={marketCapOp} onChange={(event) => setMarketCapOp(event.target.value as NumericFilterOp | '')}>
@@ -347,13 +335,15 @@ export function TradingSymbolsPage() {
             <input
               type="number"
               min={1}
-              max={TRADING_SYMBOLS_MAX_PAGE_SIZE}
+              max={NEXT_10_DAY_PREDICTIONS_MAX_PAGE_SIZE}
               step={1}
               value={pageSizeInput}
               onChange={(event) => setPageSizeInput(Number(event.target.value))}
               onBlur={() =>
                 setPageSizeInput((current) =>
-                  Number.isFinite(current) ? Math.min(TRADING_SYMBOLS_MAX_PAGE_SIZE, Math.max(1, Math.round(current))) : DEFAULT_PAGE_SIZE,
+                  Number.isFinite(current)
+                    ? Math.min(NEXT_10_DAY_PREDICTIONS_MAX_PAGE_SIZE, Math.max(1, Math.round(current)))
+                    : DEFAULT_PAGE_SIZE,
                 )
               }
             />
@@ -453,8 +443,8 @@ export function TradingSymbolsPage() {
             rows={rows}
             rowKey={rowKey}
             formatCell={formatCell}
-            emptyMessage="No symbols found."
-            storageKey="trading-symbols"
+            emptyMessage="No predictions found."
+            storageKey="next-10-day-predictions"
             rowContextMenu={[{ label: 'View Details', onSelect: setDetailsRow }]}
           />
           <div className="report-pager">
@@ -500,7 +490,7 @@ export function TradingSymbolsPage() {
       )}
 
       {!rows && !loading && !error && (
-        <p className="placeholder-note">Choose ticker types and page size (optional) and run the report.</p>
+        <p className="placeholder-note">Choose filters and page size (optional) and run the report.</p>
       )}
 
       {detailsRow && (

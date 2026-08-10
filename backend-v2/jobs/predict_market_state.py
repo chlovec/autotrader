@@ -48,6 +48,12 @@ DEFAULT_MIN_HISTORY_DAYS = 60
 ENTRY_TIME = "09:30:00"
 EXIT_TIME = "16:00:00"
 
+# Commits every this-many tickers instead of once at the very end, so a full run (tens
+# of thousands of tickers) doesn't hold a single write transaction open for its entire
+# duration - see db/session.py's WAL-mode comment for why that matters even with WAL,
+# since writers are still serialized against each other.
+COMMIT_BATCH_SIZE = 500
+
 
 def _apply_ticker_filter(query, ticker_types: list[str] | None, tickers: list[str] | None):
     """Same shape as jobs/average_volume.py's _apply_ticker_filter - filters ohlc_bars
@@ -209,6 +215,8 @@ def compute_market_state_predictions(
         )
         session.execute(stmt)
         stored += 1
+        if stored % COMMIT_BATCH_SIZE == 0:
+            session.commit()
     session.commit()
 
     logger.info(

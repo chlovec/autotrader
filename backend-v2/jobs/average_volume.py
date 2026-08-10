@@ -23,6 +23,10 @@ DEFAULT_DAYS_INTERVAL = 50
 DEFAULT_MULTIPLIER = 1
 DEFAULT_TIMESPAN = "day"
 
+# Commits every this-many tickers instead of once at the very end - same reasoning as
+# jobs/predict_market_state.py's COMMIT_BATCH_SIZE.
+COMMIT_BATCH_SIZE = 500
+
 
 def _apply_ticker_filter(query, ticker_types: list[str] | None, tickers: list[str] | None):
     """Unlike jobs/sync_indicators.py's _resolve_tickers - which has to materialize the
@@ -105,6 +109,8 @@ def compute_average_volume(
         )
         session.execute(stmt)
         stored += 1
+        if stored % COMMIT_BATCH_SIZE == 0:
+            session.commit()
     session.commit()
 
     logger.info(

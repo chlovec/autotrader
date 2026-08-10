@@ -96,6 +96,7 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
   const [averageVolumeDaysInterval, setAverageVolumeDaysInterval] = useState(job.average_volume_days_interval ?? 50)
   const [backtestStartDate, setBacktestStartDate] = useState(job.backtest_start_date ?? '')
   const [backtestEndDate, setBacktestEndDate] = useState(job.backtest_end_date ?? '')
+  const [predictionStartDate, setPredictionStartDate] = useState(job.prediction_start_date ?? '')
 
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
@@ -147,6 +148,7 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
               backtest_end_date: backtestEndDate || null,
             }
           : {}),
+        ...(job.has_prediction_start_date_field ? { prediction_start_date: predictionStartDate || null } : {}),
       })
       onSaved(updated)
     } catch (err) {
@@ -454,7 +456,8 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
                 !job.has_ticker_type_filter &&
                 !job.has_snapshot_type_filter &&
                 !job.has_average_volume_fields &&
-                !job.has_backtest_fields && (
+                !job.has_backtest_fields &&
+                !job.has_prediction_start_date_field && (
                   <p className="job-field-hint">This job has no run parameters to configure.</p>
                 )}
 
@@ -596,6 +599,22 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
                     Leave end date blank to default to yesterday (UTC) at run time, and start date blank to default
                     to 90 days before that.
                   </p>
+                </>
+              )}
+
+              {job.has_prediction_start_date_field && (
+                <>
+                  <div className="job-field-row">
+                    <label className="job-field">
+                      Start date (UTC)
+                      <input
+                        type="date"
+                        value={predictionStartDate}
+                        onChange={(e) => setPredictionStartDate(e.target.value)}
+                      />
+                    </label>
+                  </div>
+                  <p className="job-field-hint">Leave blank to default to tomorrow (UTC) at run time.</p>
                 </>
               )}
             </div>

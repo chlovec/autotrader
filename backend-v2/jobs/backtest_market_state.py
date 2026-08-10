@@ -39,6 +39,10 @@ logger = logging.getLogger("backend_v2.jobs.backtest_market_state")
 # start_date's fallback when unset - see compute_market_state_backtest's docstring.
 DEFAULT_BACKTEST_DAYS = 90
 
+# Commits every this-many stored (ticker, evaluated_date) results instead of once at the
+# very end - same reasoning as jobs/predict_market_state.py's COMMIT_BATCH_SIZE.
+COMMIT_BATCH_SIZE = 500
+
 
 def _next_trading_day(date: dt.date, all_dates: list[dt.date]) -> dt.date | None:
     """The earliest date in `all_dates` (sorted, deduped, spanning every ticker) that's
@@ -186,6 +190,8 @@ def compute_market_state_backtest(
             session.execute(stmt)
             stored += 1
             ticker_stored = True
+            if stored % COMMIT_BATCH_SIZE == 0:
+                session.commit()
 
         if not ticker_stored:
             skipped += 1

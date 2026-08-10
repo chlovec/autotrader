@@ -1,28 +1,31 @@
 #!/bin/bash
-# Starts the v2 stack directly - backend-v2's scheduled data-sync jobs (run_jobs.py)
-# and the frontend-v2 Vite dashboard - without going through the Makefile. Runs
-# stop-v2.sh first so leftover processes from a previous run can't collide with these.
-# Mirrors bin/restart.sh's shape for v1; see that file for the fuller v1 stack
-# (backend/trading loop/research) this doesn't have a v2 equivalent of yet.
+# Starts the v2 stack directly - backend-v2's dashboard API (run_jobs.py), its
+# job-execution process (job_runner.py - see backend-v2/jobs/engine.py's module
+# docstring for why this is a separate process from the API), and the frontend-v2 Vite
+# dashboard - without going through the Makefile. Runs stop-v2.sh first so leftover
+# processes from a previous run can't collide with these. Mirrors bin/restart.sh's
+# shape for v1; see that file for the fuller v1 stack (backend/trading loop/research)
+# this doesn't have a v2 equivalent of yet.
 #
 # backend-v2 reads its own .env (see backend-v2/.env.example) - MASSIVE_API_KEY,
-# BACKEND_V2_DATABASE_URL, etc. - separate from the root .env v1 uses. run_jobs.py is
-# launched with its cwd set to backend-v2/ so python-dotenv's load_dotenv() (called
-# with no arguments in data/client.py and db/session.py) finds that file instead of
-# the root one.
+# BACKEND_V2_DATABASE_URL, etc. - separate from the root .env v1 uses. run_jobs.py and
+# job_runner.py are both launched with their cwd set to backend-v2/ so python-dotenv's
+# load_dotenv() (called with no arguments in data/client.py and db/session.py) finds
+# that file instead of the root one.
 #
 # Usage (from anywhere - resolves the project root itself):
-#   ./bin/restart-v2.sh [--skip-backend] [--skip-dashboard]
+#   ./bin/restart-v2.sh [--skip-backend] [--skip-jobs] [--skip-dashboard]
 # With no flags, asks about each service one by one (Restart backend-v2? [Y/n], etc.)
-# so you can leave either one untouched. A --skip-* flag answers that one service's
+# so you can leave any of them untouched. A --skip-* flag answers that one service's
 # question in advance (useful for scripting/automation) without being asked; any
 # service not flagged is still asked interactively.
 #
 # Env overrides: DASHBOARD_V2_PORT (must match frontend-v2/vite.config.ts's
 # strictPort - default 5174, distinct from v1's 5173 so both can run side by side).
 # BACKEND_V2_PORT (must match backend-v2/.env's BACKEND_V2_PORT - default 8001, distinct
-# from v1's BACKEND_PORT 8000) - run_jobs.py now serves a FastAPI app (job config/
-# trigger endpoints for the dashboard's Jobs page) on this port, not just the scheduler.
+# from v1's BACKEND_PORT 8000) - run_jobs.py serves a FastAPI app (job config/trigger
+# endpoints for the dashboard's Jobs page) on this port. job_runner.py serves no HTTP
+# of its own - it only executes jobs on their schedule - so it has no port to report.
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -33,15 +36,17 @@ DASHBOARD_V2_PORT="${DASHBOARD_V2_PORT:-5174}"
 BACKEND_V2_PORT="${BACKEND_V2_PORT:-8001}"
 
 SKIP_BACKEND=0; BACKEND_SET=0
+SKIP_JOBS=0; JOBS_SET=0
 SKIP_DASHBOARD=0; DASHBOARD_SET=0
 
 usage() {
-  echo "Usage: $0 [--skip-backend] [--skip-dashboard]"
+  echo "Usage: $0 [--skip-backend] [--skip-jobs] [--skip-dashboard]"
 }
 
 for arg in "$@"; do
   case "$arg" in
     --skip-backend) SKIP_BACKEND=1; BACKEND_SET=1 ;;
+    --skip-jobs) SKIP_JOBS=1; JOBS_SET=1 ;;
     --skip-dashboard) SKIP_DASHBOARD=1; DASHBOARD_SET=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $arg" >&2; usage; exit 1 ;;
@@ -64,12 +69,16 @@ ask_yes_no() {
 if [ "$BACKEND_SET" -eq 0 ]; then
   if ask_yes_no "Restart backend-v2 (run_jobs.py)?" "y"; then SKIP_BACKEND=0; else SKIP_BACKEND=1; fi
 fi
+if [ "$JOBS_SET" -eq 0 ]; then
+  if ask_yes_no "Restart backend-v2's job runner (job_runner.py)?" "y"; then SKIP_JOBS=0; else SKIP_JOBS=1; fi
+fi
 if [ "$DASHBOARD_SET" -eq 0 ]; then
   if ask_yes_no "Restart dashboard-v2?" "y"; then SKIP_DASHBOARD=0; else SKIP_DASHBOARD=1; fi
 fi
 
 ACTIONS=()
 if [ "$SKIP_BACKEND" -eq 0 ]; then ACTIONS+=("backend-v2"); fi
+if [ "$SKIP_JOBS" -eq 0 ]; then ACTIONS+=("job-runner-v2"); fi
 if [ "$SKIP_DASHBOARD" -eq 0 ]; then ACTIONS+=("dashboard-v2"); fi
 
 if [ ${#ACTIONS[@]} -eq 0 ]; then
@@ -84,21 +93,32 @@ echo "Proceeding: ${ACTIONS_JOINED}."
 # shouldn't ask again - it just acts on the same --skip-* flags this script resolved.
 STOP_FLAGS=("--yes")
 if [ "$SKIP_BACKEND" -eq 1 ]; then STOP_FLAGS+=("--skip-backend"); fi
+if [ "$SKIP_JOBS" -eq 1 ]; then STOP_FLAGS+=("--skip-jobs"); fi
 if [ "$SKIP_DASHBOARD" -eq 1 ]; then STOP_FLAGS+=("--skip-dashboard"); fi
 "$SCRIPT_DIR/stop-v2.sh" "${STOP_FLAGS[@]}"
 
 LOG="services-v2.log"
 : > "$LOG"
 
-JOBS_PID=""
+BACKEND_PID=""
+JOB_RUNNER_PID=""
 
 if [ "$SKIP_BACKEND" -eq 0 ]; then
   echo "Starting backend-v2 (run_jobs.py)..."
   nohup bash -c "cd backend-v2 && exec \"$PYTHON\" run_jobs.py" >> "$LOG" 2>&1 &
-  JOBS_PID=$!
+  BACKEND_PID=$!
   disown
 else
   echo "Skipping backend-v2 (left as-is)."
+fi
+
+if [ "$SKIP_JOBS" -eq 0 ]; then
+  echo "Starting backend-v2's job runner (job_runner.py)..."
+  nohup bash -c "cd backend-v2 && exec \"$PYTHON\" job_runner.py" >> "$LOG" 2>&1 &
+  JOB_RUNNER_PID=$!
+  disown
+else
+  echo "Skipping job-runner-v2 (left as-is)."
 fi
 
 if [ "$SKIP_DASHBOARD" -eq 0 ]; then
@@ -109,16 +129,26 @@ else
   echo "Skipping dashboard-v2 (left as-is)."
 fi
 
-# `nohup ... &` never surfaces the child's exit code - without this check, backend-v2
-# crashing on startup (e.g. a missing MASSIVE_API_KEY) would still print as a
-# successful restart below. run_jobs.py never legitimately exits on its own (it blocks
-# forever once the scheduler starts), so it being dead already means it crashed.
-if [ -n "$JOBS_PID" ]; then
+# `nohup ... &` never surfaces the child's exit code - without this check, backend-v2/
+# job_runner.py crashing on startup (e.g. a missing MASSIVE_API_KEY) would still print
+# as a successful restart below. Neither ever legitimately exits on its own (run_jobs.py
+# serves forever, job_runner.py blocks forever once its scheduler starts), so either
+# being dead already means it crashed.
+if [ -n "$BACKEND_PID" ]; then
   sleep 2
-  if ! kill -0 "$JOBS_PID" 2>/dev/null; then
+  if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
     echo "ERROR: backend-v2 (run_jobs.py) exited immediately - check $LOG:" >&2
     tail -n 20 "$LOG" >&2
-    echo "Dashboard-v2 may still be running - ./bin/stop-v2.sh to tear everything down." >&2
+    echo "Other v2 services may still be running - ./bin/stop-v2.sh to tear everything down." >&2
+    exit 1
+  fi
+fi
+if [ -n "$JOB_RUNNER_PID" ]; then
+  sleep 2
+  if ! kill -0 "$JOB_RUNNER_PID" 2>/dev/null; then
+    echo "ERROR: job-runner-v2 (job_runner.py) exited immediately - check $LOG:" >&2
+    tail -n 20 "$LOG" >&2
+    echo "Other v2 services may still be running - ./bin/stop-v2.sh to tear everything down." >&2
     exit 1
   fi
 fi

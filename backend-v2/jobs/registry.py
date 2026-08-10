@@ -22,6 +22,7 @@ RSI_JOB = "sync-rsi"
 AVERAGE_VOLUME_JOB = "average-volume"
 PREDICT_MARKET_STATE_JOB = "predict-market-state"
 BACKTEST_MARKET_STATE_JOB = "backtest-market-state"
+PREDICT_10_DAY_MARKET_STATE_JOB = "predict-10-day-market-state"
 
 # job name -> massive.com indicator path segment (GET /v1/indicators/{indicator}/
 # {ticker}) - jobs/sync_indicators.py's sync_indicator takes the latter, app/main.py's
@@ -63,6 +64,7 @@ DEFAULT_SCHEDULES: dict[str, tuple[str, int]] = {
     AVERAGE_VOLUME_JOB: ("days", 1),
     PREDICT_MARKET_STATE_JOB: ("days", 1),
     BACKTEST_MARKET_STATE_JOB: ("days", 1),
+    PREDICT_10_DAY_MARKET_STATE_JOB: ("days", 1),
 }
 
 
@@ -104,6 +106,11 @@ class JobDefinition:
     # the other flags, same layering as has_average_volume_fields: the backtest job
     # also sets has_ticker_selector to scope which tickers get backtested.
     has_backtest_fields: bool = False
+    # Whether this job offers a single "Start date" field (see
+    # jobs/predict_market_state_10_day.py) - only the 10-day-prediction job takes this.
+    # Unlike has_backtest_fields, just one date (the prediction's own start date, not a
+    # range) - independent of the other flags, same layering as has_average_volume_fields.
+    has_prediction_start_date_field: bool = False
     # Seeded into JobConfig.run_type the first time this job's config row is created
     # (see app/main.py's _get_or_create_config). "auto" unless overridden below.
     default_run_type: str = "auto"
@@ -274,6 +281,25 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
         # Run-on-demand evaluation over an explicit date range, no natural daily
         # cadence of its own - manual by default, same reasoning as average-volume/
         # predict-market-state.
+        default_run_type="manual",
+    ),
+    PREDICT_10_DAY_MARKET_STATE_JOB: JobDefinition(
+        name=PREDICT_10_DAY_MARKET_STATE_JOB,
+        label="Predict next 10 trading days",
+        description=(
+            "Walks the predict-market-state job's fitted per-ticker Markov chain "
+            "forward 10 trading days from a chosen start date (default: tomorrow, "
+            "UTC), storing each ticker's full 10-day projection - predicted state, "
+            "confidence, and projected entry/exit price per day - in the "
+            "market_predictions_10_day table. Purely local - no massive.com call, "
+            "reads bars already synced by the bars job, and only bars from before the "
+            "start date."
+        ),
+        has_bars_fields=False,
+        has_ticker_selector=True,
+        has_prediction_start_date_field=True,
+        # Run-on-demand statistic over already-synced bars, no natural daily cadence of
+        # its own - manual by default, same reasoning as predict-market-state.
         default_run_type="manual",
     ),
 }
