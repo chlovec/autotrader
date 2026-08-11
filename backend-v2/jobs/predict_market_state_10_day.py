@@ -116,7 +116,10 @@ def compute_10_day_market_state_predictions(
             continue
 
         returns = [closes[i] / closes[i - 1] - 1 for i in range(1, len(closes))]
-        states, bucket_means = _bucket_states(returns)
+        # bucket_stds isn't used here - this job has no exit_price_confidence column of
+        # its own (see MarketPrediction10Day's docstring), unlike the single-day
+        # predict_market_state.py job.
+        states, bucket_means, _bucket_stds = _bucket_states(returns)
         counts = _fit_transition(states)
         current_state = states[-1]
 

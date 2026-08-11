@@ -57,7 +57,7 @@ def _independent_10_day_walk(closes: list[float]) -> dict:
     mirrors test_predict_market_state.py's
     test_stores_prediction_matching_independent_recomputation."""
     returns = [closes[i] / closes[i - 1] - 1 for i in range(1, len(closes))]
-    states, bucket_means = _bucket_states(returns)
+    states, bucket_means, _bucket_stds = _bucket_states(returns)
     counts = _fit_transition(states)
 
     expected: dict = {"current_state": STATE_LABELS[states[-1]]}

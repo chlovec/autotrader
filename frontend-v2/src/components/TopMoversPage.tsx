@@ -62,6 +62,7 @@ const COLUMNS: ReportColumn<TopMarketMoverRow>[] = [
   { key: 'abs_expected_return_pct', label: 'Abs Expected Return %' },
   { key: 'entry_price', label: 'Entry Price' },
   { key: 'exit_price', label: 'Exit Price' },
+  { key: 'exit_price_confidence', label: 'Exit Price Confidence' },
   { key: 'entry_time', label: 'Entry Time' },
   { key: 'exit_time', label: 'Exit Time' },
   { key: 'history_days', label: 'History Days' },

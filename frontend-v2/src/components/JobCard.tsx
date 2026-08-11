@@ -91,12 +91,19 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
   const [multiplier, setMultiplier] = useState(job.multiplier ?? 1)
   const [timespan, setTimespan] = useState(job.timespan ?? 'day')
   const [backfillDays, setBackfillDays] = useState(job.backfill_days ?? 730)
+  // Default 1 ("through yesterday") matches backend-v2 jobs/sync_bars.py's
+  // DEFAULT_END_DATE_OFFSET_DAYS.
+  const [barsEndDateOffsetDays, setBarsEndDateOffsetDays] = useState(job.bars_end_date_offset_days ?? 1)
   const [snapshotTypes, setSnapshotTypes] = useState<string[]>(() => parseCsv(job.snapshot_types))
   const [averageVolumeStartDate, setAverageVolumeStartDate] = useState(job.average_volume_start_date ?? '')
   const [averageVolumeDaysInterval, setAverageVolumeDaysInterval] = useState(job.average_volume_days_interval ?? 50)
   const [backtestStartDate, setBacktestStartDate] = useState(job.backtest_start_date ?? '')
   const [backtestEndDate, setBacktestEndDate] = useState(job.backtest_end_date ?? '')
   const [predictionStartDate, setPredictionStartDate] = useState(job.prediction_start_date ?? '')
+  // Default 1 ("tomorrow") matches backend-v2 jobs/predict_market_state.py's
+  // DEFAULT_PREDICTED_DATE_OFFSET_DAYS.
+  const [predictedDateOffsetDays, setPredictedDateOffsetDays] = useState(job.predicted_date_offset_days ?? 1)
+  const [mcmcNumSimulations, setMcmcNumSimulations] = useState(job.mcmc_num_simulations ?? 2000)
 
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
@@ -133,6 +140,7 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
               multiplier,
               timespan,
               backfill_days: backfillDays,
+              bars_end_date_offset_days: barsEndDateOffsetDays,
             }
           : {}),
         ...(job.has_snapshot_type_filter ? { snapshot_types: toCsv(snapshotTypes) } : {}),
@@ -149,6 +157,8 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
             }
           : {}),
         ...(job.has_prediction_start_date_field ? { prediction_start_date: predictionStartDate || null } : {}),
+        ...(job.has_predicted_date_offset_field ? { predicted_date_offset_days: predictedDateOffsetDays } : {}),
+        ...(job.has_monte_carlo_fields ? { mcmc_num_simulations: mcmcNumSimulations } : {}),
       })
       onSaved(updated)
     } catch (err) {
@@ -457,7 +467,9 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
                 !job.has_snapshot_type_filter &&
                 !job.has_average_volume_fields &&
                 !job.has_backtest_fields &&
-                !job.has_prediction_start_date_field && (
+                !job.has_prediction_start_date_field &&
+                !job.has_predicted_date_offset_field &&
+                !job.has_monte_carlo_fields && (
                   <p className="job-field-hint">This job has no run parameters to configure.</p>
                 )}
 
@@ -526,30 +538,45 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
               )}
 
               {job.has_bars_fields && (
-                <div className="job-field-row">
-                  <label className="job-field">
-                    Multiplier
-                    <input
-                      type="number"
-                      min={1}
-                      value={multiplier}
-                      onChange={(e) => setMultiplier(Number(e.target.value))}
-                    />
-                  </label>
-                  <label className="job-field">
-                    Timespan
-                    <input type="text" value={timespan} onChange={(e) => setTimespan(e.target.value)} />
-                  </label>
-                  <label className="job-field">
-                    Backfill days
-                    <input
-                      type="number"
-                      min={1}
-                      value={backfillDays}
-                      onChange={(e) => setBackfillDays(Number(e.target.value))}
-                    />
-                  </label>
-                </div>
+                <>
+                  <div className="job-field-row">
+                    <label className="job-field">
+                      Multiplier
+                      <input
+                        type="number"
+                        min={1}
+                        value={multiplier}
+                        onChange={(e) => setMultiplier(Number(e.target.value))}
+                      />
+                    </label>
+                    <label className="job-field">
+                      Timespan
+                      <input type="text" value={timespan} onChange={(e) => setTimespan(e.target.value)} />
+                    </label>
+                    <label className="job-field">
+                      Backfill days
+                      <input
+                        type="number"
+                        min={0}
+                        value={backfillDays}
+                        onChange={(e) => setBackfillDays(Number(e.target.value))}
+                      />
+                    </label>
+                    <label className="job-field">
+                      End date offset (days before today, UTC)
+                      <input
+                        type="number"
+                        min={0}
+                        step={1}
+                        value={barsEndDateOffsetDays}
+                        onChange={(e) => setBarsEndDateOffsetDays(Number(e.target.value))}
+                      />
+                    </label>
+                  </div>
+                  <p className="job-field-hint">
+                    Syncs through today minus this many days - e.g. 1 (the default) for yesterday, 0 for today.
+                  </p>
+                </>
               )}
 
               {job.has_average_volume_fields && (
@@ -615,6 +642,44 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
                     </label>
                   </div>
                   <p className="job-field-hint">Leave blank to default to tomorrow (UTC) at run time.</p>
+                </>
+              )}
+
+              {job.has_predicted_date_offset_field && (
+                <>
+                  <div className="job-field-row">
+                    <label className="job-field">
+                      Predicted date offset (days from today, UTC)
+                      <input
+                        type="number"
+                        step={1}
+                        value={predictedDateOffsetDays}
+                        onChange={(e) => setPredictedDateOffsetDays(Number(e.target.value))}
+                      />
+                    </label>
+                  </div>
+                  <p className="job-field-hint">
+                    Predicted date = today + this many days - e.g. 1 for tomorrow (the default), 0 for today, -1 for
+                    yesterday. Shared by both phases of this job: the Markov chain prediction runs first, then a
+                    Monte Carlo simulation over that same chain for the same predicted date.
+                  </p>
+                </>
+              )}
+
+              {job.has_monte_carlo_fields && (
+                <>
+                  <div className="job-field-row">
+                    <label className="job-field">
+                      Simulated paths
+                      <input
+                        type="number"
+                        min={1}
+                        value={mcmcNumSimulations}
+                        onChange={(e) => setMcmcNumSimulations(Number(e.target.value))}
+                      />
+                    </label>
+                  </div>
+                  <p className="job-field-hint">Simulated paths per ticker defaults to 2000.</p>
                 </>
               )}
             </div>

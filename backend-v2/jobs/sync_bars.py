@@ -45,6 +45,11 @@ logger = logging.getLogger("backend_v2.jobs.sync_bars")
 DEFAULT_MULTIPLIER = 1
 DEFAULT_TIMESPAN = "day"
 DEFAULT_BACKFILL_DAYS = int(os.environ.get("BARS_DEFAULT_BACKFILL_DAYS", "730"))
+# end_date's fallback offset from today (UTC) when JobConfig.bars_end_date_offset_days
+# is left unset - 1, i.e. "through yesterday", sync_bars_nightly's historical fixed
+# behavior before this became configurable (see jobs/registry.py's has_bars_fields
+# docstring).
+DEFAULT_END_DATE_OFFSET_DAYS = 1
 # Overridable via env since a lower worker count reduces the aggregate request rate
 # hitting massive.com's rate limiter (see data/client.py's MIN_REQUEST_INTERVAL_SECONDS
 # for the per-client-instance pacing knob, which this compounds with - N workers means
@@ -286,16 +291,18 @@ def sync_bars_nightly(
     multiplier: int = DEFAULT_MULTIPLIER,
     timespan: str = DEFAULT_TIMESPAN,
     backfill_days: int = DEFAULT_BACKFILL_DAYS,
+    end_date_offset_days: int = DEFAULT_END_DATE_OFFSET_DAYS,
     max_workers: int = DEFAULT_MAX_WORKERS,
     client_factory: Callable[[], DataClient] = DataClient,
     control: JobControl | None = None,
     run_id: int | None = None,
 ) -> dict[str, int]:
     """Syncs every selected ticker through the most recent trading day on or before
-    yesterday, skipping any already synced through that day, in parallel across a
-    thread pool of `max_workers` workers.
+    today minus end_date_offset_days (default: 1, i.e. yesterday - see
+    DEFAULT_END_DATE_OFFSET_DAYS), skipping any already synced through that day, in
+    parallel across a thread pool of `max_workers` workers.
 
-    end_date is yesterday rolled back to the preceding Friday if yesterday was a
+    end_date is that target day rolled back to the preceding Friday if it lands on a
     Saturday or Sunday (see _last_trading_day_on_or_before) - otherwise a Monday-morning
     run would treat Sunday as the target date, which massive.com never has a bar for,
     and every ticker (not just the ones actually behind) would get re-included forever
@@ -314,7 +321,9 @@ def sync_bars_nightly(
     ohlc_bars, not a per-ticker lookup, not worth a checkpoint of its own) before
     fanning out - see _fetch_and_store_one for where `control` is actually checked,
     once per ticker, right before its (slow) HTTP fetch."""
-    end_date = _last_trading_day_on_or_before(dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1))
+    end_date = _last_trading_day_on_or_before(
+        dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=end_date_offset_days)
+    )
     backfill_floor = end_date - dt.timedelta(days=backfill_days)
     selected = _resolve_tickers(session, ticker_types, tickers)
     last_bar_by_ticker = _last_bar_dates(session, multiplier, timespan)

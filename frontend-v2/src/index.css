@@ -1011,6 +1011,15 @@ body {
   width: 120px;
 }
 
+/* A bare .job-field defaults to flex: 1, which is fine when it's alone or paired with
+   other flex:1 fields but grows unbounded (pushing a fixed-width sibling like
+   .report-numeric-filter-field off to the far edge of the row) when paired with one
+   that isn't - see MarketPredictionsPage.tsx's "Consensus" checkbox field. */
+.report-checkbox-field {
+  flex: none;
+  width: 320px;
+}
+
 /* Numeric report filters (Trading Symbols' entry price/market cap) - a real backend
    WHERE, unlike ReportGrid's client-side numeric column filters. Same op-select +
    value-input pair shape as ColumnHeaderMenu's "Filter by condition" rows, just wider

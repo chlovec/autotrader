@@ -219,6 +219,34 @@ def test_sync_bars_nightly_skips_up_to_date_and_resumes_from_last_bar():
     assert requested_ranges["NEVER"] == ((end_date - dt.timedelta(days=730)).isoformat(), end_date.isoformat())
 
 
+def test_sync_bars_nightly_end_date_offset_days_is_configurable():
+    """end_date_offset_days=0 syncs through today (rolled back to the preceding trading
+    day if today is a weekend) instead of the default 1 (yesterday)."""
+    today = dt.datetime.now(dt.timezone.utc).date()
+    end_date = _last_trading_day_on_or_before(today)
+
+    session = SessionLocal()
+    session.add(Ticker(ticker="AAA"))
+    session.commit()
+
+    requested_ranges: dict[str, tuple[str, str]] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        parts = request.url.path.split("/")
+        ticker, start, end = parts[4], parts[-2], parts[-1]
+        requested_ranges[ticker] = (start, end)
+        return httpx.Response(200, json={"results": []})
+
+    try:
+        sync_bars_nightly(
+            session, backfill_days=5, end_date_offset_days=0, client_factory=lambda: _client_with_handler(handler)
+        )
+    finally:
+        session.close()
+
+    assert requested_ranges["AAA"] == ((end_date - dt.timedelta(days=5)).isoformat(), end_date.isoformat())
+
+
 def test_sync_bars_nightly_retries_a_ticker_that_gets_no_new_bars_back():
     """The bug this design replaces: a ticker massive.com returned nothing for used to
     get its cursor silently advanced anyway, so it was never retried again even though

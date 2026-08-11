@@ -20,7 +20,7 @@ from typing import Any, Literal
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import Float, case, cast, delete, func, or_, select, update
 from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.orm import Session
 
@@ -33,6 +33,7 @@ from db.models import (
     MarketPrediction,
     MarketPrediction10Day,
     MarketPredictionBacktest,
+    MarketPredictionMonteCarlo,
     News,
     OhlcBar,
     SyncProgress,
@@ -155,6 +156,8 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         "has_average_volume_fields": definition.has_average_volume_fields,
         "has_backtest_fields": definition.has_backtest_fields,
         "has_prediction_start_date_field": definition.has_prediction_start_date_field,
+        "has_predicted_date_offset_field": definition.has_predicted_date_offset_field,
+        "has_monte_carlo_fields": definition.has_monte_carlo_fields,
         "snapshot_type_options": SNAPSHOT_TYPE_OPTIONS,
         "run_type": config.run_type,
         "schedule_interval_unit": config.schedule_interval_unit,
@@ -166,6 +169,7 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         "multiplier": config.multiplier,
         "timespan": config.timespan,
         "backfill_days": config.backfill_days,
+        "bars_end_date_offset_days": config.bars_end_date_offset_days,
         "snapshot_types": config.snapshot_types,
         "average_volume_start_date": (
             config.average_volume_start_date.isoformat() if config.average_volume_start_date else None
@@ -176,6 +180,8 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         "prediction_start_date": (
             config.prediction_start_date.isoformat() if config.prediction_start_date else None
         ),
+        "predicted_date_offset_days": config.predicted_date_offset_days,
+        "mcmc_num_simulations": config.mcmc_num_simulations,
         "hidden": config.hidden,
         "running": config.run_requested_at is not None or run is not None,
         "paused": run.pause_requested if run is not None else False,
@@ -203,7 +209,10 @@ _RESET_TABLES: dict[str, list[type[Base]]] = {
     UNIFIED_SNAPSHOT_JOB: [UnifiedSnapshot],
     NEWS_JOB: [News],
     AVERAGE_VOLUME_JOB: [AverageVolume],
-    PREDICT_MARKET_STATE_JOB: [MarketPrediction],
+    # predict-market-state now runs both the Markov chain and Monte Carlo phases in
+    # one job (see jobs/registry.py's PREDICT_MARKET_STATE_JOB entry) - resetting it
+    # empties both tables together.
+    PREDICT_MARKET_STATE_JOB: [MarketPrediction, MarketPredictionMonteCarlo],
     PREDICT_10_DAY_MARKET_STATE_JOB: [MarketPrediction10Day],
     BACKTEST_MARKET_STATE_JOB: [MarketPredictionBacktest],
 }
@@ -227,12 +236,15 @@ class JobConfigIn(BaseModel):
     multiplier: int | None = None
     timespan: str | None = None
     backfill_days: int | None = None
+    bars_end_date_offset_days: int | None = None
     snapshot_types: str | None = None
     average_volume_start_date: str | None = None
     average_volume_days_interval: int | None = None
     backtest_start_date: str | None = None
     backtest_end_date: str | None = None
     prediction_start_date: str | None = None
+    predicted_date_offset_days: int | None = None
+    mcmc_num_simulations: int | None = None
 
 
 @app.get("/health")
@@ -293,6 +305,7 @@ def _prediction_fields(prediction: MarketPrediction | None) -> dict[str, Any]:
         "expected_return": prediction.expected_return if prediction else None,
         "entry_price": prediction.entry_price if prediction else None,
         "exit_price": prediction.exit_price if prediction else None,
+        "exit_price_confidence": prediction.exit_price_confidence if prediction else None,
         "entry_time": prediction.entry_time if prediction else None,
         "exit_time": prediction.exit_time if prediction else None,
         "history_days": prediction.history_days if prediction else None,
@@ -509,6 +522,20 @@ def _numeric_condition_clause(column: ColumnElement, op: str, value: float) -> C
     raise ValueError(f"unsupported numeric filter op: {op}")  # unreachable - op is validated before this is called
 
 
+def _validate_numeric_filter_pair(op: str, value: float | None, label: str) -> None:
+    """Raises 422 if exactly one of op/value is given (both halves of a numeric filter
+    are required together, same rule every such filter in this file follows) or if op
+    isn't one of NUMERIC_FILTER_OPS. Pulled out as a helper for market_predictions_report,
+    which has a dozen-odd numeric filters - inlining this 4-line check that many times
+    would drown the function in boilerplate the way trading_symbols_report's three
+    inlined copies don't yet."""
+    if op or value is not None:
+        if not op or value is None:
+            raise HTTPException(422, f"{label}_op and {label}_value must be provided together")
+        if op not in NUMERIC_FILTER_OPS:
+            raise HTTPException(422, f"{label}_op must be one of {', '.join(NUMERIC_FILTER_OPS)}")
+
+
 def _parse_order_by(order_by: str) -> list[tuple[str, str]]:
     """Parses the `order_by` query param, e.g. "todays_change_perc:desc,ticker:asc",
     into [("todays_change_perc", "desc"), ("ticker", "asc")] - the order of entries is
@@ -538,6 +565,9 @@ def trading_symbols_report(
     entry_price_value: float | None = None,
     market_cap_op: str = "",
     market_cap_value: float | None = None,
+    predicted_states: str = "",
+    state_confidence_op: str = "",
+    state_confidence_value: float | None = None,
 ) -> dict[str, Any]:
     """Backs the Analytics > Trading Symbols page's report grid: every synced tickers
     row, joined out to its asset_class, most recently computed average_volumes row, and
@@ -578,7 +608,22 @@ def trading_symbols_report(
     doesn't otherwise join TickerDetail in (market_cap is normally resolved separately
     below, page-scoped, purely for display), so this filter adds that join itself,
     scoped to this branch, the same "only pay for it when it's actually used" reasoning
-    entry_price's count_query join already uses."""
+    entry_price's count_query join already uses.
+
+    `predicted_states` (comma-separated, e.g. "up,strong_up" - see jobs/
+    predict_market_state.py's STATE_LABELS for the full set) filters on the same
+    market_predictions.predicted_state base_query already joins in for display/ordering -
+    unvalidated against STATE_LABELS the same way `ticker_types`/`tickers` aren't
+    validated against their own known values, so an unrecognized state just matches
+    nothing rather than 422ing.
+
+    `state_confidence_op`/`state_confidence_value` are the same numeric-filter shape as
+    entry_price's, filtering on market_predictions.state_confidence. Both this and
+    `predicted_states` reuse entry_price's count_query join (added once, guarded by
+    `needs_market_prediction_join` below) rather than each adding their own - joining
+    the same latest_predicted_date/MarketPrediction pair into count_query twice would be
+    redundant at best and (depending on the SQLAlchemy version) an ambiguous-join error
+    at worst."""
     types = split_csv(ticker_types)
     selected_tickers = split_csv(tickers)
     page = max(1, page)
@@ -596,6 +641,12 @@ def trading_symbols_report(
             raise HTTPException(422, "market_cap_op and market_cap_value must be provided together")
         if market_cap_op not in NUMERIC_FILTER_OPS:
             raise HTTPException(422, f"market_cap_op must be one of {', '.join(NUMERIC_FILTER_OPS)}")
+    if state_confidence_op or state_confidence_value is not None:
+        if not state_confidence_op or state_confidence_value is None:
+            raise HTTPException(422, "state_confidence_op and state_confidence_value must be provided together")
+        if state_confidence_op not in NUMERIC_FILTER_OPS:
+            raise HTTPException(422, f"state_confidence_op must be one of {', '.join(NUMERIC_FILTER_OPS)}")
+    states = split_csv(predicted_states)
     with SessionLocal() as session:
         count_query = select(func.count(Ticker.ticker))
         # current_snapshots and (the latest per ticker, same pattern as
@@ -625,21 +676,35 @@ def trading_symbols_report(
         if selected_tickers:
             base_query = base_query.where(Ticker.ticker.in_(selected_tickers))
             count_query = count_query.where(Ticker.ticker.in_(selected_tickers))
+        # count_query doesn't join market_predictions by default (nothing else it counts
+        # needs to) - only add the join once, shared by entry_price/predicted_states/
+        # state_confidence below, so the common no-filter case stays as cheap as it was
+        # before these filters existed, and the join isn't added twice (which - joining
+        # the same subquery/table pair in twice - is redundant at best and an
+        # ambiguous-join error at worst).
+        needs_market_prediction_join = bool(entry_price_op or states or state_confidence_op)
+        if needs_market_prediction_join:
+            count_query = count_query.outerjoin(
+                latest_predicted_date, latest_predicted_date.c.ticker == Ticker.ticker
+            ).outerjoin(
+                MarketPrediction,
+                (MarketPrediction.ticker == latest_predicted_date.c.ticker)
+                & (MarketPrediction.predicted_date == latest_predicted_date.c.predicted_date),
+            )
         if entry_price_op:
             condition = _numeric_condition_clause(MarketPrediction.entry_price, entry_price_op, entry_price_value)
             base_query = base_query.where(condition)
-            # count_query doesn't join market_predictions by default (nothing else it
-            # counts needs to) - only add the join here, scoped to this branch, so the
-            # common no-filter case stays as cheap as it was before this filter existed.
-            count_query = (
-                count_query.outerjoin(latest_predicted_date, latest_predicted_date.c.ticker == Ticker.ticker)
-                .outerjoin(
-                    MarketPrediction,
-                    (MarketPrediction.ticker == latest_predicted_date.c.ticker)
-                    & (MarketPrediction.predicted_date == latest_predicted_date.c.predicted_date),
-                )
-                .where(condition)
+            count_query = count_query.where(condition)
+        if states:
+            condition = MarketPrediction.predicted_state.in_(states)
+            base_query = base_query.where(condition)
+            count_query = count_query.where(condition)
+        if state_confidence_op:
+            condition = _numeric_condition_clause(
+                MarketPrediction.state_confidence, state_confidence_op, state_confidence_value
             )
+            base_query = base_query.where(condition)
+            count_query = count_query.where(condition)
         if market_cap_op:
             condition = _numeric_condition_clause(TickerDetail.market_cap, market_cap_op, market_cap_value)
             # Neither query joins ticker_details by default (market_cap is normally
@@ -1142,6 +1207,518 @@ def next_10_day_predictions_report(
         return {"rows": rows, "total": total, "page": page, "page_size": page_size}
 
 
+MARKET_PREDICTIONS_MAX_PAGE_SIZE = 1000
+MARKET_PREDICTIONS_DEFAULT_PAGE_SIZE = 500
+
+# Backtest hit-rate per ticker (jobs/backtest_market_state.py's walk-forward
+# evaluation of predict-market-state), aggregated once as a reusable subquery rather
+# than built per-request - a static aggregate over market_prediction_backtests with no
+# dependency on any request parameter, so it's safe to build at import time and join
+# into market_predictions_report's queries by reference wherever validation_score is
+# needed (SELECT/WHERE/ORDER BY). predicted_correct is a Boolean column (stored as
+# 0/1 in sqlite), so func.avg over it directly yields a 0-1 hit-rate fraction with no
+# case() needed. NULL for a ticker with zero backtest rows - deliberately left
+# ungrouped-away so validation_score can be empty (see MarketPredictionsPage.tsx) for
+# any ticker the backtest job has never covered, rather than defaulting to 0 and
+# unfairly reading as "predicted wrong every time."
+_BACKTEST_STATS_SUBQ = (
+    select(
+        MarketPredictionBacktest.ticker.label("ticker"),
+        func.avg(MarketPredictionBacktest.predicted_correct).label("validation_score"),
+    )
+    .group_by(MarketPredictionBacktest.ticker)
+    .subquery("backtest_stats")
+)
+
+# Blended risk-adjusted attractiveness score: expected_return * exit_price_confidence
+# (a return scaled down by how tight/confident the prediction is) averaged across
+# whichever of markov/mcmc a ticker actually has a prediction for on the requested
+# date, rather than always dividing by 2 - a ticker with only one side present
+# shouldn't be penalized against one with both just for missing a job run.
+# market_predictions_report's inclusion_condition guarantees at least one side is
+# present for any row this is evaluated against, so the divisor is never 0 in
+# practice; func.nullif still guards it defensively rather than relying on that.
+# _market_prediction_row_to_dict's _survivor_score is the Python-side mirror of this
+# same formula, used for display once markov/mcmc rows are already fetched.
+_MARKOV_SURVIVOR_COMPONENT = MarketPrediction.expected_return * MarketPrediction.exit_price_confidence
+_MCMC_SURVIVOR_COMPONENT = MarketPredictionMonteCarlo.expected_return * MarketPredictionMonteCarlo.exit_price_confidence
+_SURVIVOR_SIDE_COUNT = case((MarketPrediction.ticker.isnot(None), 1), else_=0) + case(
+    (MarketPredictionMonteCarlo.ticker.isnot(None), 1), else_=0
+)
+SURVIVOR_SCORE_EXPR = (
+    func.coalesce(_MARKOV_SURVIVOR_COMPONENT, 0.0) + func.coalesce(_MCMC_SURVIVOR_COMPONENT, 0.0)
+) / func.nullif(cast(_SURVIVOR_SIDE_COUNT, Float), 0)
+
+# MCMC's 10th-percentile simulated exit price, expressed as a return percentage off
+# entry_price rather than a raw price - a downside/VaR-style check ("even a
+# bad-percentile simulated outcome is still profitable") distinct from
+# exit_price_confidence (which scores distribution tightness, not direction). Markov
+# has no percentile bands of its own (see MarketPrediction vs MarketPredictionMonteCarlo's
+# docstrings in db/models.py), so this filter only exists for the MCMC side.
+MCMC_P10_RETURN_PCT_EXPR = (MarketPredictionMonteCarlo.exit_price_p10 / MarketPredictionMonteCarlo.entry_price - 1) * 100.0
+
+# order_by field keys accepted by market_predictions_report, mapped to the column they
+# sort on - both prediction tables are unconditionally left-joined into base_query
+# below (this report's whole point is showing both side by side), so unlike
+# trading_symbols_report's optional entry_price_op join, no extra count_query join is
+# needed to make these orderable. average_volume/market_cap/validation_score are also
+# unconditionally joined below (see market_predictions_report's docstring for why they
+# stopped being page-scoped-only lookups), so they're orderable/filterable the same way.
+MARKET_PREDICTIONS_ORDERABLE_FIELDS: dict[str, ColumnElement] = {
+    "ticker": Ticker.ticker,
+    "name": Ticker.name,
+    "average_volume": AverageVolume.average_volume,
+    "market_cap": TickerDetail.market_cap,
+    "markov_state_confidence": MarketPrediction.state_confidence,
+    "markov_expected_return": MarketPrediction.expected_return,
+    "markov_exit_price_confidence": MarketPrediction.exit_price_confidence,
+    "markov_history_days": MarketPrediction.history_days,
+    "mcmc_state_confidence": MarketPredictionMonteCarlo.state_confidence,
+    "mcmc_expected_return": MarketPredictionMonteCarlo.expected_return,
+    "mcmc_exit_price_confidence": MarketPredictionMonteCarlo.exit_price_confidence,
+    "mcmc_history_days": MarketPredictionMonteCarlo.history_days,
+    "validation_score": _BACKTEST_STATS_SUBQ.c.validation_score,
+    "survivor_score": SURVIVOR_SCORE_EXPR,
+}
+
+
+def _parse_market_predictions_order_by(order_by: str) -> list[tuple[str, str]]:
+    """Same shape as _parse_order_by/_parse_next_10_day_order_by, against
+    MARKET_PREDICTIONS_ORDERABLE_FIELDS instead."""
+    fields: list[tuple[str, str]] = []
+    for entry in split_csv(order_by) or []:
+        field, _, direction = entry.partition(":")
+        direction = direction.lower() or "asc"
+        if field not in MARKET_PREDICTIONS_ORDERABLE_FIELDS:
+            raise HTTPException(422, f"Unknown order_by field: {field}")
+        if direction not in ("asc", "desc"):
+            raise HTTPException(422, f"Unknown order_by direction: {direction}")
+        fields.append((field, direction))
+    return fields
+
+
+def _markov_prediction_fields(prediction: MarketPrediction | None) -> dict[str, Any]:
+    """markov_-prefixed fields from jobs/predict_market_state.py's MarketPrediction -
+    prefixed (rather than reusing _prediction_fields' unprefixed keys) since
+    market_predictions_report shows the predict-market-state job's two phases - the
+    Markov chain prediction and the Monte Carlo simulation that runs immediately after
+    it - side by side, and the two tables share column names. predicted_date isn't
+    included here - unlike every other
+    consumer of MarketPrediction, this report already knows it (the caller-supplied
+    predicted_date every row is pinned to), so it's a single top-level field instead
+    (see market_predictions_report)."""
+    return {
+        "markov_current_state": prediction.current_state if prediction else None,
+        "markov_predicted_state": prediction.predicted_state if prediction else None,
+        "markov_state_confidence": prediction.state_confidence if prediction else None,
+        "markov_expected_return": prediction.expected_return if prediction else None,
+        "markov_entry_price": prediction.entry_price if prediction else None,
+        "markov_exit_price": prediction.exit_price if prediction else None,
+        "markov_exit_price_confidence": prediction.exit_price_confidence if prediction else None,
+        "markov_entry_time": prediction.entry_time if prediction else None,
+        "markov_exit_time": prediction.exit_time if prediction else None,
+        "markov_history_days": prediction.history_days if prediction else None,
+        "markov_computed_at": prediction.computed_at.isoformat() if prediction else None,
+    }
+
+
+def _mcmc_prediction_fields(prediction: MarketPredictionMonteCarlo | None) -> dict[str, Any]:
+    """Same shape/reasoning as _markov_prediction_fields above, mcmc_-prefixed, over
+    jobs/predict_market_state_mcmc.py's MarketPredictionMonteCarlo."""
+    return {
+        "mcmc_current_state": prediction.current_state if prediction else None,
+        "mcmc_predicted_state": prediction.predicted_state if prediction else None,
+        "mcmc_state_confidence": prediction.state_confidence if prediction else None,
+        "mcmc_expected_return": prediction.expected_return if prediction else None,
+        "mcmc_entry_price": prediction.entry_price if prediction else None,
+        "mcmc_exit_price": prediction.exit_price if prediction else None,
+        "mcmc_exit_price_mean": prediction.exit_price_mean if prediction else None,
+        "mcmc_exit_price_std": prediction.exit_price_std if prediction else None,
+        "mcmc_exit_price_confidence": prediction.exit_price_confidence if prediction else None,
+        "mcmc_exit_price_p10": prediction.exit_price_p10 if prediction else None,
+        "mcmc_exit_price_p50": prediction.exit_price_p50 if prediction else None,
+        "mcmc_exit_price_p90": prediction.exit_price_p90 if prediction else None,
+        "mcmc_entry_time": prediction.entry_time if prediction else None,
+        "mcmc_exit_time": prediction.exit_time if prediction else None,
+        "mcmc_num_simulations": prediction.num_simulations if prediction else None,
+        "mcmc_history_days": prediction.history_days if prediction else None,
+        "mcmc_computed_at": prediction.computed_at.isoformat() if prediction else None,
+    }
+
+
+def _survivor_score(markov: MarketPrediction | None, mcmc: MarketPredictionMonteCarlo | None) -> float | None:
+    """Python-side mirror of the module-level SURVIVOR_SCORE_EXPR SQL expression -
+    expected_return * exit_price_confidence averaged across whichever of markov/mcmc
+    is present, rather than always /2. Recomputed here (not read back from the SQL
+    query) since this runs per already-fetched row purely for display; kept
+    formula-identical to SURVIVOR_SCORE_EXPR on purpose so a row's displayed
+    survivor_score always matches what the survivor_score_op/value filter and
+    order_by=survivor_score actually sorted/filtered on.
+
+    Checks expected_return/exit_price_confidence for None despite both being typed
+    Mapped[float] (NOT NULL) in db/models.py - some rows predate that constraint and
+    genuinely carry a NULL in one of these columns, which SURVIVOR_SCORE_EXPR's SQL
+    already tolerates via func.coalesce but a bare Python `*` doesn't."""
+    components = []
+    if markov is not None and markov.expected_return is not None and markov.exit_price_confidence is not None:
+        components.append(markov.expected_return * markov.exit_price_confidence)
+    if mcmc is not None and mcmc.expected_return is not None and mcmc.exit_price_confidence is not None:
+        components.append(mcmc.expected_return * mcmc.exit_price_confidence)
+    return sum(components) / len(components) if components else None
+
+
+def _market_prediction_row_to_dict(
+    predicted_date: dt.date,
+    ticker: Ticker,
+    average_volume: float | None,
+    market_cap: float | None,
+    validation_score: float | None,
+    markov: MarketPrediction | None,
+    mcmc: MarketPredictionMonteCarlo | None,
+) -> dict[str, Any]:
+    markov_fields = _markov_prediction_fields(markov)
+    mcmc_fields = _mcmc_prediction_fields(mcmc)
+    return {
+        "ticker": ticker.ticker,
+        "name": ticker.name,
+        "average_volume": average_volume,
+        "market_cap": market_cap,
+        # Backtest hit-rate (validation_score, empty/None when the ticker has no
+        # market_prediction_backtests rows) and the blended expected_return x
+        # exit_price_confidence blend (survivor_score, see _survivor_score) - both
+        # ticker-level scoring fields like average_volume/market_cap above, not paired
+        # markov_x/mcmc_x columns, so they sit alongside those rather than interleaved
+        # into the markov/mcmc block below.
+        "validation_score": validation_score,
+        "survivor_score": _survivor_score(markov, mcmc),
+        # Not markov's/mcmc's own predicted_date (there's only one column - see
+        # _markov_prediction_fields) - always the requested date, since every row is
+        # pinned to it regardless of which side(s) actually matched.
+        "predicted_date": predicted_date.isoformat(),
+        # Interleaved markov_x/mcmc_x pairs (not two grouped blocks) so the JSON key
+        # order matches the report grid's column order (see MarketPredictionsPage.tsx's
+        # COLUMNS) - mcmc_exit_price_mean/std/p10/p50/p90 and mcmc_num_simulations have
+        # no markov_ counterpart to pair with, so they're interleaved right after the
+        # shared field they elaborate on instead (exit_price_confidence, history_days).
+        "markov_current_state": markov_fields["markov_current_state"],
+        "mcmc_current_state": mcmc_fields["mcmc_current_state"],
+        "markov_predicted_state": markov_fields["markov_predicted_state"],
+        "mcmc_predicted_state": mcmc_fields["mcmc_predicted_state"],
+        "markov_state_confidence": markov_fields["markov_state_confidence"],
+        "mcmc_state_confidence": mcmc_fields["mcmc_state_confidence"],
+        "markov_expected_return": markov_fields["markov_expected_return"],
+        "mcmc_expected_return": mcmc_fields["mcmc_expected_return"],
+        "markov_entry_price": markov_fields["markov_entry_price"],
+        "mcmc_entry_price": mcmc_fields["mcmc_entry_price"],
+        "markov_exit_price": markov_fields["markov_exit_price"],
+        "mcmc_exit_price": mcmc_fields["mcmc_exit_price"],
+        "markov_exit_price_confidence": markov_fields["markov_exit_price_confidence"],
+        "mcmc_exit_price_confidence": mcmc_fields["mcmc_exit_price_confidence"],
+        "mcmc_exit_price_mean": mcmc_fields["mcmc_exit_price_mean"],
+        "mcmc_exit_price_std": mcmc_fields["mcmc_exit_price_std"],
+        "mcmc_exit_price_p10": mcmc_fields["mcmc_exit_price_p10"],
+        "mcmc_exit_price_p50": mcmc_fields["mcmc_exit_price_p50"],
+        "mcmc_exit_price_p90": mcmc_fields["mcmc_exit_price_p90"],
+        "markov_entry_time": markov_fields["markov_entry_time"],
+        "mcmc_entry_time": mcmc_fields["mcmc_entry_time"],
+        "markov_exit_time": markov_fields["markov_exit_time"],
+        "mcmc_exit_time": mcmc_fields["mcmc_exit_time"],
+        "mcmc_num_simulations": mcmc_fields["mcmc_num_simulations"],
+        "markov_history_days": markov_fields["markov_history_days"],
+        "mcmc_history_days": mcmc_fields["mcmc_history_days"],
+        "markov_computed_at": markov_fields["markov_computed_at"],
+        "mcmc_computed_at": mcmc_fields["mcmc_computed_at"],
+    }
+
+
+@app.get("/reports/market-predictions")
+def market_predictions_report(
+    predicted_date: str,
+    ticker_types: str = "",
+    tickers: str = "",
+    markov_exit_price_confidence_op: str = "",
+    markov_exit_price_confidence_value: float | None = None,
+    mcmc_exit_price_confidence_op: str = "",
+    mcmc_exit_price_confidence_value: float | None = None,
+    average_volume_op: str = "",
+    average_volume_value: float | None = None,
+    market_cap_op: str = "",
+    market_cap_value: float | None = None,
+    markov_history_days_op: str = "",
+    markov_history_days_value: float | None = None,
+    mcmc_history_days_op: str = "",
+    mcmc_history_days_value: float | None = None,
+    markov_state_confidence_op: str = "",
+    markov_state_confidence_value: float | None = None,
+    mcmc_state_confidence_op: str = "",
+    mcmc_state_confidence_value: float | None = None,
+    markov_expected_return_op: str = "",
+    markov_expected_return_value: float | None = None,
+    mcmc_expected_return_op: str = "",
+    mcmc_expected_return_value: float | None = None,
+    markov_predicted_states: str = "",
+    mcmc_predicted_states: str = "",
+    require_consensus: bool = False,
+    mcmc_p10_return_pct_op: str = "",
+    mcmc_p10_return_pct_value: float | None = None,
+    validation_score_op: str = "",
+    validation_score_value: float | None = None,
+    survivor_score_op: str = "",
+    survivor_score_value: float | None = None,
+    page: int = 1,
+    page_size: int = MARKET_PREDICTIONS_DEFAULT_PAGE_SIZE,
+    order_by: str = "",
+) -> dict[str, Any]:
+    """Backs the Analytics > Market Predictions page's report grid.
+
+    `predicted_date` (ISO date, e.g. "2026-08-11") is required, unlike every other
+    report in this file - every row this endpoint returns is for exactly this one
+    date. The caller picks the date up front and the report shows whichever of the two
+    jobs' predictions exist for it, so `predicted_date` in the response is a single,
+    always-populated column (just the requested value echoed back, never null) rather
+    than separate markov_predicted_date/mcmc_predicted_date columns that could each be
+    null or disagree.
+
+    One query, driven from Ticker: MarketPrediction and MarketPredictionMonteCarlo are
+    both LEFT JOINed in, each pinned to predicted_date *in the join's ON clause*
+    (`base_query`/`count_query` below) rather than filtered via WHERE - the ON clause
+    is what lets a ticker whose Markov row doesn't exist for this date still show its
+    Monte Carlo row (and vice versa) instead of the join silently degrading into an
+    inner join, which is what would happen if that condition were a WHERE instead.
+    AverageVolume (latest-per-ticker, joined the same "max computed_at" way
+    trading_symbols_report resolves it), TickerDetail, and _BACKTEST_STATS_SUBQ
+    (validation_score) are also unconditionally left-joined now - unlike this report's
+    earlier version, average_volume/market_cap/validation_score are no longer
+    page-scoped display-only lookups, so they can be filtered/ordered on before
+    pagination the same way the markov_/mcmc_ columns already were.
+
+    A ticker then only needs to *appear* if at least one side matched:
+    `inclusion_condition` below is
+    `(MarketPrediction.ticker IS NOT NULL AND <all active markov-side filters>)
+     OR (MarketPredictionMonteCarlo.ticker IS NOT NULL AND <all active mcmc-side filters>)`.
+    Because each side's filters live inside this OR (each only gates its own side),
+    every markov_*/mcmc_* filter pair below (exit_price_confidence, history_days,
+    state_confidence, expected_return, predicted_states, plus mcmc's own
+    p10_return_pct) combines as OR across the two prediction sources, not AND: a row
+    included via its Markov prediction still shows its Monte Carlo columns even if
+    that MCMC row wouldn't itself have passed the mcmc-side filters (the join already
+    pulled those columns in, unconditionally), and vice versa - same semantics the
+    original two exit_price_confidence filters already had.
+
+    `average_volume_op`/`market_cap_op`/`validation_score_op`/`survivor_score_op` (each
+    paired with `..._value`) and `require_consensus` are different: they're global
+    AND conditions applied on top of inclusion_condition, not gated to one side, since
+    liquidity/backtest-accuracy/blended-score/agreement aren't markov- or mcmc-specific
+    concepts. `require_consensus=true` adds
+    `MarketPrediction.ticker IS NOT NULL AND MarketPredictionMonteCarlo.ticker IS NOT NULL
+     AND MarketPrediction.predicted_state = MarketPredictionMonteCarlo.predicted_state`
+    - both sides must be present *and* agree on the predicted state. Combined with a
+    one-sided `markov_predicted_states`/`mcmc_predicted_states` filter (e.g.
+    markov_predicted_states=up,strong_up), this also pins the *other* side to the same
+    state set transitively, without needing to duplicate the filter on both sides.
+
+    `validation_score_op`/`validation_score_value` filter on _BACKTEST_STATS_SUBQ's
+    per-ticker backtest hit rate (jobs/backtest_market_state.py's walk-forward
+    predicted_correct, averaged) - NULL for a ticker with no backtest rows, which never
+    matches any numeric comparison (same null-exclusion semantics every filter here
+    has), so leaving this filter unset is required to see tickers the backtest job
+    hasn't covered.
+
+    `survivor_score_op`/`survivor_score_value` filter on SURVIVOR_SCORE_EXPR, the
+    blended expected_return x exit_price_confidence score averaged across whichever of
+    markov/mcmc is present (see that expression's own comment).
+
+    `mcmc_p10_return_pct_op`/`mcmc_p10_return_pct_value` filter on
+    MCMC_P10_RETURN_PCT_EXPR - MCMC's simulated 10th-percentile exit price as a %
+    return off entry_price, e.g. `>= 0` to require even a bad-percentile simulated
+    outcome to still be profitable. Gated inside mcmc_condition (mcmc-only, no Markov
+    equivalent - see that expression's own comment).
+
+    Otherwise ordered/paginated/filtered the same way trading_symbols_report is - see
+    that function's docstring for the shared `page`/`page_size`/`order_by`/
+    `ticker_types`/`tickers` reasoning. `order_by` picks among
+    MARKET_PREDICTIONS_ORDERABLE_FIELDS, defaulting to ticker ascending, always
+    appended as a tiebreaker (same reasoning as trading_symbols_report)."""
+    try:
+        parsed_predicted_date = dt.date.fromisoformat(predicted_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="predicted_date must be an ISO date, e.g. '2026-08-11'") from exc
+
+    types = split_csv(ticker_types)
+    selected_tickers = split_csv(tickers)
+    markov_states = split_csv(markov_predicted_states)
+    mcmc_states = split_csv(mcmc_predicted_states)
+    page = max(1, page)
+    page_size = max(1, min(page_size, MARKET_PREDICTIONS_MAX_PAGE_SIZE))
+    order_fields = _parse_market_predictions_order_by(order_by) or [("ticker", "asc")]
+    if "ticker" not in {field for field, _ in order_fields}:
+        order_fields = [*order_fields, ("ticker", "asc")]
+
+    for op, value, label in [
+        (markov_exit_price_confidence_op, markov_exit_price_confidence_value, "markov_exit_price_confidence"),
+        (mcmc_exit_price_confidence_op, mcmc_exit_price_confidence_value, "mcmc_exit_price_confidence"),
+        (average_volume_op, average_volume_value, "average_volume"),
+        (market_cap_op, market_cap_value, "market_cap"),
+        (markov_history_days_op, markov_history_days_value, "markov_history_days"),
+        (mcmc_history_days_op, mcmc_history_days_value, "mcmc_history_days"),
+        (markov_state_confidence_op, markov_state_confidence_value, "markov_state_confidence"),
+        (mcmc_state_confidence_op, mcmc_state_confidence_value, "mcmc_state_confidence"),
+        (markov_expected_return_op, markov_expected_return_value, "markov_expected_return"),
+        (mcmc_expected_return_op, mcmc_expected_return_value, "mcmc_expected_return"),
+        (mcmc_p10_return_pct_op, mcmc_p10_return_pct_value, "mcmc_p10_return_pct"),
+        (validation_score_op, validation_score_value, "validation_score"),
+        (survivor_score_op, survivor_score_value, "survivor_score"),
+    ]:
+        _validate_numeric_filter_pair(op, value, label)
+
+    with SessionLocal() as session:
+        # Pinned in the ON clause (not a WHERE) so a ticker missing one side's row for
+        # this date still keeps the other side's - see this function's docstring.
+        markov_join = (MarketPrediction.ticker == Ticker.ticker) & (MarketPrediction.predicted_date == parsed_predicted_date)
+        mcmc_join = (MarketPredictionMonteCarlo.ticker == Ticker.ticker) & (
+            MarketPredictionMonteCarlo.predicted_date == parsed_predicted_date
+        )
+
+        markov_condition = MarketPrediction.ticker.isnot(None)
+        if markov_exit_price_confidence_op:
+            markov_condition = markov_condition & _numeric_condition_clause(
+                MarketPrediction.exit_price_confidence, markov_exit_price_confidence_op, markov_exit_price_confidence_value
+            )
+        if markov_history_days_op:
+            markov_condition = markov_condition & _numeric_condition_clause(
+                MarketPrediction.history_days, markov_history_days_op, markov_history_days_value
+            )
+        if markov_state_confidence_op:
+            markov_condition = markov_condition & _numeric_condition_clause(
+                MarketPrediction.state_confidence, markov_state_confidence_op, markov_state_confidence_value
+            )
+        if markov_expected_return_op:
+            markov_condition = markov_condition & _numeric_condition_clause(
+                MarketPrediction.expected_return, markov_expected_return_op, markov_expected_return_value
+            )
+        if markov_states:
+            markov_condition = markov_condition & MarketPrediction.predicted_state.in_(markov_states)
+
+        mcmc_condition = MarketPredictionMonteCarlo.ticker.isnot(None)
+        if mcmc_exit_price_confidence_op:
+            mcmc_condition = mcmc_condition & _numeric_condition_clause(
+                MarketPredictionMonteCarlo.exit_price_confidence, mcmc_exit_price_confidence_op, mcmc_exit_price_confidence_value
+            )
+        if mcmc_history_days_op:
+            mcmc_condition = mcmc_condition & _numeric_condition_clause(
+                MarketPredictionMonteCarlo.history_days, mcmc_history_days_op, mcmc_history_days_value
+            )
+        if mcmc_state_confidence_op:
+            mcmc_condition = mcmc_condition & _numeric_condition_clause(
+                MarketPredictionMonteCarlo.state_confidence, mcmc_state_confidence_op, mcmc_state_confidence_value
+            )
+        if mcmc_expected_return_op:
+            mcmc_condition = mcmc_condition & _numeric_condition_clause(
+                MarketPredictionMonteCarlo.expected_return, mcmc_expected_return_op, mcmc_expected_return_value
+            )
+        if mcmc_states:
+            mcmc_condition = mcmc_condition & MarketPredictionMonteCarlo.predicted_state.in_(mcmc_states)
+        if mcmc_p10_return_pct_op:
+            mcmc_condition = mcmc_condition & _numeric_condition_clause(
+                MCMC_P10_RETURN_PCT_EXPR, mcmc_p10_return_pct_op, mcmc_p10_return_pct_value
+            )
+        inclusion_condition = markov_condition | mcmc_condition
+
+        # Latest AverageVolume row per ticker - same "max computed_at" subquery+join
+        # pattern trading_symbols_report/this report's own predecessor used page-scoped,
+        # now built unconditionally (not scoped to a known page of tickers, since
+        # filtering/ordering on it has to happen before pagination picks a page).
+        latest_avg_vol_dates = (
+            select(AverageVolume.ticker, func.max(AverageVolume.computed_at).label("computed_at"))
+            .group_by(AverageVolume.ticker)
+            .subquery()
+        )
+        avg_vol_join = (AverageVolume.ticker == latest_avg_vol_dates.c.ticker) & (
+            AverageVolume.computed_at == latest_avg_vol_dates.c.computed_at
+        )
+
+        count_query = (
+            select(func.count(Ticker.ticker))
+            .outerjoin(MarketPrediction, markov_join)
+            .outerjoin(MarketPredictionMonteCarlo, mcmc_join)
+            .outerjoin(latest_avg_vol_dates, latest_avg_vol_dates.c.ticker == Ticker.ticker)
+            .outerjoin(AverageVolume, avg_vol_join)
+            .outerjoin(TickerDetail, TickerDetail.ticker == Ticker.ticker)
+            .outerjoin(_BACKTEST_STATS_SUBQ, _BACKTEST_STATS_SUBQ.c.ticker == Ticker.ticker)
+            .where(inclusion_condition)
+        )
+        base_query = (
+            select(Ticker, MarketPrediction, MarketPredictionMonteCarlo, AverageVolume, TickerDetail, _BACKTEST_STATS_SUBQ.c.validation_score)
+            .outerjoin(MarketPrediction, markov_join)
+            .outerjoin(MarketPredictionMonteCarlo, mcmc_join)
+            .outerjoin(latest_avg_vol_dates, latest_avg_vol_dates.c.ticker == Ticker.ticker)
+            .outerjoin(AverageVolume, avg_vol_join)
+            .outerjoin(TickerDetail, TickerDetail.ticker == Ticker.ticker)
+            .outerjoin(_BACKTEST_STATS_SUBQ, _BACKTEST_STATS_SUBQ.c.ticker == Ticker.ticker)
+            .where(inclusion_condition)
+        )
+        if types:
+            base_query = base_query.where(Ticker.type.in_(types))
+            count_query = count_query.where(Ticker.type.in_(types))
+        if selected_tickers:
+            base_query = base_query.where(Ticker.ticker.in_(selected_tickers))
+            count_query = count_query.where(Ticker.ticker.in_(selected_tickers))
+        if average_volume_op:
+            condition = _numeric_condition_clause(AverageVolume.average_volume, average_volume_op, average_volume_value)
+            base_query = base_query.where(condition)
+            count_query = count_query.where(condition)
+        if market_cap_op:
+            condition = _numeric_condition_clause(TickerDetail.market_cap, market_cap_op, market_cap_value)
+            base_query = base_query.where(condition)
+            count_query = count_query.where(condition)
+        if validation_score_op:
+            condition = _numeric_condition_clause(
+                _BACKTEST_STATS_SUBQ.c.validation_score, validation_score_op, validation_score_value
+            )
+            base_query = base_query.where(condition)
+            count_query = count_query.where(condition)
+        if survivor_score_op:
+            condition = _numeric_condition_clause(SURVIVOR_SCORE_EXPR, survivor_score_op, survivor_score_value)
+            base_query = base_query.where(condition)
+            count_query = count_query.where(condition)
+        if require_consensus:
+            condition = (
+                MarketPrediction.ticker.isnot(None)
+                & MarketPredictionMonteCarlo.ticker.isnot(None)
+                & (MarketPrediction.predicted_state == MarketPredictionMonteCarlo.predicted_state)
+            )
+            base_query = base_query.where(condition)
+            count_query = count_query.where(condition)
+        total = session.execute(count_query).scalar_one()
+
+        order_clauses = []
+        for field, direction in order_fields:
+            column = MARKET_PREDICTIONS_ORDERABLE_FIELDS[field]
+            order_clauses.append((column.desc() if direction == "desc" else column.asc()).nulls_last())
+        query = base_query.order_by(*order_clauses).limit(page_size).offset((page - 1) * page_size)
+        page_rows = session.execute(query).all()
+        page_tickers = [row[0] for row in page_rows]
+        markov_by_ticker = {row[0].ticker: row[1] for row in page_rows}
+        mcmc_by_ticker = {row[0].ticker: row[2] for row in page_rows}
+        average_volume_by_ticker = {row[0].ticker: row[3].average_volume if row[3] is not None else None for row in page_rows}
+        market_cap_by_ticker = {row[0].ticker: row[4].market_cap if row[4] is not None else None for row in page_rows}
+        validation_score_by_ticker = {row[0].ticker: row[5] for row in page_rows}
+
+        rows = [
+            _market_prediction_row_to_dict(
+                parsed_predicted_date,
+                ticker,
+                average_volume_by_ticker.get(ticker.ticker),
+                market_cap_by_ticker.get(ticker.ticker),
+                validation_score_by_ticker.get(ticker.ticker),
+                markov_by_ticker.get(ticker.ticker),
+                mcmc_by_ticker.get(ticker.ticker),
+            )
+            for ticker in page_tickers
+        ]
+        return {"rows": rows, "total": total, "page": page, "page_size": page_size}
+
+
 @app.get("/jobs")
 def list_jobs() -> list[dict]:
     with SessionLocal() as session:
@@ -1168,6 +1745,8 @@ def update_job_config(job_name: str, body: JobConfigIn) -> dict:
         invalid := set(split_csv(body.snapshot_types) or []) - set(SNAPSHOT_TYPE_OPTIONS)
     ):
         raise HTTPException(status_code=400, detail=f"invalid snapshot_types: {', '.join(sorted(invalid))}")
+    if body.bars_end_date_offset_days is not None and body.bars_end_date_offset_days < 0:
+        raise HTTPException(status_code=400, detail="bars_end_date_offset_days must be at least 0")
     if body.average_volume_days_interval is not None and body.average_volume_days_interval < 1:
         raise HTTPException(status_code=400, detail="average_volume_days_interval must be at least 1")
     average_volume_start_date: dt.date | None = None
@@ -1204,6 +1783,8 @@ def update_job_config(job_name: str, body: JobConfigIn) -> dict:
             raise HTTPException(
                 status_code=400, detail="prediction_start_date must be an ISO date, e.g. '2026-08-06'"
             ) from exc
+    if body.mcmc_num_simulations is not None and body.mcmc_num_simulations < 1:
+        raise HTTPException(status_code=400, detail="mcmc_num_simulations must be at least 1")
 
     with SessionLocal() as session:
         definition = JOB_DEFINITIONS[job_name]
@@ -1226,6 +1807,7 @@ def update_job_config(job_name: str, body: JobConfigIn) -> dict:
             config.multiplier = body.multiplier
             config.timespan = body.timespan
             config.backfill_days = body.backfill_days
+            config.bars_end_date_offset_days = body.bars_end_date_offset_days
         config.snapshot_types = body.snapshot_types if definition.has_snapshot_type_filter else None
         if definition.has_average_volume_fields:
             config.average_volume_start_date = average_volume_start_date
@@ -1243,6 +1825,10 @@ def update_job_config(job_name: str, body: JobConfigIn) -> dict:
             config.prediction_start_date = prediction_start_date
         else:
             config.prediction_start_date = None
+        config.predicted_date_offset_days = (
+            body.predicted_date_offset_days if definition.has_predicted_date_offset_field else None
+        )
+        config.mcmc_num_simulations = body.mcmc_num_simulations if definition.has_monte_carlo_fields else None
         config.updated_at = dt.datetime.utcnow()
         session.commit()
 

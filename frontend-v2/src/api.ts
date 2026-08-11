@@ -46,6 +46,8 @@ export interface Job {
   has_average_volume_fields: boolean
   has_backtest_fields: boolean
   has_prediction_start_date_field: boolean
+  has_predicted_date_offset_field: boolean
+  has_monte_carlo_fields: boolean
   // Always the full massive.com asset-class list (jobs/registry.py's
   // SNAPSHOT_TYPE_OPTIONS), regardless of has_snapshot_type_filter - fetched from the
   // backend rather than hardcoded here so the two never drift.
@@ -60,6 +62,10 @@ export interface Job {
   multiplier: number | null
   timespan: string | null
   backfill_days: number | null
+  // Signed number of days from today (UTC) to sync bars through - e.g. 1 (the
+  // default) for "through yesterday", 0 for "through today" - or null to default to 1
+  // at run time. See backend-v2 jobs/sync_bars.py's sync_bars_nightly.
+  bars_end_date_offset_days: number | null
   snapshot_types: string | null
   // ISO date ("YYYY-MM-DD"), or null to default to yesterday (UTC) at run time - see
   // backend-v2 jobs/average_volume.py's compute_average_volume.
@@ -73,6 +79,21 @@ export interface Job {
   // ISO date ("YYYY-MM-DD"), or null to default to tomorrow (UTC) at run time - see
   // backend-v2 jobs/predict_market_state_10_day.py's compute_10_day_market_state_predictions.
   prediction_start_date: string | null
+  // Signed number of days from today (UTC) - e.g. 1 for tomorrow, 0 for today, -1 for
+  // yesterday - or null to default to tomorrow at run time. Only meaningful alongside
+  // has_predicted_date_offset_field (the predict-market-state job): backend-v2
+  // jobs/engine.py's run_job resolves this once per run into a concrete predicted
+  // date and feeds it to both the Markov chain and (see mcmc_num_simulations below)
+  // Monte Carlo phases of that job, in that order, so the two always target the same
+  // session - see db/models.py's JobConfig.predicted_date_offset_days docstring.
+  predicted_date_offset_days: number | null
+  // Number of Monte Carlo paths simulated per ticker, or null to default to 2000 at
+  // run time - see backend-v2 jobs/predict_market_state_mcmc.py's
+  // compute_market_state_mcmc_predictions. Only meaningful alongside
+  // has_monte_carlo_fields, the predict-market-state job's Monte Carlo phase (see
+  // predicted_date_offset_days above for the date that phase shares with the Markov
+  // chain phase before it).
+  mcmc_num_simulations: number | null
   // Persisted (JobConfig.hidden), not display-only - keeps a job off the Jobs page's
   // default list across reloads until explicitly unhidden. Independent of running/
   // paused: a hidden job still runs on its schedule, it's just tucked away here.
@@ -95,12 +116,15 @@ export interface JobConfigInput {
   multiplier?: number | null
   timespan?: string | null
   backfill_days?: number | null
+  bars_end_date_offset_days?: number | null
   snapshot_types?: string | null
   average_volume_start_date?: string | null
   average_volume_days_interval?: number | null
   backtest_start_date?: string | null
   backtest_end_date?: string | null
   prediction_start_date?: string | null
+  predicted_date_offset_days?: number | null
+  mcmc_num_simulations?: number | null
 }
 
 export interface TickerOption {
@@ -161,6 +185,7 @@ export interface TopMarketMoverRow {
   abs_expected_return_pct: number | null
   entry_price: number | null
   exit_price: number | null
+  exit_price_confidence: number | null
   entry_time: string | null
   exit_time: string | null
   history_days: number | null
@@ -211,6 +236,7 @@ export interface TradingSymbolRow {
   abs_expected_return_pct: number | null
   entry_price: number | null
   exit_price: number | null
+  exit_price_confidence: number | null
   entry_time: string | null
   exit_time: string | null
   history_days: number | null
@@ -402,6 +428,110 @@ export interface BacktestPoint {
   price_error_pct: number
 }
 
+// One row per ticker that has a Markov chain prediction (jobs/predict_market_state.py,
+// markov_-prefixed) and/or a Monte Carlo prediction (jobs/predict_market_state_mcmc.py,
+// mcmc_-prefixed) for the requested predicted_date - backs the Analytics > Market
+// Predictions report grid (see app/main.py's market_predictions_report). A row needs
+// only one of the two predictions to appear at all (the other side's markov_*/mcmc_*
+// fields are null if that job didn't run for this ticker on this date) - unlike every
+// other report's rows, average_volume/market_cap are the only fields guaranteed
+// present regardless of which prediction(s) matched. predicted_date itself is never
+// null - it's always exactly the date the report was run for, not per-prediction.
+export interface MarketPredictionRow {
+  ticker: string
+  name: string | null
+  average_volume: number | null
+  market_cap: number | null
+  // Backtest hit-rate (0-1 fraction of jobs/backtest_market_state.py's
+  // predicted_correct, averaged across every evaluated_date on record for this
+  // ticker) - null if the backtest job has never covered this ticker, not 0 (see
+  // app/main.py's _BACKTEST_STATS_SUBQ).
+  validation_score: number | null
+  // Blended expected_return * exit_price_confidence, averaged across whichever of
+  // markov_/mcmc_ this row actually has a prediction for (see app/main.py's
+  // SURVIVOR_SCORE_EXPR / _survivor_score).
+  survivor_score: number | null
+  predicted_date: string
+  markov_current_state: string | null
+  markov_predicted_state: string | null
+  markov_state_confidence: number | null
+  markov_expected_return: number | null
+  markov_entry_price: number | null
+  markov_exit_price: number | null
+  markov_exit_price_confidence: number | null
+  markov_entry_time: string | null
+  markov_exit_time: string | null
+  markov_history_days: number | null
+  markov_computed_at: string | null
+  mcmc_current_state: string | null
+  mcmc_predicted_state: string | null
+  mcmc_state_confidence: number | null
+  mcmc_expected_return: number | null
+  mcmc_entry_price: number | null
+  mcmc_exit_price: number | null
+  mcmc_exit_price_mean: number | null
+  mcmc_exit_price_std: number | null
+  mcmc_exit_price_confidence: number | null
+  mcmc_exit_price_p10: number | null
+  mcmc_exit_price_p50: number | null
+  mcmc_exit_price_p90: number | null
+  mcmc_entry_time: string | null
+  mcmc_exit_time: string | null
+  mcmc_num_simulations: number | null
+  mcmc_history_days: number | null
+  mcmc_computed_at: string | null
+}
+
+// Backend caps page_size at 1000 (see app/main.py's MARKET_PREDICTIONS_MAX_PAGE_SIZE).
+export const MARKET_PREDICTIONS_MAX_PAGE_SIZE = 1000
+
+export interface MarketPredictionsReport {
+  rows: MarketPredictionRow[]
+  total: number
+  page: number
+  page_size: number
+}
+
+// Sort priority for the Market Predictions report - same shape/reasoning as
+// TradingSymbolOrderField, against MARKET_PREDICTIONS_ORDERABLE_FIELDS instead.
+export interface MarketPredictionOrderField {
+  field: string
+  dir: 'asc' | 'desc'
+}
+
+// Params for api.marketPredictionsReport - an options object rather than positional
+// args (unlike tradingSymbolsReport/next10DayPredictionsReport above) because this
+// report alone has a dozen-odd independent filters; a positional signature that long
+// would be unreadable at the call site and error-prone to reorder. Every filter here
+// maps 1:1 to one of app/main.py's market_predictions_report query params - see that
+// function's docstring for what each one does and how markov_/mcmc_ filters combine
+// (OR, each gating only its own side) vs. the global ones (average volume/market cap/
+// validation/survivor score, require consensus - all AND'd on top).
+export interface MarketPredictionsReportParams {
+  predictedDate: string
+  tickerTypes?: string[]
+  tickers?: string[]
+  page?: number
+  pageSize?: number
+  orderBy?: MarketPredictionOrderField[]
+  markovExitPriceConfidenceFilter?: NumericFilter
+  mcmcExitPriceConfidenceFilter?: NumericFilter
+  averageVolumeFilter?: NumericFilter
+  marketCapFilter?: NumericFilter
+  markovHistoryDaysFilter?: NumericFilter
+  mcmcHistoryDaysFilter?: NumericFilter
+  markovStateConfidenceFilter?: NumericFilter
+  mcmcStateConfidenceFilter?: NumericFilter
+  markovExpectedReturnFilter?: NumericFilter
+  mcmcExpectedReturnFilter?: NumericFilter
+  markovPredictedStates?: string[]
+  mcmcPredictedStates?: string[]
+  requireConsensus?: boolean
+  mcmcP10ReturnPctFilter?: NumericFilter
+  validationScoreFilter?: NumericFilter
+  survivorScoreFilter?: NumericFilter
+}
+
 async function getJSON<T>(path: string): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`)
   if (!res.ok) throw new Error(`${path} failed: ${res.status}`)
@@ -442,6 +572,15 @@ function withAbsExpectedReturnPct<T extends { expected_return: number | null }>(
   }
 }
 
+// Sets `${prefix}_op`/`${prefix}_value` on `qs` when `filter` is given, no-ops
+// otherwise - shared by marketPredictionsReport's dozen-odd numeric filters below so
+// each doesn't repeat this two-line ternary the way tradingSymbolsReport's three do.
+function addNumericFilter(qs: URLSearchParams, prefix: string, filter?: NumericFilter): void {
+  if (!filter) return
+  qs.set(`${prefix}_op`, filter.op)
+  qs.set(`${prefix}_value`, String(filter.value))
+}
+
 export type TriggerJobResult = { status: 'started' } | { status: 'already-running' }
 
 export const api = {
@@ -477,6 +616,8 @@ export const api = {
     entryPriceFilter?: NumericFilter,
     marketCapFilter?: NumericFilter,
     tickers: string[] = [],
+    predictedStates: string[] = [],
+    stateConfidenceFilter?: NumericFilter,
   ) => {
     const orderByParam = orderBy.map(({ field, dir }) => `${field}:${dir}`).join(',')
     const entryPriceParam = entryPriceFilter
@@ -485,8 +626,11 @@ export const api = {
     const marketCapParam = marketCapFilter
       ? `&market_cap_op=${encodeURIComponent(marketCapFilter.op)}&market_cap_value=${marketCapFilter.value}`
       : ''
+    const stateConfidenceParam = stateConfidenceFilter
+      ? `&state_confidence_op=${encodeURIComponent(stateConfidenceFilter.op)}&state_confidence_value=${stateConfidenceFilter.value}`
+      : ''
     return getJSON<TradingSymbolsPage>(
-      `/reports/trading-symbols?ticker_types=${encodeURIComponent(tickerTypes.join(','))}&tickers=${encodeURIComponent(tickers.join(','))}&page=${page}&page_size=${pageSize}&order_by=${encodeURIComponent(orderByParam)}${entryPriceParam}${marketCapParam}`,
+      `/reports/trading-symbols?ticker_types=${encodeURIComponent(tickerTypes.join(','))}&tickers=${encodeURIComponent(tickers.join(','))}&page=${page}&page_size=${pageSize}&order_by=${encodeURIComponent(orderByParam)}${entryPriceParam}${marketCapParam}&predicted_states=${encodeURIComponent(predictedStates.join(','))}${stateConfidenceParam}`,
     ).then((data) => ({ ...data, rows: data.rows.map(withAbsExpectedReturnPct) }))
   },
   next10DayPredictionsReport: (
@@ -504,6 +648,56 @@ export const api = {
     return getJSON<Next10DayPredictionsReport>(
       `/reports/next-10-day-predictions?ticker_types=${encodeURIComponent(tickerTypes.join(','))}&tickers=${encodeURIComponent(tickers.join(','))}&page=${page}&page_size=${pageSize}&order_by=${encodeURIComponent(orderByParam)}${marketCapParam}`,
     )
+  },
+  marketPredictionsReport: (params: MarketPredictionsReportParams) => {
+    const {
+      predictedDate,
+      tickerTypes = [],
+      tickers = [],
+      page = 1,
+      pageSize = MARKET_PREDICTIONS_MAX_PAGE_SIZE,
+      orderBy = [],
+      markovExitPriceConfidenceFilter,
+      mcmcExitPriceConfidenceFilter,
+      averageVolumeFilter,
+      marketCapFilter,
+      markovHistoryDaysFilter,
+      mcmcHistoryDaysFilter,
+      markovStateConfidenceFilter,
+      mcmcStateConfidenceFilter,
+      markovExpectedReturnFilter,
+      mcmcExpectedReturnFilter,
+      markovPredictedStates = [],
+      mcmcPredictedStates = [],
+      requireConsensus = false,
+      mcmcP10ReturnPctFilter,
+      validationScoreFilter,
+      survivorScoreFilter,
+    } = params
+    const qs = new URLSearchParams()
+    qs.set('predicted_date', predictedDate)
+    qs.set('ticker_types', tickerTypes.join(','))
+    qs.set('tickers', tickers.join(','))
+    qs.set('page', String(page))
+    qs.set('page_size', String(pageSize))
+    qs.set('order_by', orderBy.map(({ field, dir }) => `${field}:${dir}`).join(','))
+    addNumericFilter(qs, 'markov_exit_price_confidence', markovExitPriceConfidenceFilter)
+    addNumericFilter(qs, 'mcmc_exit_price_confidence', mcmcExitPriceConfidenceFilter)
+    addNumericFilter(qs, 'average_volume', averageVolumeFilter)
+    addNumericFilter(qs, 'market_cap', marketCapFilter)
+    addNumericFilter(qs, 'markov_history_days', markovHistoryDaysFilter)
+    addNumericFilter(qs, 'mcmc_history_days', mcmcHistoryDaysFilter)
+    addNumericFilter(qs, 'markov_state_confidence', markovStateConfidenceFilter)
+    addNumericFilter(qs, 'mcmc_state_confidence', mcmcStateConfidenceFilter)
+    addNumericFilter(qs, 'markov_expected_return', markovExpectedReturnFilter)
+    addNumericFilter(qs, 'mcmc_expected_return', mcmcExpectedReturnFilter)
+    addNumericFilter(qs, 'mcmc_p10_return_pct', mcmcP10ReturnPctFilter)
+    addNumericFilter(qs, 'validation_score', validationScoreFilter)
+    addNumericFilter(qs, 'survivor_score', survivorScoreFilter)
+    if (markovPredictedStates.length) qs.set('markov_predicted_states', markovPredictedStates.join(','))
+    if (mcmcPredictedStates.length) qs.set('mcmc_predicted_states', mcmcPredictedStates.join(','))
+    if (requireConsensus) qs.set('require_consensus', 'true')
+    return getJSON<MarketPredictionsReport>(`/reports/market-predictions?${qs.toString()}`)
   },
   staleTickersReport: (
     tickerTypes: string[] = [],

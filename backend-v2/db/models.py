@@ -366,6 +366,15 @@ class MarketPrediction(Base):
     not predicted values - see the module docstring for why daily-bar data can't
     support a real time-of-day prediction.
 
+    exit_price_confidence is 1 - (predicted_state's historical return std / (1 +
+    expected_return)) - the same coefficient-of-variation formula shape as
+    MarketPredictionMonteCarlo.exit_price_confidence, rescaled from return-space to
+    price-space, so the two are directly comparable. Unlike the Monte Carlo job's
+    (which simulates the state draw too, so its spread reflects both which state and
+    what return within it), this only reflects the predicted state's own historical
+    return spread - predicted_state itself is a single deterministic argmax pick with
+    no uncertainty of its own to add in.
+
     Upserted - a re-run for the same (ticker, predicted_date) overwrites the prior
     prediction rather than accumulating rows, same semantics as AverageVolume."""
 
@@ -379,6 +388,7 @@ class MarketPrediction(Base):
     expected_return: Mapped[float] = mapped_column(Float)
     entry_price: Mapped[float] = mapped_column(Float)
     exit_price: Mapped[float] = mapped_column(Float)
+    exit_price_confidence: Mapped[float] = mapped_column(Float)
     entry_time: Mapped[str] = mapped_column(String)
     exit_time: Mapped[str] = mapped_column(String)
     history_days: Mapped[int] = mapped_column(Integer)
@@ -545,6 +555,74 @@ class MarketPrediction10Day(Base):
     computed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
 
 
+class MarketPredictionMonteCarlo(Base):
+    """One row per (ticker, predicted_date), produced by jobs/predict_market_state_mcmc.py's
+    compute_market_state_mcmc_predictions. Purely local, same reasoning as
+    MarketPrediction; reuses jobs/predict_market_state.py's fitted per-ticker Markov
+    chain (STATE_LABELS, quantile buckets, transition matrix) rather than fitting its
+    own.
+
+    Unlike MarketPrediction's single deterministic argmax step, this runs
+    num_simulations independent random walks: each path draws a next state weighted by
+    the fitted transition probabilities (predict_market_state._transition_row) rather
+    than always taking the most likely one, then draws that state's return from
+    Normal(bucket_mean, bucket_std) - a genuine Monte Carlo simulation *of* the fitted
+    Markov chain (not "MCMC" in the stricter Metropolis-Hastings/Gibbs sampling sense).
+
+    current_state/entry_price mean the same thing as MarketPrediction's columns of the
+    same name (entry_price is deterministic - today's/predicted_date's last close
+    before the cutoff, no simulation involved). predicted_state is the most-frequently
+    simulated next state across all paths; state_confidence is its frequency /
+    num_simulations - a simulated estimate of the same transition probability
+    MarketPrediction.state_confidence computes analytically. expected_return is a
+    fraction (exit_price_mean / entry_price - 1), same convention as
+    MarketPrediction.expected_return; exit_price is entry_price * (1 + expected_return) -
+    same formula, and therefore the same value, as exit_price_mean, kept as its own
+    column so this table carries a single-point exit price the same shape as
+    MarketPrediction.exit_price for consumers that want one. exit_price_mean/
+    exit_price_std/exit_price_p10/exit_price_p50/exit_price_p90 summarize the full
+    simulated exit-price distribution across all paths.
+
+    exit_price_confidence is 1 - (exit_price_std / exit_price_mean) - a 0-1 score (can
+    go negative if std exceeds mean) where a tight simulated spread scores near 1 and a
+    wide/uncertain one scores lower; 0.0 if exit_price_mean is 0. Distinct from
+    state_confidence, which measures confidence in the predicted *state*, not the
+    price. There is no entry_price_confidence - entry_price is today's/
+    predicted_date's already-observed last close before the cutoff, not simulated, so
+    it carries no uncertainty to quantify.
+
+    entry_time/exit_time are fixed constants, same reasoning as MarketPrediction's
+    columns of the same name.
+
+    Upserted - a re-run for the same (ticker, predicted_date) overwrites the prior
+    prediction rather than accumulating rows, same semantics as MarketPrediction."""
+
+    __tablename__ = "market_predictions_mcmc"
+
+    ticker: Mapped[str] = mapped_column(ForeignKey("tickers.ticker"), primary_key=True)
+    predicted_date: Mapped[dt.date] = mapped_column(Date, primary_key=True)
+    current_state: Mapped[str] = mapped_column(String)
+    predicted_state: Mapped[str] = mapped_column(String)
+    state_confidence: Mapped[float] = mapped_column(Float)
+    expected_return: Mapped[float] = mapped_column(Float)
+    entry_price: Mapped[float] = mapped_column(Float)
+    exit_price: Mapped[float] = mapped_column(Float)
+    exit_price_mean: Mapped[float] = mapped_column(Float)
+    exit_price_std: Mapped[float] = mapped_column(Float)
+    exit_price_confidence: Mapped[float] = mapped_column(Float)
+    exit_price_p10: Mapped[float] = mapped_column(Float)
+    exit_price_p50: Mapped[float] = mapped_column(Float)
+    exit_price_p90: Mapped[float] = mapped_column(Float)
+    entry_time: Mapped[str] = mapped_column(String)
+    exit_time: Mapped[str] = mapped_column(String)
+    # Persisted (rather than assumed constant) since it's a per-run JobConfig knob - see
+    # JobConfig.mcmc_num_simulations - and can therefore differ between two runs of the
+    # same ticker/predicted_date.
+    num_simulations: Mapped[int] = mapped_column(Integer)
+    history_days: Mapped[int] = mapped_column(Integer)
+    computed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
+
+
 class News(Base):
     """One row per article returned by GET /v2/reference/news, keyed by massive.com's
     own article `id` rather than by ticker - a single article often covers more than
@@ -596,12 +674,18 @@ class JobConfig(Base):
     backend-v2 restart; the schedule is kept (and shown) even for a "manual" job, so
     switching it to "auto" later doesn't need re-entering it.
 
-    tickers/multiplier/timespan/backfill_days only apply to the bars job
-    (registry.JobDefinition.has_bars_fields) and are left None for the tickers job.
-    ticker_types applies to both jobs: a single upstream `type` filter for the tickers
-    job (jobs/sync_tickers.py's ticker_type param - None syncs every type), or a
-    multi-select filter for the bars job, mutually exclusive with tickers there - see
-    jobs/sync_bars.py's _resolve_tickers. Comma-separated either way.
+    tickers/multiplier/timespan/backfill_days/bars_end_date_offset_days only apply to
+    the bars job (registry.JobDefinition.has_bars_fields) and are left None for the
+    tickers job. ticker_types applies to both jobs: a single upstream `type` filter for
+    the tickers job (jobs/sync_tickers.py's ticker_type param - None syncs every type),
+    or a multi-select filter for the bars job, mutually exclusive with tickers there -
+    see jobs/sync_bars.py's _resolve_tickers. Comma-separated either way.
+
+    bars_end_date_offset_days is a signed integer offset in days from today (UTC) -
+    e.g. 1 for "through yesterday" (sync_bars_nightly's historical fixed behavior), 0
+    for "through today" - rather than a literal date, same "left None, resolved at run
+    time" reasoning as average_volume_start_date below, defaulting to
+    jobs/sync_bars.py's DEFAULT_END_DATE_OFFSET_DAYS (1) when unset.
 
     snapshot_types is unrelated to ticker_types - it only applies to the unified-
     snapshot job (registry.JobDefinition.has_snapshot_type_filter), filtering by
@@ -627,6 +711,24 @@ class JobConfig(Base):
     at run time" reasoning as average_volume_start_date -
     jobs/predict_market_state_10_day.py resolves a None start date to tomorrow (UTC).
 
+    predicted_date_offset_days only applies to the predict-market-state job
+    (registry.JobDefinition.has_predicted_date_offset_field) - unlike
+    prediction_start_date above, it's an integer *offset* in days from today (UTC)
+    rather than a literal date (e.g. +1 for tomorrow, 0 for today, -1 for yesterday),
+    resolved to a concrete date once per run by jobs/engine.py's run_job. Left None,
+    same "resolved at run time" reasoning as average_volume_start_date, defaulting to
+    jobs/predict_market_state.py's DEFAULT_PREDICTED_DATE_OFFSET_DAYS (+1, tomorrow).
+    That resolved date feeds both phases of the predict-market-state job's run - the
+    Markov chain prediction (jobs/predict_market_state.py) and, immediately after it,
+    the Monte Carlo simulation over that same chain (jobs/predict_market_state_mcmc.py) -
+    so a single run's two stored predictions always target the same session.
+
+    mcmc_num_simulations only applies to the predict-market-state job's Monte Carlo
+    phase (registry.JobDefinition.has_monte_carlo_fields), same "left None, resolved at
+    run time" reasoning as average_volume_start_date -
+    jobs/predict_market_state_mcmc.py resolves a None value to
+    DEFAULT_NUM_SIMULATIONS (2000).
+
     run_requested_at is how app/main.py (the API process) asks job_runner.py (the
     separate process that actually executes jobs - see jobs/engine.py) to run this job
     now: POST /jobs/{name}/run sets it, job_runner.py's poll_run_requests clears it
@@ -646,12 +748,15 @@ class JobConfig(Base):
     multiplier: Mapped[int | None] = mapped_column(Integer)
     timespan: Mapped[str | None] = mapped_column(String)
     backfill_days: Mapped[int | None] = mapped_column(Integer)
+    bars_end_date_offset_days: Mapped[int | None] = mapped_column(Integer)
     snapshot_types: Mapped[str | None] = mapped_column(String)
     average_volume_start_date: Mapped[dt.date | None] = mapped_column(Date)
     average_volume_days_interval: Mapped[int | None] = mapped_column(Integer)
     backtest_start_date: Mapped[dt.date | None] = mapped_column(Date)
     backtest_end_date: Mapped[dt.date | None] = mapped_column(Date)
     prediction_start_date: Mapped[dt.date | None] = mapped_column(Date)
+    predicted_date_offset_days: Mapped[int | None] = mapped_column(Integer)
+    mcmc_num_simulations: Mapped[int | None] = mapped_column(Integer)
     # Hides the job's card from the Jobs page's default list (see app/main.py's
     # list_jobs) without affecting its schedule - a hidden job still runs normally.
     hidden: Mapped[bool] = mapped_column(default=False)

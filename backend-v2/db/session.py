@@ -47,38 +47,50 @@ if DATABASE_URL.startswith("sqlite"):
 def init_db() -> None:
     Base.metadata.create_all(engine)
     _add_job_configs_start_time_column()
+    _add_job_configs_bars_end_date_offset_days_column()
     _add_job_configs_snapshot_types_column()
     _add_job_configs_average_volume_columns()
     _add_job_configs_hidden_column()
     _add_job_configs_backtest_columns()
     _add_job_configs_run_requested_at_column()
     _add_job_configs_prediction_start_date_column()
+    _add_job_configs_predicted_date_offset_days_column()
+    _add_job_configs_mcmc_num_simulations_column()
     _add_job_runs_progress_columns()
     _add_job_runs_control_columns()
+    _add_market_predictions_mcmc_columns()
+    _add_market_predictions_exit_price_confidence_column()
     _drop_ticker_bar_sync_state_table()
 
 
-def _add_job_configs_column(column: str, ddl_type: str) -> None:
-    """Shared by _add_job_configs_start_time_column and
-    _add_job_configs_snapshot_types_column below - create_all only creates missing
-    *tables*, not missing columns on ones that already exist, so a database from
-    before one of these columns was added would otherwise 500 on its first query
-    against job_configs. There's no migration tool here (see this module's lack of
+def _add_column_if_missing(table: str, column: str, ddl_type: str) -> None:
+    """Shared by every _add_<table>_*_column helper below - create_all only creates
+    missing *tables*, not missing columns on ones that already exist, so a database
+    from before one of these columns was added would otherwise 500 on its first query
+    against that table. There's no migration tool here (see this module's lack of
     one), so this is a one-off, idempotent ALTER TABLE instead - cheap enough that
     running it unconditionally on every init_db() call beats standing up Alembic for a
-    couple of added columns."""
+    handful of added columns."""
     inspector = inspect(engine)
-    if "job_configs" not in inspector.get_table_names():
+    if table not in inspector.get_table_names():
         return
-    columns = {col["name"] for col in inspector.get_columns("job_configs")}
+    columns = {col["name"] for col in inspector.get_columns(table)}
     if column in columns:
         return
     with engine.begin() as conn:
-        conn.execute(text(f"ALTER TABLE job_configs ADD COLUMN {column} {ddl_type}"))
+        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}"))
+
+
+def _add_job_configs_column(column: str, ddl_type: str) -> None:
+    _add_column_if_missing("job_configs", column, ddl_type)
 
 
 def _add_job_configs_start_time_column() -> None:
     _add_job_configs_column("start_time", "VARCHAR DEFAULT '00:00'")
+
+
+def _add_job_configs_bars_end_date_offset_days_column() -> None:
+    _add_job_configs_column("bars_end_date_offset_days", "INTEGER")
 
 
 def _add_job_configs_snapshot_types_column() -> None:
@@ -107,18 +119,16 @@ def _add_job_configs_prediction_start_date_column() -> None:
     _add_job_configs_column("prediction_start_date", "DATE")
 
 
+def _add_job_configs_predicted_date_offset_days_column() -> None:
+    _add_job_configs_column("predicted_date_offset_days", "INTEGER")
+
+
+def _add_job_configs_mcmc_num_simulations_column() -> None:
+    _add_job_configs_column("mcmc_num_simulations", "INTEGER")
+
+
 def _add_job_runs_column(column: str, ddl_type: str) -> None:
-    """Same idempotent-ALTER-TABLE reasoning as _add_job_configs_column above, scoped
-    to job_runs instead - a database from before progress_completed/progress_total
-    existed would otherwise 500 on its first query against job_runs."""
-    inspector = inspect(engine)
-    if "job_runs" not in inspector.get_table_names():
-        return
-    columns = {col["name"] for col in inspector.get_columns("job_runs")}
-    if column in columns:
-        return
-    with engine.begin() as conn:
-        conn.execute(text(f"ALTER TABLE job_runs ADD COLUMN {column} {ddl_type}"))
+    _add_column_if_missing("job_runs", column, ddl_type)
 
 
 def _add_job_runs_progress_columns() -> None:
@@ -129,6 +139,24 @@ def _add_job_runs_progress_columns() -> None:
 def _add_job_runs_control_columns() -> None:
     _add_job_runs_column("pause_requested", "BOOLEAN DEFAULT 0")
     _add_job_runs_column("cancel_requested", "BOOLEAN DEFAULT 0")
+
+
+def _add_market_predictions_mcmc_columns() -> None:
+    """exit_price/exit_price_confidence were added after market_predictions_mcmc
+    itself - a database that already ran the Monte Carlo job before these existed
+    would otherwise 500 on its first query against the table. Existing rows get NULL
+    in both new columns until their next run recomputes them, same as any other
+    column added to a table with existing data."""
+    _add_column_if_missing("market_predictions_mcmc", "exit_price", "FLOAT")
+    _add_column_if_missing("market_predictions_mcmc", "exit_price_confidence", "FLOAT")
+
+
+def _add_market_predictions_exit_price_confidence_column() -> None:
+    """exit_price_confidence was added after market_predictions itself (a table with
+    live production data going back to before this column existed) - existing rows
+    get NULL until their next run recomputes it, same reasoning as
+    _add_market_predictions_mcmc_columns above."""
+    _add_column_if_missing("market_predictions", "exit_price_confidence", "FLOAT")
 
 
 def _drop_ticker_bar_sync_state_table() -> None:

@@ -23,12 +23,27 @@ type SavedParams = {
   entryPriceValue: string
   marketCapOp: NumericFilterOp | ''
   marketCapValue: string
+  predictedStates: string[]
+  stateConfidenceOp: NumericFilterOp | ''
+  stateConfidenceValue: string
 }
 
 // Backend caps /ticker-types/search's limit at 50 (see app/main.py's search_ticker_types) -
 // ticker_types is a short, mostly-static reference list (db/models.py's TickerType
 // docstring), so that's comfortably the whole thing in one page.
 const TICKER_TYPE_OPTIONS_LIMIT = 50
+
+// Matches jobs/predict_market_state.py's STATE_LABELS - the fixed, per-ticker-relative
+// quantile buckets predicted_state/current_state are drawn from. Small and static
+// enough (unlike ticker types or tickers) to hardcode here rather than fetch from an
+// options endpoint.
+const PREDICTED_STATE_OPTIONS: SelectOption[] = [
+  { value: 'strong_down', label: 'Strong Down' },
+  { value: 'down', label: 'Down' },
+  { value: 'flat', label: 'Flat' },
+  { value: 'up', label: 'Up' },
+  { value: 'strong_up', label: 'Strong Up' },
+]
 
 const DEFAULT_PAGE_SIZE = 500
 
@@ -89,6 +104,7 @@ const COLUMNS: ReportColumn<TradingSymbolRow>[] = [
   { key: 'abs_expected_return_pct', label: 'Abs Expected Return %' },
   { key: 'entry_price', label: 'Entry Price' },
   { key: 'exit_price', label: 'Exit Price' },
+  { key: 'exit_price_confidence', label: 'Exit Price Confidence' },
   { key: 'entry_time', label: 'Entry Time' },
   { key: 'exit_time', label: 'Exit Time' },
   { key: 'history_days', label: 'History Days' },
@@ -149,6 +165,16 @@ export function TradingSymbolsPage() {
   // instead.
   const [marketCapOp, setMarketCapOp] = useState<NumericFilterOp | ''>(() => loadSavedParams()?.marketCapOp ?? '')
   const [marketCapValue, setMarketCapValue] = useState(() => loadSavedParams()?.marketCapValue ?? '')
+  // A real backend filter on market_predictions.predicted_state (see app/main.py's
+  // trading_symbols_report), same AND-combined-with-everything-else reasoning as
+  // tickers/tickerTypes above.
+  const [predictedStates, setPredictedStates] = useState<string[]>(() => loadSavedParams()?.predictedStates ?? [])
+  // Same shape/reasoning as entryPriceOp/entryPriceValue, filtering on
+  // market_predictions.state_confidence instead.
+  const [stateConfidenceOp, setStateConfidenceOp] = useState<NumericFilterOp | ''>(
+    () => loadSavedParams()?.stateConfidenceOp ?? '',
+  )
+  const [stateConfidenceValue, setStateConfidenceValue] = useState(() => loadSavedParams()?.stateConfidenceValue ?? '')
   // Draft value bound to the page-size input, distinct from `pageSize` below (the
   // value the currently-displayed page was actually fetched with) - editing this
   // doesn't affect what's on screen, or what Prev/Next page through, until "Run
@@ -186,6 +212,10 @@ export function TradingSymbolsPage() {
     marketCapOp && marketCapValue.trim() !== '' && Number.isFinite(Number(marketCapValue))
       ? { op: marketCapOp, value: Number(marketCapValue) }
       : undefined
+  const stateConfidenceFilter =
+    stateConfidenceOp && stateConfidenceValue.trim() !== '' && Number.isFinite(Number(stateConfidenceValue))
+      ? { op: stateConfidenceOp, value: Number(stateConfidenceValue) }
+      : undefined
 
   const fetchPage = async (targetPage: number, requestedPageSize: number) => {
     setLoading(true)
@@ -199,6 +229,8 @@ export function TradingSymbolsPage() {
         entryPriceFilter,
         marketCapFilter,
         tickers,
+        predictedStates,
+        stateConfidenceFilter,
       )
       setRows(result.rows)
       setTotal(result.total)
@@ -237,6 +269,9 @@ export function TradingSymbolsPage() {
       entryPriceValue,
       marketCapOp,
       marketCapValue,
+      predictedStates,
+      stateConfidenceOp,
+      stateConfidenceValue,
     })
     setParamsJustSaved(true)
     if (paramsSavedFlashTimeout.current) window.clearTimeout(paramsSavedFlashTimeout.current)
@@ -337,6 +372,38 @@ export function TradingSymbolsPage() {
                 placeholder="Value"
                 value={marketCapValue}
                 onChange={(event) => setMarketCapValue(event.target.value)}
+              />
+            </div>
+          </div>
+          <div className="job-field report-ticker-type-field">
+            <span className="job-field-label">Predicted state</span>
+            <SearchableSelect
+              multiple
+              selected={predictedStates}
+              onChange={setPredictedStates}
+              options={PREDICTED_STATE_OPTIONS}
+              placeholder="Search predicted state... (leave blank for all)"
+            />
+          </div>
+          <div className="job-field report-numeric-filter-field">
+            <span className="job-field-label">State confidence</span>
+            <div className="report-numeric-filter-inputs">
+              <select
+                value={stateConfidenceOp}
+                onChange={(event) => setStateConfidenceOp(event.target.value as NumericFilterOp | '')}
+              >
+                <option value="">Any</option>
+                {NUMERIC_FILTER_OPS.map((op) => (
+                  <option key={op} value={op}>
+                    {op}
+                  </option>
+                ))}
+              </select>
+              <input
+                type="number"
+                placeholder="Value"
+                value={stateConfidenceValue}
+                onChange={(event) => setStateConfidenceValue(event.target.value)}
               />
             </div>
           </div>

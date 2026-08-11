@@ -8,7 +8,6 @@ from jobs.predict_market_state import (
     STATE_LABELS,
     _bucket_states,
     _fit_transition,
-    _next_trading_day,
     _predict_next_state,
     compute_market_state_predictions,
 )
@@ -62,28 +61,84 @@ def test_stores_prediction_matching_independent_recomputation():
     try:
         start = dt.date(2026, 1, 1)
         _seed_bars(session, "AAA", _CLOSES, start)
-        stored = compute_market_state_predictions(session, min_history_days=10)
+        prediction_date = start + dt.timedelta(days=len(_CLOSES))  # one day after the last seeded bar
+        stored = compute_market_state_predictions(session, prediction_date=prediction_date, min_history_days=10)
         assert stored == 1
 
         row = session.query(MarketPrediction).filter_by(ticker="AAA").one()
 
         returns = [_CLOSES[i] / _CLOSES[i - 1] - 1 for i in range(1, len(_CLOSES))]
-        states, bucket_means = _bucket_states(returns)
+        states, bucket_means, bucket_stds = _bucket_states(returns)
         counts = _fit_transition(states)
         predicted_state, confidence = _predict_next_state(counts, states[-1], states)
+        expected_return = bucket_means[predicted_state]
 
         assert row.current_state == STATE_LABELS[states[-1]]
         assert row.predicted_state == STATE_LABELS[predicted_state]
         assert row.state_confidence == pytest.approx(confidence)
-        assert row.expected_return == pytest.approx(bucket_means[predicted_state])
+        assert row.expected_return == pytest.approx(expected_return)
         assert row.entry_price == pytest.approx(_CLOSES[-1])
-        assert row.exit_price == pytest.approx(_CLOSES[-1] * (1 + bucket_means[predicted_state]))
+        assert row.exit_price == pytest.approx(_CLOSES[-1] * (1 + expected_return))
+        assert row.exit_price_confidence == pytest.approx(1 - bucket_stds[predicted_state] / (1 + expected_return))
         assert row.entry_time == "09:30:00"
         assert row.exit_time == "16:00:00"
         assert row.history_days == len(returns)
+        assert row.predicted_date == prediction_date
+    finally:
+        session.close()
 
-        last_date = start + dt.timedelta(days=len(_CLOSES) - 1)
-        assert row.predicted_date == _next_trading_day(last_date)
+
+def test_data_on_or_after_prediction_date_cutoff_is_excluded():
+    """Bars on/after prediction_date must not influence the fit - a real prediction can
+    never see data from a day it hasn't happened yet."""
+    session = SessionLocal()
+    try:
+        start = dt.date(2026, 1, 1)
+        _seed_bars(session, "AAA", _CLOSES, start)
+        prediction_date = start + dt.timedelta(days=len(_CLOSES))
+        compute_market_state_predictions(session, prediction_date=prediction_date, min_history_days=10)
+        baseline = session.query(MarketPrediction).filter_by(ticker="AAA").one()
+        baseline_entry_price = baseline.entry_price
+
+        # A wild, obviously-influential bar landing exactly on prediction_date.
+        session.add(
+            OhlcBar(
+                ticker="AAA",
+                multiplier=1,
+                timespan="day",
+                timestamp=dt.datetime.combine(prediction_date, dt.time.min),
+                close=999999.0,
+            )
+        )
+        session.commit()
+
+        session.query(MarketPrediction).delete()
+        session.commit()
+        compute_market_state_predictions(session, prediction_date=prediction_date, min_history_days=10)
+        after = session.query(MarketPrediction).filter_by(ticker="AAA").one()
+        assert after.entry_price == pytest.approx(baseline_entry_price)
+    finally:
+        session.close()
+
+
+def test_prediction_date_defaults_to_tomorrow_utc():
+    session = SessionLocal()
+    try:
+        _seed_bars(session, "AAA", _CLOSES, dt.date(2026, 1, 1))
+        compute_market_state_predictions(session, min_history_days=10)
+        row = session.query(MarketPrediction).filter_by(ticker="AAA").one()
+        assert row.predicted_date == dt.datetime.now(dt.timezone.utc).date() + dt.timedelta(days=1)
+    finally:
+        session.close()
+
+
+def test_different_prediction_dates_accumulate_separate_rows():
+    session = SessionLocal()
+    try:
+        _seed_bars(session, "AAA", _CLOSES, dt.date(2026, 1, 1))
+        compute_market_state_predictions(session, prediction_date=dt.date(2026, 3, 1), min_history_days=10)
+        compute_market_state_predictions(session, prediction_date=dt.date(2026, 3, 2), min_history_days=10)
+        assert session.query(MarketPrediction).count() == 2
     finally:
         session.close()
 

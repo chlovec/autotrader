@@ -27,8 +27,13 @@ from jobs.average_volume import DEFAULT_DAYS_INTERVAL, compute_average_volume
 from jobs.backtest_market_state import compute_market_state_backtest
 from jobs.config_store import get_or_create_config, interval_trigger, split_csv
 from jobs.control import JobCancelled, JobControl
-from jobs.predict_market_state import DEFAULT_MIN_HISTORY_DAYS, compute_market_state_predictions
+from jobs.predict_market_state import (
+    DEFAULT_MIN_HISTORY_DAYS,
+    DEFAULT_PREDICTED_DATE_OFFSET_DAYS,
+    compute_market_state_predictions,
+)
 from jobs.predict_market_state_10_day import compute_10_day_market_state_predictions
+from jobs.predict_market_state_mcmc import DEFAULT_NUM_SIMULATIONS, compute_market_state_mcmc_predictions
 from jobs.registry import (
     AVERAGE_VOLUME_JOB,
     BACKTEST_MARKET_STATE_JOB,
@@ -45,7 +50,13 @@ from jobs.registry import (
     TICKERS_JOB,
     UNIFIED_SNAPSHOT_JOB,
 )
-from jobs.sync_bars import DEFAULT_BACKFILL_DAYS, DEFAULT_MULTIPLIER, DEFAULT_TIMESPAN, sync_bars_nightly
+from jobs.sync_bars import (
+    DEFAULT_BACKFILL_DAYS,
+    DEFAULT_END_DATE_OFFSET_DAYS,
+    DEFAULT_MULTIPLIER,
+    DEFAULT_TIMESPAN,
+    sync_bars_nightly,
+)
 from jobs.sync_indicators import sync_indicator
 from jobs.sync_news import sync_news
 from jobs.sync_snapshots import sync_snapshots
@@ -186,17 +197,44 @@ async def run_job(job_name: str, trigger: str) -> None:
             )
             summary = f"{count} ticker(s) average volume computed"
         elif job_name == PREDICT_MARKET_STATE_JOB:
-            # Same reasoning as the average-volume branch above - purely local, off
-            # the event loop via asyncio.to_thread.
-            count = await asyncio.to_thread(
+            # Merged run: the deterministic Markov chain prediction always runs first,
+            # then a Monte Carlo simulation over that same fitted chain - both purely
+            # local, off the event loop via asyncio.to_thread, same reasoning as the
+            # average-volume branch above. Both phases share one predicted date,
+            # resolved here (as an offset in days from today - see JobConfig.
+            # predicted_date_offset_days's docstring) rather than twice, so they can
+            # never target different sessions.
+            offset_days = (
+                config.predicted_date_offset_days
+                if config.predicted_date_offset_days is not None
+                else DEFAULT_PREDICTED_DATE_OFFSET_DAYS
+            )
+            prediction_date = dt.datetime.now(dt.timezone.utc).date() + dt.timedelta(days=offset_days)
+            ticker_types = split_csv(config.ticker_types)
+            tickers = split_csv(config.tickers)
+            markov_count = await asyncio.to_thread(
                 compute_market_state_predictions,
                 session,
-                split_csv(config.ticker_types),
-                split_csv(config.tickers),
+                prediction_date,
+                ticker_types,
+                tickers,
                 DEFAULT_MIN_HISTORY_DAYS,
                 control=control,
             )
-            summary = f"{count} ticker(s) market state predicted"
+            mcmc_count = await asyncio.to_thread(
+                compute_market_state_mcmc_predictions,
+                session,
+                prediction_date,
+                ticker_types,
+                tickers,
+                DEFAULT_MIN_HISTORY_DAYS,
+                num_simulations=config.mcmc_num_simulations or DEFAULT_NUM_SIMULATIONS,
+                control=control,
+            )
+            summary = (
+                f"{markov_count} ticker(s) market state predicted, "
+                f"{mcmc_count} ticker(s) Monte Carlo market state predicted"
+            )
         elif job_name == PREDICT_10_DAY_MARKET_STATE_JOB:
             # Same reasoning as the predict-market-state branch above - purely local,
             # off the event loop via asyncio.to_thread.
@@ -249,7 +287,17 @@ async def run_job(job_name: str, trigger: str) -> None:
                 split_csv(config.tickers),
                 multiplier=config.multiplier or DEFAULT_MULTIPLIER,
                 timespan=config.timespan or DEFAULT_TIMESPAN,
-                backfill_days=config.backfill_days or DEFAULT_BACKFILL_DAYS,
+                # `or` would wrongly fall back to the default on a deliberate 0
+                # ("no backfill, just the end date itself") - 0 is falsy but a valid
+                # value now that Backfill days' UI minimum is 0, not 1.
+                backfill_days=config.backfill_days if config.backfill_days is not None else DEFAULT_BACKFILL_DAYS,
+                # Same reasoning as backfill_days above - 0 ("through today") is a
+                # valid offset, not a "use the default" signal.
+                end_date_offset_days=(
+                    config.bars_end_date_offset_days
+                    if config.bars_end_date_offset_days is not None
+                    else DEFAULT_END_DATE_OFFSET_DAYS
+                ),
                 control=control,
                 run_id=run_id,
             )

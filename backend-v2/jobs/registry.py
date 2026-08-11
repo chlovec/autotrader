@@ -20,6 +20,11 @@ EMA_JOB = "sync-ema"
 MACD_JOB = "sync-macd"
 RSI_JOB = "sync-rsi"
 AVERAGE_VOLUME_JOB = "average-volume"
+# Runs jobs/predict_market_state.py's Markov chain prediction followed immediately by
+# jobs/predict_market_state_mcmc.py's Monte Carlo simulation over that same chain, in
+# that order, in a single job run - see JOB_DEFINITIONS' entry below and
+# jobs/engine.py's run_job. There is no separate "predict-market-state-mcmc" job id;
+# the Monte Carlo phase is folded into this one.
 PREDICT_MARKET_STATE_JOB = "predict-market-state"
 BACKTEST_MARKET_STATE_JOB = "backtest-market-state"
 PREDICT_10_DAY_MARKET_STATE_JOB = "predict-10-day-market-state"
@@ -73,7 +78,12 @@ class JobDefinition:
     name: str
     label: str
     description: str
-    # Whether multiplier/timespan/backfill_days apply to this job (bars-only).
+    # Whether multiplier/timespan/backfill_days/bars_end_date_offset_days apply to
+    # this job (bars-only). bars_end_date_offset_days is a signed offset in days from
+    # today (UTC) - e.g. 1 for "through yesterday" (the historical default), 0 for
+    # "through today" - resolved to a concrete end date once per run by
+    # jobs/sync_bars.py's sync_bars_nightly, same "left None, resolved at run time"
+    # reasoning backfill_days already uses.
     has_bars_fields: bool
     # Whether ticker_types applies to this job as a *single* type filter - the tickers
     # job's only selection mechanism (see jobs/sync_tickers.py's ticker_type param).
@@ -111,6 +121,23 @@ class JobDefinition:
     # Unlike has_backtest_fields, just one date (the prediction's own start date, not a
     # range) - independent of the other flags, same layering as has_average_volume_fields.
     has_prediction_start_date_field: bool = False
+    # Whether this job offers a "Predicted date" field expressed as an offset in days
+    # from today (e.g. +1 for tomorrow, 0 for today, -1 for yesterday) rather than a
+    # literal date - only the predict-market-state job takes this. jobs/engine.py's
+    # run_job resolves the offset to a concrete date once per run and feeds that same
+    # date to both phases of that job (see has_monte_carlo_fields below), so the
+    # Markov chain and Monte Carlo predictions it stores always target the same
+    # session. Never coexists with has_prediction_start_date_field above - each
+    # caller-chosen-date job takes exactly one of the two field shapes.
+    has_predicted_date_offset_field: bool = False
+    # Whether this job offers a "Simulated paths" field (see
+    # jobs/predict_market_state_mcmc.py) - only the predict-market-state job takes
+    # this, for the Monte Carlo phase it runs immediately after its deterministic
+    # Markov chain phase (see PREDICT_MARKET_STATE_JOB's description and
+    # jobs/engine.py's run_job). Independent of the other flags; always paired with
+    # has_predicted_date_offset_field above, since both phases share the same
+    # resolved predicted date.
+    has_monte_carlo_fields: bool = False
     # Seeded into JobConfig.run_type the first time this job's config row is created
     # (see app/main.py's _get_or_create_config). "auto" unless overridden below.
     default_run_type: str = "auto"
@@ -126,9 +153,44 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
     BARS_JOB: JobDefinition(
         name=BARS_JOB,
         label="Sync bars (nightly)",
-        description="Syncs OHLC bars through yesterday for every ticker not already up to date.",
+        description=(
+            "Syncs OHLC bars through today minus the End date offset field (default: "
+            "1, i.e. through yesterday) for every ticker not already up to date."
+        ),
         has_bars_fields=True,
         has_ticker_selector=True,
+    ),
+    PREDICT_MARKET_STATE_JOB: JobDefinition(
+        name=PREDICT_MARKET_STATE_JOB,
+        label="Predict market state",
+        description=(
+            "Fits a first-order Markov chain per selected ticker on its history of "
+            "discretized daily ohlc_bars returns for a chosen predicted date (default: "
+            "tomorrow, UTC, expressed as an offset in days from today - see the "
+            "Predicted date field), storing each ticker's predicted state "
+            "(strong_down/down/flat/up/strong_up), a confidence score, and a projected "
+            "entry/exit price in the market_predictions table - then immediately runs "
+            "a Monte Carlo simulation over that same fitted chain for the same "
+            "predicted date, where each of a configurable number of simulated paths "
+            "draws a next state weighted by the fitted transition probabilities "
+            "(rather than always the most likely one) and a return from that state's "
+            "own historical mean/standard deviation, storing the resulting simulated "
+            "exit-price distribution - mean, standard deviation, and 10th/50th/90th "
+            "percentile bands - per ticker in the market_predictions_mcmc table. The "
+            "two phases always run in that order within a single job run, sharing the "
+            "same ticker selection, predicted date, and bar history. Purely local - no "
+            "massive.com call, reads bars already synced by the bars job, and only "
+            "bars from before the predicted date. Entry/exit time are fixed to the "
+            "regular session's open/close, not predicted - daily bars carry no "
+            "intraday timestamp to predict from."
+        ),
+        has_bars_fields=False,
+        has_ticker_selector=True,
+        has_predicted_date_offset_field=True,
+        has_monte_carlo_fields=True,
+        # Run-on-demand statistic over already-synced bars, no natural daily cadence of
+        # its own - manual by default, same reasoning as average-volume.
+        default_run_type="manual",
     ),
     TICKER_TYPES_JOB: JobDefinition(
         name=TICKER_TYPES_JOB,
@@ -243,24 +305,6 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
         has_average_volume_fields=True,
         # Run-on-demand statistic over already-synced bars, no natural daily cadence of
         # its own - manual by default, same reasoning as ticker-types/snapshots/movers.
-        default_run_type="manual",
-    ),
-    PREDICT_MARKET_STATE_JOB: JobDefinition(
-        name=PREDICT_MARKET_STATE_JOB,
-        label="Predict market state",
-        description=(
-            "Fits a first-order Markov chain per selected ticker on its history of "
-            "discretized daily ohlc_bars returns, and stores each ticker's predicted "
-            "next-session state (strong_down/down/flat/up/strong_up), a confidence "
-            "score, and a projected entry/exit price in the market_predictions table. "
-            "Purely local - no massive.com call, reads bars already synced by the bars "
-            "job. Entry/exit time are fixed to the regular session's open/close, not "
-            "predicted - daily bars carry no intraday timestamp to predict from."
-        ),
-        has_bars_fields=False,
-        has_ticker_selector=True,
-        # Run-on-demand statistic over already-synced bars, no natural daily cadence of
-        # its own - manual by default, same reasoning as average-volume.
         default_run_type="manual",
     ),
     BACKTEST_MARKET_STATE_JOB: JobDefinition(
