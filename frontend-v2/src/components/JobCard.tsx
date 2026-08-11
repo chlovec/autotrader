@@ -544,7 +544,6 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
                       Multiplier
                       <input
                         type="number"
-                        min={1}
                         value={multiplier}
                         onChange={(e) => setMultiplier(Number(e.target.value))}
                       />
