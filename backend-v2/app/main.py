@@ -1492,18 +1492,18 @@ def market_predictions_report(
     page-scoped display-only lookups, so they can be filtered/ordered on before
     pagination the same way the markov_/mcmc_ columns already were.
 
-    A ticker then only needs to *appear* if at least one side matched:
-    `inclusion_condition` below is
-    `(MarketPrediction.ticker IS NOT NULL AND <all active markov-side filters>)
-     OR (MarketPredictionMonteCarlo.ticker IS NOT NULL AND <all active mcmc-side filters>)`.
-    Because each side's filters live inside this OR (each only gates its own side),
-    every markov_*/mcmc_* filter pair below (exit_price_confidence, history_days,
+    A ticker only needs a prediction from *either* source to appear at all -
+    `inclusion_condition` below starts as
+    `MarketPrediction.ticker IS NOT NULL OR MarketPredictionMonteCarlo.ticker IS NOT NULL`.
+    Every markov_*/mcmc_* filter pair (exit_price_confidence, history_days,
     state_confidence, expected_return, predicted_states, plus mcmc's own
-    p10_return_pct) combines as OR across the two prediction sources, not AND: a row
-    included via its Markov prediction still shows its Monte Carlo columns even if
-    that MCMC row wouldn't itself have passed the mcmc-side filters (the join already
-    pulled those columns in, unconditionally), and vice versa - same semantics the
-    original two exit_price_confidence filters already had.
+    p10_return_pct) is then AND'd onto that directly as an independent global condition,
+    not split per-side and OR'd together: setting markov_expected_return_op filters on
+    Markov's expected_return regardless of what MCMC's row looks like, and vice versa. A
+    ticker missing the relevant side's row for this date has that column as NULL, and any
+    op comparison against NULL is false, so a set filter naturally excludes tickers that
+    don't have a satisfying value on that side rather than passing them through via the
+    other side.
 
     `average_volume_op`/`market_cap_op`/`validation_score_op`/`survivor_score_op` (each
     paired with `..._value`) and `require_consensus` are different: they're global
@@ -1579,50 +1579,62 @@ def market_predictions_report(
             MarketPredictionMonteCarlo.predicted_date == parsed_predicted_date
         )
 
-        markov_condition = MarketPrediction.ticker.isnot(None)
+        # A ticker only needs a prediction from *either* source to appear at all - this
+        # presence check is deliberately separate from (and unaffected by) the markov_*/
+        # mcmc_* filters below, which are now independent global AND conditions rather
+        # than being split per-side and OR'd together. Previously each markov_*/mcmc_*
+        # filter only gated its own side of a `markov_condition | mcmc_condition` OR, so
+        # e.g. setting only markov_expected_return_op let any ticker with an MCMC row in
+        # regardless of its Markov expected_return (and vice versa) - a row could be
+        # admitted via one side while displaying an unfiltered, filter-failing value from
+        # the other. Every filter below now applies directly to its column: unset filters
+        # are simply not added (equivalent to `... IS NULL OR column op value`, but
+        # skipping the clause entirely reads clearer than spelling out the null-check),
+        # and a set filter always constrains that column - if the relevant prediction row
+        # doesn't exist, the column is NULL and any op comparison against it is false,
+        # which correctly excludes the ticker rather than vacuously passing.
+        inclusion_condition = MarketPrediction.ticker.isnot(None) | MarketPredictionMonteCarlo.ticker.isnot(None)
         if markov_exit_price_confidence_op:
-            markov_condition = markov_condition & _numeric_condition_clause(
+            inclusion_condition = inclusion_condition & _numeric_condition_clause(
                 MarketPrediction.exit_price_confidence, markov_exit_price_confidence_op, markov_exit_price_confidence_value
             )
         if markov_history_days_op:
-            markov_condition = markov_condition & _numeric_condition_clause(
+            inclusion_condition = inclusion_condition & _numeric_condition_clause(
                 MarketPrediction.history_days, markov_history_days_op, markov_history_days_value
             )
         if markov_state_confidence_op:
-            markov_condition = markov_condition & _numeric_condition_clause(
+            inclusion_condition = inclusion_condition & _numeric_condition_clause(
                 MarketPrediction.state_confidence, markov_state_confidence_op, markov_state_confidence_value
             )
         if markov_expected_return_op:
-            markov_condition = markov_condition & _numeric_condition_clause(
+            inclusion_condition = inclusion_condition & _numeric_condition_clause(
                 MarketPrediction.expected_return, markov_expected_return_op, markov_expected_return_value
             )
         if markov_states:
-            markov_condition = markov_condition & MarketPrediction.predicted_state.in_(markov_states)
+            inclusion_condition = inclusion_condition & MarketPrediction.predicted_state.in_(markov_states)
 
-        mcmc_condition = MarketPredictionMonteCarlo.ticker.isnot(None)
         if mcmc_exit_price_confidence_op:
-            mcmc_condition = mcmc_condition & _numeric_condition_clause(
+            inclusion_condition = inclusion_condition & _numeric_condition_clause(
                 MarketPredictionMonteCarlo.exit_price_confidence, mcmc_exit_price_confidence_op, mcmc_exit_price_confidence_value
             )
         if mcmc_history_days_op:
-            mcmc_condition = mcmc_condition & _numeric_condition_clause(
+            inclusion_condition = inclusion_condition & _numeric_condition_clause(
                 MarketPredictionMonteCarlo.history_days, mcmc_history_days_op, mcmc_history_days_value
             )
         if mcmc_state_confidence_op:
-            mcmc_condition = mcmc_condition & _numeric_condition_clause(
+            inclusion_condition = inclusion_condition & _numeric_condition_clause(
                 MarketPredictionMonteCarlo.state_confidence, mcmc_state_confidence_op, mcmc_state_confidence_value
             )
         if mcmc_expected_return_op:
-            mcmc_condition = mcmc_condition & _numeric_condition_clause(
+            inclusion_condition = inclusion_condition & _numeric_condition_clause(
                 MarketPredictionMonteCarlo.expected_return, mcmc_expected_return_op, mcmc_expected_return_value
             )
         if mcmc_states:
-            mcmc_condition = mcmc_condition & MarketPredictionMonteCarlo.predicted_state.in_(mcmc_states)
+            inclusion_condition = inclusion_condition & MarketPredictionMonteCarlo.predicted_state.in_(mcmc_states)
         if mcmc_p10_return_pct_op:
-            mcmc_condition = mcmc_condition & _numeric_condition_clause(
+            inclusion_condition = inclusion_condition & _numeric_condition_clause(
                 MCMC_P10_RETURN_PCT_EXPR, mcmc_p10_return_pct_op, mcmc_p10_return_pct_value
             )
-        inclusion_condition = markov_condition | mcmc_condition
 
         # Latest AverageVolume row per ticker - same "max computed_at" subquery+join
         # pattern trading_symbols_report/this report's own predecessor used page-scoped,

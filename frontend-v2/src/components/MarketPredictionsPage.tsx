@@ -166,6 +166,8 @@ const COLUMNS: ReportColumn<MarketPredictionRow>[] = [
   { key: 'mcmc_state_confidence', label: 'MCMC State Confidence' },
   { key: 'markov_expected_return', label: 'Markov Expected Return' },
   { key: 'mcmc_expected_return', label: 'MCMC Expected Return' },
+  { key: 'markov_expected_return_pct', label: 'Markov Expected Return %' },
+  { key: 'mcmc_expected_return_pct', label: 'MCMC Expected Return %' },
   { key: 'markov_entry_price', label: 'Markov Entry Price' },
   { key: 'mcmc_entry_price', label: 'MCMC Entry Price' },
   { key: 'markov_exit_price', label: 'Markov Exit Price' },
@@ -195,11 +197,19 @@ const COLUMNS: ReportColumn<MarketPredictionRow>[] = [
 // TradingSymbolsPage's predicted_date.
 const TIMESTAMP_FIELDS = new Set<keyof MarketPredictionRow>(['markov_computed_at', 'mcmc_computed_at'])
 
+// markov_expected_return_pct/mcmc_expected_return_pct are already *100 (see api.ts's
+// withExpectedReturnPct) - this just appends the "%" formatCell's generic number
+// branch below doesn't know to add.
+const PCT_FIELDS = new Set<keyof MarketPredictionRow>(['markov_expected_return_pct', 'mcmc_expected_return_pct'])
+
 function formatCell(row: MarketPredictionRow, key: keyof MarketPredictionRow): string {
   const value = row[key]
   if (value == null) return '–'
   if (TIMESTAMP_FIELDS.has(key)) return new Date(`${value}Z`).toLocaleString()
-  if (typeof value === 'number') return value.toLocaleString(undefined, { maximumFractionDigits: 4 })
+  if (typeof value === 'number') {
+    const formatted = value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    return PCT_FIELDS.has(key) ? `${formatted}%` : formatted
+  }
   return String(value)
 }
 
@@ -223,12 +233,12 @@ export function MarketPredictionsPage() {
   const [tickers, setTickers] = useState<string[]>(() => loadSavedParams()?.tickers ?? [])
   const [orderBy, setOrderBy] = useState<MarketPredictionOrderField[]>(() => loadSavedParams()?.orderBy ?? [])
   // Filters which markov_/mcmc_ prediction rows can qualify a ticker for inclusion -
-  // markov_*/mcmc_* filters below combine as OR across the two sources, not AND (see
-  // app/main.py's market_predictions_report docstring) - each only gates its own
-  // side, so a ticker failing a Markov filter still appears (with its Markov data
-  // shown regardless) if its MCMC prediction passes the MCMC filters, and vice versa.
-  // averageVolume/marketCap/validationScore/survivorScore and requireConsensus are
-  // global AND filters instead, not tied to either side (see the same docstring).
+  // markov_*/mcmc_* filters below each apply directly to their own column as an
+  // independent global AND condition (see app/main.py's market_predictions_report
+  // docstring), same as averageVolume/marketCap/validationScore/survivorScore and
+  // requireConsensus. A ticker only needs a prediction from either source to appear
+  // at all; a set filter then excludes tickers that don't have a satisfying value on
+  // that side, rather than letting them through via the other side.
   const markovExitPriceConfidence = useNumericFilterField(
     loadSavedParams()?.markovExitPriceConfidenceOp ?? '',
     loadSavedParams()?.markovExitPriceConfidenceValue ?? '',

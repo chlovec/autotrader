@@ -456,6 +456,9 @@ export interface MarketPredictionRow {
   markov_predicted_state: string | null
   markov_state_confidence: number | null
   markov_expected_return: number | null
+  // markov_expected_return * 100 - derived client-side (see withExpectedReturnPct
+  // below), same reasoning as abs_expected_return_pct on the other reports.
+  markov_expected_return_pct: number | null
   markov_entry_price: number | null
   markov_exit_price: number | null
   markov_exit_price_confidence: number | null
@@ -467,6 +470,8 @@ export interface MarketPredictionRow {
   mcmc_predicted_state: string | null
   mcmc_state_confidence: number | null
   mcmc_expected_return: number | null
+  // mcmc_expected_return * 100 - see markov_expected_return_pct above.
+  mcmc_expected_return_pct: number | null
   mcmc_entry_price: number | null
   mcmc_exit_price: number | null
   mcmc_exit_price_mean: number | null
@@ -504,9 +509,9 @@ export interface MarketPredictionOrderField {
 // report alone has a dozen-odd independent filters; a positional signature that long
 // would be unreadable at the call site and error-prone to reorder. Every filter here
 // maps 1:1 to one of app/main.py's market_predictions_report query params - see that
-// function's docstring for what each one does and how markov_/mcmc_ filters combine
-// (OR, each gating only its own side) vs. the global ones (average volume/market cap/
-// validation/survivor score, require consensus - all AND'd on top).
+// function's docstring for what each one does. markov_/mcmc_ filters and the global
+// ones (average volume/market cap/validation/survivor score, require consensus) all
+// AND together the same way - each filter constrains only its own column.
 export interface MarketPredictionsReportParams {
   predictedDate: string
   tickerTypes?: string[]
@@ -569,6 +574,17 @@ function withAbsExpectedReturnPct<T extends { expected_return: number | null }>(
   return {
     ...row,
     abs_expected_return_pct: row.expected_return == null ? null : Math.abs(row.expected_return) * 100,
+  }
+}
+
+// Fills in markov_expected_return_pct/mcmc_expected_return_pct on a market-predictions
+// report row - same *100 derivation as withAbsExpectedReturnPct above, just unsigned
+// and doubled up for the two prediction sources.
+function withExpectedReturnPct(row: MarketPredictionRow): MarketPredictionRow {
+  return {
+    ...row,
+    markov_expected_return_pct: row.markov_expected_return == null ? null : row.markov_expected_return * 100,
+    mcmc_expected_return_pct: row.mcmc_expected_return == null ? null : row.mcmc_expected_return * 100,
   }
 }
 
@@ -697,7 +713,10 @@ export const api = {
     if (markovPredictedStates.length) qs.set('markov_predicted_states', markovPredictedStates.join(','))
     if (mcmcPredictedStates.length) qs.set('mcmc_predicted_states', mcmcPredictedStates.join(','))
     if (requireConsensus) qs.set('require_consensus', 'true')
-    return getJSON<MarketPredictionsReport>(`/reports/market-predictions?${qs.toString()}`)
+    return getJSON<MarketPredictionsReport>(`/reports/market-predictions?${qs.toString()}`).then((data) => ({
+      ...data,
+      rows: data.rows.map(withExpectedReturnPct),
+    }))
   },
   staleTickersReport: (
     tickerTypes: string[] = [],
