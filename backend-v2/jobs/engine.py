@@ -44,12 +44,15 @@ from jobs.registry import (
     NEWS_JOB,
     PREDICT_10_DAY_MARKET_STATE_JOB,
     PREDICT_MARKET_STATE_JOB,
+    RESEARCH_PICKS_JOB,
     SNAPSHOTS_JOB,
     TICKER_DETAILS_JOB,
     TICKER_TYPES_JOB,
     TICKERS_JOB,
     UNIFIED_SNAPSHOT_JOB,
+    WIN_RATE_JOB,
 )
+from jobs.research_picks import compute_research_picks
 from jobs.sync_bars import (
     DEFAULT_BACKFILL_DAYS,
     DEFAULT_END_DATE_OFFSET_DAYS,
@@ -65,6 +68,7 @@ from jobs.sync_ticker_types import sync_ticker_types
 from jobs.sync_tickers import sync_tickers
 from jobs.sync_top_movers import sync_top_movers
 from jobs.sync_unified_snapshot import sync_unified_snapshot
+from jobs.win_rates import compute_win_rates
 
 logger = logging.getLogger("backend_v2.jobs.engine")
 
@@ -248,6 +252,22 @@ async def run_job(job_name: str, trigger: str) -> None:
                 control=control,
             )
             summary = f"{count} ticker(s) 10-day market state predicted"
+        elif job_name == WIN_RATE_JOB:
+            # Same reasoning as the average-volume/backtest branches above - purely
+            # local, off the event loop via asyncio.to_thread.
+            count = await asyncio.to_thread(
+                compute_win_rates,
+                session,
+                split_csv(config.ticker_types),
+                split_csv(config.tickers),
+                control=control,
+            )
+            summary = f"{count} ticker(s) win rate computed"
+        elif job_name == RESEARCH_PICKS_JOB:
+            # Same reasoning as the win-rate/average-volume branches above - purely
+            # local, off the event loop via asyncio.to_thread.
+            count = await asyncio.to_thread(compute_research_picks, session, run_id, control=control)
+            summary = f"{count} research pick(s) selected"
         elif job_name == BACKTEST_MARKET_STATE_JOB:
             # Same reasoning as the average-volume/predict-market-state branches above -
             # purely local, off the event loop via asyncio.to_thread.

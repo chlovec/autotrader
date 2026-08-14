@@ -1001,6 +1001,29 @@ body {
   gap: 12px;
 }
 
+/* Toggles .report-controls-fields visibility - same ChevronIcon/rotation convention as
+   JobCard's .job-collapse-button, just with a text label since this button isn't
+   paired with an adjacent title the way each job card's is. */
+.report-filters-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  align-self: flex-start;
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.report-filters-toggle .icon {
+  width: 14px;
+  height: 14px;
+  transition: transform 0.15s ease;
+}
+
 .report-ticker-type-field {
   min-width: 280px;
   max-width: 480px;
@@ -1048,6 +1071,29 @@ body {
 .report-order-by-field {
   min-width: 260px;
   max-width: 420px;
+}
+
+/* Market Prediction Performance's filter row: this report has more fields than the
+   others (MarketPredictionsPerformancePage.tsx), so it lays out 2 per row instead of
+   the single wrapped row .report-controls-fields gives every other report page. Scoped
+   to this page rather than changed on the shared class. */
+.market-predictions-performance-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: end;
+}
+
+.market-predictions-performance-fields .report-ticker-type-field,
+.market-predictions-performance-fields .report-page-size-field,
+.market-predictions-performance-fields .report-numeric-filter-field,
+.market-predictions-performance-fields .report-order-by-field {
+  width: 100%;
+  max-width: none;
+  min-width: 0;
+}
+
+.market-predictions-performance-fields .report-order-by-field {
+  grid-column: 1 / -1;
 }
 
 /* Order-by picker (Trading Symbols report) - a priority-ordered list of fields the

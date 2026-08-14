@@ -60,6 +60,8 @@ def init_db() -> None:
     _add_job_runs_control_columns()
     _add_market_predictions_mcmc_columns()
     _add_market_predictions_exit_price_confidence_column()
+    _add_ohlc_bars_pcnt_increase_column()
+    _convert_ohlc_bars_pcnt_increase_generated_column()
     _drop_ticker_bar_sync_state_table()
 
 
@@ -157,6 +159,54 @@ def _add_market_predictions_exit_price_confidence_column() -> None:
     get NULL until their next run recomputes it, same reasoning as
     _add_market_predictions_mcmc_columns above."""
     _add_column_if_missing("market_predictions", "exit_price_confidence", "FLOAT")
+
+
+def _add_ohlc_bars_pcnt_increase_column() -> None:
+    """pcnt_increase (see db/models.py's OhlcBar) is a plain column populated by
+    jobs/sync_bars.py's _upsert_bar on every write, not a DB-level generated one - so a
+    database from before this column existed needs both the ALTER TABLE (same as every
+    other _add_*_column helper here) and a one-time backfill of existing rows, which
+    would otherwise sit at NULL forever until each row's next sync happens to touch it
+    again. The backfill uses the same formula _upsert_bar computes in Python, run once
+    directly in SQL so it doesn't have to load every row into memory."""
+    inspector = inspect(engine)
+    if "ohlc_bars" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("ohlc_bars")}
+    if "pcnt_increase" in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE ohlc_bars ADD COLUMN pcnt_increase FLOAT"))
+        conn.execute(
+            text(
+                'UPDATE ohlc_bars SET pcnt_increase = '
+                'CASE WHEN "open" IS NULL OR "close" IS NULL OR "open" = 0 THEN NULL '
+                'ELSE ("close" - "open") / "open" * 100 END'
+            )
+        )
+
+
+def _convert_ohlc_bars_pcnt_increase_generated_column() -> None:
+    """Some databases created pcnt_increase as a SQLite GENERATED ALWAYS AS (...)
+    VIRTUAL column, which SQLite refuses to UPDATE/INSERT directly - that no longer
+    matches db/models.py's OhlcBar.pcnt_increase, a plain column meant to be writable
+    (see jobs/sync_bars.py's _upsert_bar). SQLite has no ALTER TABLE that turns a
+    generated column into a plain one in place, so this adds a plain pcnt_gain column,
+    copies over each row's already-computed value, drops the old generated column, and
+    renames pcnt_gain back to pcnt_increase - same values, now directly writable."""
+    inspector = inspect(engine)
+    if "ohlc_bars" not in inspector.get_table_names():
+        return
+    with engine.begin() as conn:
+        create_sql = conn.execute(
+            text("SELECT sql FROM sqlite_master WHERE type='table' AND name='ohlc_bars'")
+        ).scalar_one()
+        if "GENERATED" not in create_sql:
+            return
+        conn.execute(text("ALTER TABLE ohlc_bars ADD COLUMN pcnt_gain FLOAT"))
+        conn.execute(text("UPDATE ohlc_bars SET pcnt_gain = pcnt_increase"))
+        conn.execute(text("ALTER TABLE ohlc_bars DROP COLUMN pcnt_increase"))
+        conn.execute(text("ALTER TABLE ohlc_bars RENAME COLUMN pcnt_gain TO pcnt_increase"))
 
 
 def _drop_ticker_bar_sync_state_table() -> None:

@@ -12,6 +12,7 @@ directly) - see db/session.py's WAL-mode comment for why that stopped being viab
 """
 
 import datetime as dt
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -20,7 +21,7 @@ from typing import Any, Literal
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import Float, case, cast, delete, func, or_, select, update
+from sqlalchemy import Float, case, cast, delete, func, or_, select, text, update
 from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.orm import Session
 
@@ -36,6 +37,7 @@ from db.models import (
     MarketPredictionMonteCarlo,
     News,
     OhlcBar,
+    ResearchPick,
     SyncProgress,
     SyncState,
     TechnicalIndicator,
@@ -44,6 +46,7 @@ from db.models import (
     TickerType,
     TopMarketMover,
     UnifiedSnapshot,
+    WinRate,
 )
 from db.session import SessionLocal, init_db
 from jobs.config_store import get_or_create_config, interval_trigger, job_is_active, split_csv
@@ -58,6 +61,7 @@ from jobs.registry import (
     NEWS_JOB,
     PREDICT_10_DAY_MARKET_STATE_JOB,
     PREDICT_MARKET_STATE_JOB,
+    RESEARCH_PICKS_JOB,
     SNAPSHOT_TYPE_OPTIONS,
     SNAPSHOTS_JOB,
     START_TIME_OPTIONS,
@@ -65,6 +69,7 @@ from jobs.registry import (
     TICKER_TYPES_JOB,
     TICKERS_JOB,
     UNIFIED_SNAPSHOT_JOB,
+    WIN_RATE_JOB,
 )
 from jobs.sync_bars import DEFAULT_MULTIPLIER, DEFAULT_TIMESPAN
 
@@ -215,6 +220,8 @@ _RESET_TABLES: dict[str, list[type[Base]]] = {
     PREDICT_MARKET_STATE_JOB: [MarketPrediction, MarketPredictionMonteCarlo],
     PREDICT_10_DAY_MARKET_STATE_JOB: [MarketPrediction10Day],
     BACKTEST_MARKET_STATE_JOB: [MarketPredictionBacktest],
+    WIN_RATE_JOB: [WinRate],
+    RESEARCH_PICKS_JOB: [ResearchPick],
 }
 
 # job name -> the SyncState/SyncProgress job_name key it syncs incrementally under
@@ -1729,6 +1736,368 @@ def market_predictions_report(
             for ticker in page_tickers
         ]
         return {"rows": rows, "total": total, "page": page, "page_size": page_size}
+
+
+# Copied verbatim from temp_queries/market_prediction_performance.sql (see
+# market_predictions_performance_report) - not reassembled through the ORM the way
+# every other report in this file is, so the query stays exactly what was authored and
+# validated there. No trailing semicolon: it's used as a subquery below, which a
+# trailing semicolon would break.
+MARKET_PREDICTIONS_PERFORMANCE_SQL = """
+SELECT
+	a.ticker,
+	a.name,
+	a.market,
+	a.locale,
+	a.type,
+	b.description,
+	a.active,
+	a.currency_name,
+	a.primary_exchange,
+	g.market_cap,
+	h.average_volume,
+	c.predicted_date,
+	c.current_state as markov_current_state,
+	c.predicted_state as markov_predicted_state,
+	c.state_confidence as markov_state_confidence,
+	c.expected_return as markov_expected_return,
+	c.entry_price as markov_entry_price,
+	c.exit_price as markov_exit_price,
+	c.history_days as markov_history_days,
+	c.exit_price_confidence as markov_exit_price_confidence,
+	d.current_state as mcmc_current_state,
+	d.state_confidence as mcmc_state_confidence,
+	d.expected_return as mcmc_expected_return,
+	d.entry_price as mcmc_entry_price,
+	d.exit_price as mcmc_exit_price,
+	d.history_days as mcmc_history_days,
+	d.exit_price_confidence as mcmc_exit_price_confidence,
+	e.open as actual_entry_price,
+	e.close as actual_exit_price,
+	e.pcnt_increase as actual_gain,
+	CASE
+		WHEN e.pcnt_increase IS NULL THEN NULL
+		WHEN e.pcnt_increase <= 0  AND c.expected_return <= 0 THEN 'WON'
+		WHEN e.pcnt_increase >= 0  AND c.expected_return >= 0 THEN 'WIN'
+		ELSE 'FAILED'
+	END as markov_result,
+	CASE
+		WHEN e.pcnt_increase IS NULL THEN NULL
+		WHEN e.pcnt_increase <= 0  AND d.expected_return <= 0 THEN 'WON'
+		WHEN e.pcnt_increase >= 0  AND d.expected_return >= 0 THEN 'WIN'
+		ELSE 'FAILED'
+	END as mcmc_result,
+	f.mcmc_win_count,
+	f.mcmc_win_rate,
+	f.mcmc_predictions_count,
+	f.markov_win_count,
+	f.markov_win_rate,
+	f.markov_predictions_count
+FROM tickers a
+JOIN ticker_types b
+	on a.type = b.code
+JOIN market_predictions c
+	on a.ticker = c.ticker
+LEFT JOIN market_predictions_mcmc d
+	on c.ticker = d.ticker and c.predicted_date = d.predicted_date
+LEFT OUTER JOIN ohlc_bars e
+	on c.ticker = e.ticker and c.ticker = e.ticker and c.predicted_date = date(e.timestamp)
+LEFT OUTER JOIN win_rates f
+	on a.ticker = f.ticker
+LEFT OUTER JOIN ticker_details g
+	on a.ticker = g.ticker
+LEFT OUTER JOIN (
+	SELECT av.ticker, av.average_volume
+	FROM average_volumes av
+	JOIN (
+		SELECT ticker, MAX(computed_at) as computed_at
+		FROM average_volumes
+		GROUP BY ticker
+	) latest
+		on av.ticker = latest.ticker and av.computed_at = latest.computed_at
+) h
+	on a.ticker = h.ticker
+WHERE c.predicted_date BETWEEN :start_date AND :end_date
+	AND (:types IS NULL OR a.type IN (SELECT value FROM json_each(:types)))
+	AND (:tickers IS NULL OR a.ticker IN (SELECT value FROM json_each(:tickers)))
+"""
+
+MARKET_PREDICTIONS_PERFORMANCE_MAX_PAGE_SIZE = 1000
+MARKET_PREDICTIONS_PERFORMANCE_DEFAULT_PAGE_SIZE = 500
+
+# Every column MARKET_PREDICTIONS_PERFORMANCE_SQL's SELECT produces (by its alias) -
+# what market_predictions_performance_report's order_by accepts. Doubles as the
+# allowlist that keeps order_by from being a SQL injection vector into the raw ORDER BY
+# clause built below, since (unlike every other report's order_by, which resolves a
+# field name to a SQLAlchemy ColumnElement) there's no query-builder step here to
+# escape a field name for us.
+MARKET_PREDICTIONS_PERFORMANCE_ORDERABLE_FIELDS = frozenset(
+    {
+        "ticker",
+        "name",
+        "market",
+        "locale",
+        "type",
+        "description",
+        "active",
+        "currency_name",
+        "primary_exchange",
+        "market_cap",
+        "average_volume",
+        "predicted_date",
+        "markov_current_state",
+        "markov_predicted_state",
+        "markov_state_confidence",
+        "markov_expected_return",
+        "markov_entry_price",
+        "markov_exit_price",
+        "markov_history_days",
+        "markov_exit_price_confidence",
+        "mcmc_current_state",
+        "mcmc_state_confidence",
+        "mcmc_expected_return",
+        "mcmc_entry_price",
+        "mcmc_exit_price",
+        "mcmc_history_days",
+        "mcmc_exit_price_confidence",
+        "actual_entry_price",
+        "actual_exit_price",
+        "actual_gain",
+        "markov_result",
+        "mcmc_result",
+        "mcmc_win_count",
+        "mcmc_win_rate",
+        "mcmc_predictions_count",
+        "markov_win_count",
+        "markov_win_rate",
+        "markov_predictions_count",
+    }
+)
+
+
+def _parse_market_predictions_performance_order_by(order_by: str) -> list[tuple[str, str]]:
+    """Same shape as _parse_order_by, validated against
+    MARKET_PREDICTIONS_PERFORMANCE_ORDERABLE_FIELDS instead."""
+    fields: list[tuple[str, str]] = []
+    for entry in split_csv(order_by) or []:
+        field, _, direction = entry.partition(":")
+        direction = direction.lower() or "asc"
+        if field not in MARKET_PREDICTIONS_PERFORMANCE_ORDERABLE_FIELDS:
+            raise HTTPException(422, f"Unknown order_by field: {field}")
+        if direction not in ("asc", "desc"):
+            raise HTTPException(422, f"Unknown order_by direction: {direction}")
+        fields.append((field, direction))
+    return fields
+
+
+@app.get("/reports/market-predictions-performance")
+def market_predictions_performance_report(
+    start_date: str = "",
+    end_date: str = "",
+    ticker_types: str = "",
+    tickers: str = "",
+    page: int = 1,
+    page_size: int = MARKET_PREDICTIONS_PERFORMANCE_DEFAULT_PAGE_SIZE,
+    order_by: str = "",
+    market_cap_op: str = "",
+    market_cap_value: float | None = None,
+    markov_exit_price_confidence_op: str = "",
+    markov_exit_price_confidence_value: float | None = None,
+    mcmc_exit_price_confidence_op: str = "",
+    mcmc_exit_price_confidence_value: float | None = None,
+    markov_win_rate_op: str = "",
+    markov_win_rate_value: float | None = None,
+    mcmc_win_rate_op: str = "",
+    mcmc_win_rate_value: float | None = None,
+) -> dict[str, Any]:
+    """Backs the Analytics > Market Prediction Performance page's report grid: runs
+    MARKET_PREDICTIONS_PERFORMANCE_SQL (temp_queries/market_prediction_performance.sql,
+    unmodified apart from the outer market_cap filter below) directly rather than
+    reassembling it through the ORM - one row per (ticker, predicted_date) with a
+    market_predictions row in [start_date, end_date], each ticker's type description,
+    its paired market_predictions_mcmc row (if any), the ohlc_bars row realized on
+    predicted_date (if synced yet, which is what markov_result/mcmc_result score the
+    prediction against), win_rates' ticker-level running tallies, ticker_details'
+    market_cap, and average_volumes' most recently computed average_volume (same
+    latest-row-per-ticker join as market_predictions_report's average_volume_by_ticker).
+
+    `start_date`/`end_date` (ISO dates) each independently default to today (UTC) when
+    omitted, so a bare request ("today's performance") is the common case, not an
+    error, rather than requiring both or neither.
+
+    `ticker_types`/`tickers` (comma-separated, e.g. "CS,ETF" / "AAPL,MSFT") bind to the
+    SQL's :types/:tickers params as JSON arrays - what its own json_each(...) clauses
+    expect - or NULL (matching every type/ticker) when left blank. Same
+    comma-separated-list-or-everything convention every other report in this file uses,
+    just serialized differently to match what the raw SQL parses.
+
+    `market_cap_op`/`market_cap_value`, `markov_exit_price_confidence_op`/`_value`,
+    `mcmc_exit_price_confidence_op`/`_value`, `markov_win_rate_op`/`_value`, and
+    `mcmc_win_rate_op`/`_value` are the same shape as trading_symbols_report's - each
+    pair both or neither, op restricted to NUMERIC_FILTER_OPS. Unlike start_date/
+    end_date/types/tickers, these aren't baked into MARKET_PREDICTIONS_PERFORMANCE_SQL
+    itself (that query stays exactly what was authored and validated in the .sql file);
+    instead each active filter contributes a `column {op} :value` condition, ANDed
+    together into a single WHERE on the outer wrapper query, op safe to interpolate
+    directly since it's validated against the fixed NUMERIC_FILTER_OPS allowlist first -
+    same reasoning as order_by's field/direction interpolation below. A row with a NULL
+    value for a filtered column (e.g. market_cap with no ticker_details row, or
+    mcmc_exit_price_confidence with no market_predictions_mcmc row) is excluded whenever
+    that filter is active, same as any other NULL loses a numeric comparison.
+
+    Paginated/ordered around the query rather than baked into it, so the query text
+    itself stays untouched: `order_by` (see MARKET_PREDICTIONS_PERFORMANCE_ORDERABLE_FIELDS)
+    and LIMIT/OFFSET wrap it in an outer `SELECT * FROM (<query>) ORDER BY ... LIMIT ...
+    OFFSET ...`, and `total` comes from `SELECT COUNT(*) FROM (<query>)` over the same
+    unmodified inner query. Defaults to ticker ascending, always appended as a
+    tiebreaker - same reasoning as trading_symbols_report."""
+    today = dt.datetime.now(dt.timezone.utc).date().isoformat()
+    parsed_start = start_date or today
+    parsed_end = end_date or today
+    try:
+        dt.date.fromisoformat(parsed_start)
+    except ValueError as exc:
+        raise HTTPException(422, "start_date must be an ISO date, e.g. '2026-08-12'") from exc
+    try:
+        dt.date.fromisoformat(parsed_end)
+    except ValueError as exc:
+        raise HTTPException(422, "end_date must be an ISO date, e.g. '2026-08-12'") from exc
+    if parsed_start > parsed_end:
+        raise HTTPException(422, "start_date must not be after end_date")
+
+    types = split_csv(ticker_types)
+    selected_tickers = split_csv(tickers)
+    page = max(1, page)
+    page_size = max(1, min(page_size, MARKET_PREDICTIONS_PERFORMANCE_MAX_PAGE_SIZE))
+    order_fields = _parse_market_predictions_performance_order_by(order_by) or [("ticker", "asc")]
+    if "ticker" not in {field for field, _ in order_fields}:
+        order_fields = [*order_fields, ("ticker", "asc")]
+    order_clause = ", ".join(f"{field} {direction.upper()}" for field, direction in order_fields)
+
+    _validate_numeric_filter_pair(market_cap_op, market_cap_value, "market_cap")
+    _validate_numeric_filter_pair(
+        markov_exit_price_confidence_op, markov_exit_price_confidence_value, "markov_exit_price_confidence"
+    )
+    _validate_numeric_filter_pair(
+        mcmc_exit_price_confidence_op, mcmc_exit_price_confidence_value, "mcmc_exit_price_confidence"
+    )
+    _validate_numeric_filter_pair(markov_win_rate_op, markov_win_rate_value, "markov_win_rate")
+    _validate_numeric_filter_pair(mcmc_win_rate_op, mcmc_win_rate_value, "mcmc_win_rate")
+    numeric_filters = (
+        (market_cap_op, "market_cap", "market_cap_value"),
+        (markov_exit_price_confidence_op, "markov_exit_price_confidence", "markov_exit_price_confidence_value"),
+        (mcmc_exit_price_confidence_op, "mcmc_exit_price_confidence", "mcmc_exit_price_confidence_value"),
+        (markov_win_rate_op, "markov_win_rate", "markov_win_rate_value"),
+        (mcmc_win_rate_op, "mcmc_win_rate", "mcmc_win_rate_value"),
+    )
+    filter_conditions = [f"{column} {op} :{param}" for op, column, param in numeric_filters if op]
+    filter_clause = f"WHERE {' AND '.join(filter_conditions)}" if filter_conditions else ""
+
+    params = {
+        "start_date": parsed_start,
+        "end_date": parsed_end,
+        "types": json.dumps(types) if types else None,
+        "tickers": json.dumps(selected_tickers) if selected_tickers else None,
+        "market_cap_value": market_cap_value,
+        "markov_exit_price_confidence_value": markov_exit_price_confidence_value,
+        "mcmc_exit_price_confidence_value": mcmc_exit_price_confidence_value,
+        "markov_win_rate_value": markov_win_rate_value,
+        "mcmc_win_rate_value": mcmc_win_rate_value,
+    }
+    with SessionLocal() as session:
+        total = session.execute(
+            text(
+                f"SELECT COUNT(*) FROM ({MARKET_PREDICTIONS_PERFORMANCE_SQL}) AS performance "
+                f"{filter_clause}"
+            ),
+            params,
+        ).scalar_one()
+        page_rows = (
+            session.execute(
+                text(
+                    f"SELECT * FROM ({MARKET_PREDICTIONS_PERFORMANCE_SQL}) AS performance "
+                    f"{filter_clause} "
+                    f"ORDER BY {order_clause} LIMIT :limit OFFSET :offset"
+                ),
+                {**params, "limit": page_size, "offset": (page - 1) * page_size},
+            )
+            .mappings()
+            .all()
+        )
+        return {"rows": [dict(row) for row in page_rows], "total": total, "page": page, "page_size": page_size}
+
+
+def _research_pick_to_dict(pick: ResearchPick, ticker: Ticker) -> dict[str, Any]:
+    return {
+        "ticker": pick.ticker,
+        "name": ticker.name,
+        "rank": pick.rank,
+        "predicted_date": pick.predicted_date.isoformat(),
+        "predicted_direction": pick.predicted_direction,
+        "score": pick.score,
+        "expected_return_score": pick.expected_return_score,
+        "confidence_score": pick.confidence_score,
+        "win_rate_score": pick.win_rate_score,
+        "backtest_score": pick.backtest_score,
+        "rsi_adjustment": pick.rsi_adjustment,
+        "news_adjustment": pick.news_adjustment,
+        "markov_predicted_state": pick.markov_predicted_state,
+        "markov_expected_return": pick.markov_expected_return,
+        "markov_state_confidence": pick.markov_state_confidence,
+        "mcmc_predicted_state": pick.mcmc_predicted_state,
+        "mcmc_expected_return": pick.mcmc_expected_return,
+        "mcmc_state_confidence": pick.mcmc_state_confidence,
+        "market_cap": pick.market_cap,
+        "average_volume": pick.average_volume,
+        "markov_win_rate": pick.markov_win_rate,
+        "markov_predictions_count": pick.markov_predictions_count,
+        "mcmc_win_rate": pick.mcmc_win_rate,
+        "mcmc_predictions_count": pick.mcmc_predictions_count,
+        "backtest_win_rate": pick.backtest_win_rate,
+        "backtest_evaluated_count": pick.backtest_evaluated_count,
+        "rsi_value": pick.rsi_value,
+        "news_article_count": pick.news_article_count,
+        "news_sentiment_lean": pick.news_sentiment_lean,
+        "comment": pick.comment,
+    }
+
+
+@app.get("/reports/research-picks")
+def research_picks_report(run_id: int | None = None) -> dict[str, Any]:
+    """Backs the Research page: one run's ResearchPick rows (jobs/research_picks.py's
+    compute_research_picks), ordered by rank. Omitting run_id resolves to the most
+    recent completed research-picks JobRun that actually produced picks (a completed
+    run that found zero qualifying candidates is skipped, not shown as an empty
+    "latest" run), so a bare request always shows the latest real shortlist without the
+    frontend having to look up a run id first - same "resolve at request time" pattern
+    other reports in this file use for dates. Returns run_id/generated_at alongside
+    rows so the page can show which run it's displaying even when run_id wasn't passed
+    explicitly, and {"run_id": None, ...} with empty rows if no run has ever produced
+    picks yet (e.g. predict-market-state hasn't run yet either)."""
+    with SessionLocal() as session:
+        resolved_run_id = run_id
+        if resolved_run_id is None:
+            resolved_run_id = session.execute(
+                select(JobRun.id)
+                .join(ResearchPick, ResearchPick.run_id == JobRun.id)
+                .where(JobRun.job_name == RESEARCH_PICKS_JOB, JobRun.status == "completed")
+                .order_by(JobRun.started_at.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+        if resolved_run_id is None:
+            return {"run_id": None, "generated_at": None, "rows": []}
+        run = session.get(JobRun, resolved_run_id)
+        pick_rows = session.execute(
+            select(ResearchPick, Ticker)
+            .join(Ticker, Ticker.ticker == ResearchPick.ticker)
+            .where(ResearchPick.run_id == resolved_run_id)
+            .order_by(ResearchPick.rank.asc())
+        ).all()
+        return {
+            "run_id": resolved_run_id,
+            "generated_at": run.finished_at.isoformat() if run and run.finished_at else None,
+            "rows": [_research_pick_to_dict(pick, ticker) for pick, ticker in pick_rows],
+        }
 
 
 @app.get("/jobs")

@@ -100,6 +100,16 @@ class OhlcBar(Base):
     vwap: Mapped[float | None] = mapped_column(Float)
     transactions: Mapped[int | None] = mapped_column(Integer)
 
+    # Percent change from open to close, e.g. 1.5 for a 1.5% gain. Computed in Python
+    # and stored plainly (see jobs/sync_bars.py's _upsert_bar) rather than as a
+    # DB-level generated column, so a raw INSERT/UPDATE bypassing that helper wouldn't
+    # populate it - but every write to this table already goes through _upsert_bar,
+    # and a plain column keeps this ordinary rather than needing sqlite's generated-
+    # column support (which some tooling doesn't handle well) - see db/session.py's
+    # _add_ohlc_bars_pcnt_increase_column for the migration that adds it (and backfills
+    # existing rows) on a database created before this column existed.
+    pcnt_increase: Mapped[float | None] = mapped_column(Float)
+
 
 class CurrentSnapshot(Base):
     """One row per ticker's latest market snapshot from GET /v2/snapshot/locale/us/
@@ -620,6 +630,110 @@ class MarketPredictionMonteCarlo(Base):
     # same ticker/predicted_date.
     num_simulations: Mapped[int] = mapped_column(Integer)
     history_days: Mapped[int] = mapped_column(Integer)
+    computed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
+
+
+class WinRate(Base):
+    """One row per ticker, produced by jobs/win_rates.py's compute_win_rates. Purely
+    local - no massive.com call, reads market_predictions/market_predictions_mcmc
+    (predicted direction) joined against ohlc_bars.pcnt_increase (actual direction) for
+    every predicted_date whose outcome is already known.
+
+    A prediction "wins" (WON if both are <= 0, WIN if both are >= 0 - same two-label
+    split as jobs/win_rates.py's SQL, both meaning the predicted and actual direction
+    agreed) when its predicted_state's expected_return and the actual close-to-close
+    pcnt_increase on predicted_date are on the same side of zero; otherwise it's a
+    loss. *_predictions_count only counts predictions with a known actual outcome
+    (i.e. an ohlc_bars row already synced for predicted_date) - not every prediction
+    ever made for the ticker, some of which may still be pending. *_win_rate is
+    win_count / predictions_count, left NULL when predictions_count is 0 rather than
+    dividing by zero.
+
+    mcmc_result is scored against market_predictions_mcmc the same way markov_result is
+    scored against market_predictions - a ticker with a market_predictions row but no
+    matching market_predictions_mcmc row still counts toward mcmc_predictions_count (as
+    a loss), mirroring jobs/win_rates.py's SQL exactly rather than excluding it.
+
+    Upserted - a re-run overwrites the prior row for a ticker rather than accumulating
+    history, same semantics as AverageVolume."""
+
+    __tablename__ = "win_rates"
+
+    ticker: Mapped[str] = mapped_column(ForeignKey("tickers.ticker"), primary_key=True)
+    last_updated: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
+    mcmc_win_count: Mapped[int] = mapped_column(Integer)
+    mcmc_predictions_count: Mapped[int] = mapped_column(Integer)
+    mcmc_win_rate: Mapped[float | None] = mapped_column(Float)
+    markov_win_count: Mapped[int] = mapped_column(Integer)
+    markov_predictions_count: Mapped[int] = mapped_column(Integer)
+    markov_win_rate: Mapped[float | None] = mapped_column(Float)
+
+
+class ResearchPick(Base):
+    """One row per (job_runs.id, ticker) - one of jobs/research_picks.py's
+    compute_research_picks' up-to-20 selections for that run, screened and scored
+    purely from already-synced/computed local tables (market_predictions,
+    market_predictions_mcmc, win_rates, market_prediction_backtests, ticker_details,
+    average_volumes, technical_indicators, news) - no massive.com call, no v1 Alpaca
+    broker call, and no trade is placed or simulated. This is a research shortlist for
+    further human investigation, not an autonomous trading signal - see that module's
+    docstring.
+
+    Keyed by (run_id, ticker) rather than upserted by ticker alone: unlike WinRate/
+    AverageVolume (a single current snapshot per ticker), a human needs to compare
+    today's picks against a prior run's, so every run's selections accumulate as their
+    own rows rather than overwriting the last run's - same reasoning as
+    MarketPredictionBacktest accumulating one row per (ticker, evaluated_date) rather
+    than upserting. run_id ties each row back to the job_runs row that produced it, so
+    the dashboard can list distinct past runs and show one run's picks at a time.
+
+    rank is this ticker's 1-based position within its run (1 = highest score) - at most
+    20 rows share a run_id. score is the final composite score picks were ranked by;
+    the *_score/*_adjustment columns below are its components, persisted individually
+    so the results page can show a breakdown rather than just the final number. Every
+    win-rate/backtest/RSI/news field is nullable - each is an optional, neutral-when-
+    absent signal (see jobs/research_picks.py), not a required input."""
+
+    __tablename__ = "research_picks"
+
+    run_id: Mapped[int] = mapped_column(ForeignKey("job_runs.id"), primary_key=True)
+    ticker: Mapped[str] = mapped_column(ForeignKey("tickers.ticker"), primary_key=True)
+    rank: Mapped[int] = mapped_column(Integer)
+    predicted_date: Mapped[dt.date] = mapped_column(Date)
+    predicted_direction: Mapped[str] = mapped_column(String)
+    score: Mapped[float] = mapped_column(Float)
+
+    # Score breakdown - persisted individually for the results page's per-pick detail.
+    expected_return_score: Mapped[float] = mapped_column(Float)
+    confidence_score: Mapped[float] = mapped_column(Float)
+    win_rate_score: Mapped[float] = mapped_column(Float)
+    backtest_score: Mapped[float] = mapped_column(Float)
+    rsi_adjustment: Mapped[float] = mapped_column(Float)
+    news_adjustment: Mapped[float] = mapped_column(Float)
+
+    # Raw values behind the scores above, for display.
+    markov_predicted_state: Mapped[str] = mapped_column(String)
+    markov_expected_return: Mapped[float] = mapped_column(Float)
+    markov_state_confidence: Mapped[float] = mapped_column(Float)
+    mcmc_predicted_state: Mapped[str] = mapped_column(String)
+    mcmc_expected_return: Mapped[float] = mapped_column(Float)
+    mcmc_state_confidence: Mapped[float] = mapped_column(Float)
+    market_cap: Mapped[float] = mapped_column(Float)
+    average_volume: Mapped[float] = mapped_column(Float)
+    markov_win_rate: Mapped[float | None] = mapped_column(Float)
+    markov_predictions_count: Mapped[int | None] = mapped_column(Integer)
+    mcmc_win_rate: Mapped[float | None] = mapped_column(Float)
+    mcmc_predictions_count: Mapped[int | None] = mapped_column(Integer)
+    backtest_win_rate: Mapped[float | None] = mapped_column(Float)
+    backtest_evaluated_count: Mapped[int | None] = mapped_column(Integer)
+    rsi_value: Mapped[float | None] = mapped_column(Float)
+    news_article_count: Mapped[int | None] = mapped_column(Integer)
+    # Count of positive-sentiment articles minus negative-sentiment ones, among the
+    # ticker's matched articles within the lookback window - see
+    # jobs/research_picks.py's _news_signal.
+    news_sentiment_lean: Mapped[int | None] = mapped_column(Integer)
+
+    comment: Mapped[str] = mapped_column(String)
     computed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
 
 

@@ -537,6 +537,120 @@ export interface MarketPredictionsReportParams {
   survivorScoreFilter?: NumericFilter
 }
 
+// One row per (ticker, predicted_date) with a market_predictions row in the requested
+// date range, scored against what actually happened - backs the Analytics > Market
+// Prediction Performance report grid (see app/main.py's
+// market_predictions_performance_report, which runs temp_queries/
+// market_prediction_performance.sql unmodified). Unlike MarketPredictionRow (one row
+// per ticker, pinned to a single predicted_date the caller picks up front), this is
+// one row per ticker *per predicted_date* across the whole [start_date, end_date]
+// range, and every markov_result/mcmc_result/actual_* field is null until
+// ohlc_bars has synced predicted_date's actual outcome to score the prediction
+// against.
+export interface MarketPredictionPerformanceRow {
+  ticker: string
+  name: string | null
+  market: string | null
+  locale: string | null
+  type: string | null
+  description: string | null
+  active: boolean | null
+  currency_name: string | null
+  primary_exchange: string | null
+  market_cap: number | null
+  average_volume: number | null
+  predicted_date: string
+  markov_current_state: string | null
+  markov_predicted_state: string | null
+  markov_state_confidence: number | null
+  markov_expected_return: number | null
+  markov_entry_price: number | null
+  markov_exit_price: number | null
+  markov_history_days: number | null
+  markov_exit_price_confidence: number | null
+  mcmc_current_state: string | null
+  mcmc_state_confidence: number | null
+  mcmc_expected_return: number | null
+  mcmc_entry_price: number | null
+  mcmc_exit_price: number | null
+  mcmc_history_days: number | null
+  mcmc_exit_price_confidence: number | null
+  actual_entry_price: number | null
+  actual_exit_price: number | null
+  actual_gain: number | null
+  markov_result: 'WON' | 'WIN' | 'FAILED' | null
+  mcmc_result: 'WON' | 'WIN' | 'FAILED' | null
+  mcmc_win_count: number | null
+  mcmc_win_rate: number | null
+  mcmc_predictions_count: number | null
+  markov_win_count: number | null
+  markov_win_rate: number | null
+  markov_predictions_count: number | null
+}
+
+// Backend caps page_size at 1000 (see app/main.py's
+// MARKET_PREDICTIONS_PERFORMANCE_MAX_PAGE_SIZE).
+export const MARKET_PREDICTIONS_PERFORMANCE_MAX_PAGE_SIZE = 1000
+
+export interface MarketPredictionsPerformanceReport {
+  rows: MarketPredictionPerformanceRow[]
+  total: number
+  page: number
+  page_size: number
+}
+
+// One of backend-v2 jobs/research_picks.py's compute_research_picks' up-to-20
+// selections for a run (see app/main.py's research_picks_report /
+// _research_pick_to_dict) - a research shortlist for further investigation, not a
+// trading signal (see `comment`, which always ends with that disclaimer).
+export interface ResearchPickRow {
+  ticker: string
+  name: string | null
+  rank: number
+  predicted_date: string
+  predicted_direction: 'up' | 'down'
+  score: number
+  expected_return_score: number
+  confidence_score: number
+  win_rate_score: number
+  backtest_score: number
+  rsi_adjustment: number
+  news_adjustment: number
+  markov_predicted_state: string
+  markov_expected_return: number
+  markov_state_confidence: number
+  mcmc_predicted_state: string
+  mcmc_expected_return: number
+  mcmc_state_confidence: number
+  market_cap: number
+  average_volume: number
+  markov_win_rate: number | null
+  markov_predictions_count: number | null
+  mcmc_win_rate: number | null
+  mcmc_predictions_count: number | null
+  backtest_win_rate: number | null
+  backtest_evaluated_count: number | null
+  rsi_value: number | null
+  news_article_count: number | null
+  news_sentiment_lean: number | null
+  comment: string
+}
+
+export interface ResearchPicksResult {
+  // null when no research-picks run has ever produced picks yet.
+  run_id: number | null
+  generated_at: string | null
+  rows: ResearchPickRow[]
+}
+
+// Sort priority for the Market Prediction Performance report - same shape/reasoning as
+// TradingSymbolOrderField, against MARKET_PREDICTIONS_PERFORMANCE_ORDERABLE_FIELDS
+// instead.
+export interface MarketPredictionPerformanceOrderField {
+  field: string
+  dir: 'asc' | 'desc'
+}
+
 async function getJSON<T>(path: string): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`)
   if (!res.ok) throw new Error(`${path} failed: ${res.status}`)
@@ -737,4 +851,42 @@ export const api = {
     getJSON<BacktestPoint[]>(
       `/reports/backtest?ticker=${encodeURIComponent(ticker)}&start_date=${encodeURIComponent(startDate ?? '')}&end_date=${encodeURIComponent(endDate ?? '')}`,
     ),
+  // startDate/endDate are ISO dates ("YYYY-MM-DD"); each independently defaults to
+  // today (UTC) server-side when omitted - see app/main.py's
+  // market_predictions_performance_report. market_cap/markovExitPriceConfidence/
+  // mcmcExitPriceConfidence/markovWinRate/mcmcWinRate are the only numeric/state
+  // filters this report exposes beyond what temp_queries/market_prediction_performance.sql
+  // itself filters on - same op/value shape as tradingSymbolsReport's marketCapFilter.
+  marketPredictionsPerformanceReport: (
+    startDate?: string,
+    endDate?: string,
+    tickerTypes: string[] = [],
+    tickers: string[] = [],
+    page = 1,
+    pageSize = MARKET_PREDICTIONS_PERFORMANCE_MAX_PAGE_SIZE,
+    orderBy: MarketPredictionPerformanceOrderField[] = [],
+    marketCapFilter?: NumericFilter,
+    markovExitPriceConfidenceFilter?: NumericFilter,
+    mcmcExitPriceConfidenceFilter?: NumericFilter,
+    markovWinRateFilter?: NumericFilter,
+    mcmcWinRateFilter?: NumericFilter,
+  ) => {
+    const orderByParam = orderBy.map(({ field, dir }) => `${field}:${dir}`).join(',')
+    const qs = new URLSearchParams()
+    qs.set('start_date', startDate ?? '')
+    qs.set('end_date', endDate ?? '')
+    qs.set('ticker_types', tickerTypes.join(','))
+    qs.set('tickers', tickers.join(','))
+    qs.set('page', String(page))
+    qs.set('page_size', String(pageSize))
+    qs.set('order_by', orderByParam)
+    addNumericFilter(qs, 'market_cap', marketCapFilter)
+    addNumericFilter(qs, 'markov_exit_price_confidence', markovExitPriceConfidenceFilter)
+    addNumericFilter(qs, 'mcmc_exit_price_confidence', mcmcExitPriceConfidenceFilter)
+    addNumericFilter(qs, 'markov_win_rate', markovWinRateFilter)
+    addNumericFilter(qs, 'mcmc_win_rate', mcmcWinRateFilter)
+    return getJSON<MarketPredictionsPerformanceReport>(`/reports/market-predictions-performance?${qs.toString()}`)
+  },
+  researchPicks: (runId?: number) =>
+    getJSON<ResearchPicksResult>(`/reports/research-picks${runId ? `?run_id=${runId}` : ''}`),
 }

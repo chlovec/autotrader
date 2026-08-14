@@ -7,6 +7,8 @@ import { TradingSymbolsPage } from './components/TradingSymbolsPage'
 import { StaleTickersPage } from './components/StaleTickersPage'
 import { Next10DayPredictionsPage } from './components/Next10DayPredictionsPage'
 import { MarketPredictionsPage } from './components/MarketPredictionsPage'
+import { MarketPredictionsPerformancePage } from './components/MarketPredictionsPerformancePage'
+import { ResearchPage } from './components/ResearchPage'
 
 // Below this width the side menu renders as an overlay drawer (see index.css) and
 // should start closed; at/above it, it renders inline and should start open.
@@ -24,6 +26,7 @@ export type View =
   | 'Stale Tickers'
   | 'Next 10 Day Predictions'
   | 'Market Predictions'
+  | 'Market Prediction Performance'
   | 'Settings'
 
 function App() {
@@ -58,6 +61,10 @@ function App() {
             <Next10DayPredictionsPage />
           ) : activeView === 'Market Predictions' ? (
             <MarketPredictionsPage />
+          ) : activeView === 'Market Prediction Performance' ? (
+            <MarketPredictionsPerformancePage />
+          ) : activeView === 'Research' ? (
+            <ResearchPage />
           ) : (
             <p className="placeholder-note">{activeView} goes here.</p>
           )}

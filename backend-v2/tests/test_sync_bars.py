@@ -9,7 +9,13 @@ from data.client import DataClient
 from db.models import JobRun, OhlcBar, Ticker
 from db.session import SessionLocal, init_db
 from jobs.control import JobCancelled, JobControl
-from jobs.sync_bars import _last_trading_day_on_or_before, fetch_and_store_bars, sync_bars_manual, sync_bars_nightly
+from jobs.sync_bars import (
+    _last_trading_day_on_or_before,
+    _pcnt_increase,
+    fetch_and_store_bars,
+    sync_bars_manual,
+    sync_bars_nightly,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -69,6 +75,29 @@ async def test_fetch_and_store_bars_paginates_and_upserts():
 
     assert requests[0].url.path == "/v2/aggs/ticker/AAA/range/1/day/2024-01-01/2024-01-02"
     assert requests[1].url.params["cursor"] == "page2"
+
+
+def test_pcnt_increase_helper_matches_the_open_to_close_formula():
+    assert _pcnt_increase(10.0, 11.0) == pytest.approx(10.0)
+    assert _pcnt_increase(10.0, 9.0) == pytest.approx(-10.0)
+    assert _pcnt_increase(None, 11.0) is None
+    assert _pcnt_increase(10.0, None) is None
+    assert _pcnt_increase(0, 11.0) is None
+
+
+async def test_pcnt_increase_is_computed_and_stored_on_upsert():
+    # _bar()'s open is close - 1, so a close of 11.0 gives open=10.0, close=11.0 -> +10%.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"results": [_bar(dt.date(2024, 1, 1), 11.0)]})
+
+    async with _client_with_handler(handler) as client:
+        session = SessionLocal()
+        try:
+            await fetch_and_store_bars(client, session, "AAA", dt.date(2024, 1, 1), dt.date(2024, 1, 1))
+            bar = session.query(OhlcBar).filter_by(ticker="AAA").one()
+            assert bar.pcnt_increase == pytest.approx(10.0)
+        finally:
+            session.close()
 
 
 def test_sync_bars_manual_defaults_to_all_tickers_and_isolates_failures():

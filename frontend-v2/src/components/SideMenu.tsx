@@ -25,7 +25,14 @@ const NAV_ITEMS: NavItem[] = [
   { view: 'Jobs' },
   {
     view: 'Analytics',
-    children: ['Top Movers', 'Trading Symbols', 'Stale Tickers', 'Next 10 Day Predictions', 'Market Predictions'],
+    children: [
+      'Top Movers',
+      'Trading Symbols',
+      'Stale Tickers',
+      'Next 10 Day Predictions',
+      'Market Predictions',
+      'Market Prediction Performance',
+    ],
   },
   { view: 'Settings' },
 ]

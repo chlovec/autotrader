@@ -28,6 +28,8 @@ AVERAGE_VOLUME_JOB = "average-volume"
 PREDICT_MARKET_STATE_JOB = "predict-market-state"
 BACKTEST_MARKET_STATE_JOB = "backtest-market-state"
 PREDICT_10_DAY_MARKET_STATE_JOB = "predict-10-day-market-state"
+WIN_RATE_JOB = "compute-win-rates"
+RESEARCH_PICKS_JOB = "research-picks"
 
 # job name -> massive.com indicator path segment (GET /v1/indicators/{indicator}/
 # {ticker}) - jobs/sync_indicators.py's sync_indicator takes the latter, app/main.py's
@@ -70,6 +72,8 @@ DEFAULT_SCHEDULES: dict[str, tuple[str, int]] = {
     PREDICT_MARKET_STATE_JOB: ("days", 1),
     BACKTEST_MARKET_STATE_JOB: ("days", 1),
     PREDICT_10_DAY_MARKET_STATE_JOB: ("days", 1),
+    WIN_RATE_JOB: ("days", 1),
+    RESEARCH_PICKS_JOB: ("days", 1),
 }
 
 
@@ -344,6 +348,48 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
         has_prediction_start_date_field=True,
         # Run-on-demand statistic over already-synced bars, no natural daily cadence of
         # its own - manual by default, same reasoning as predict-market-state.
+        default_run_type="manual",
+    ),
+    WIN_RATE_JOB: JobDefinition(
+        name=WIN_RATE_JOB,
+        label="Compute win rates",
+        description=(
+            "Aggregates each selected ticker's Markov chain and Monte Carlo "
+            "market-state predictions against what actually happened "
+            "(ohlc_bars.pcnt_increase on the predicted date), storing per-ticker win "
+            "counts, evaluated-prediction counts, and win rates for each model in the "
+            "win_rates table. Purely local - no massive.com call, reads predictions "
+            "and bars already computed/synced by other jobs."
+        ),
+        has_bars_fields=False,
+        has_ticker_selector=True,
+        # Run-on-demand aggregation over already-computed predictions, no natural
+        # daily cadence of its own - manual by default, same reasoning as
+        # average-volume/predict-market-state.
+        default_run_type="manual",
+    ),
+    RESEARCH_PICKS_JOB: JobDefinition(
+        name=RESEARCH_PICKS_JOB,
+        label="Research picks",
+        description=(
+            "Screens the CS ticker universe for liquid candidates (market cap >= $2B, "
+            "average volume >= 1M/day) whose Markov and Monte Carlo predictions agree "
+            "on direction, scores them by a composite of expected-return magnitude, "
+            "confidence, live/backtest win-rate track record, RSI, and recent news "
+            "sentiment, and stores up to 20 as a research shortlist for further "
+            "investigation - not a trading signal. Purely local - no massive.com call, "
+            "reads predictions/indicators/news already synced or computed by other "
+            "jobs."
+        ),
+        has_bars_fields=False,
+        # No filter to offer - this job's whole purpose is screening the *entire* CS
+        # universe by its own liquidity/agreement criteria, same reasoning as
+        # ticker-types/sync-news taking has_ticker_type_filter=False. A ticker/type
+        # picker here would let a caller filter away exactly the candidates it exists
+        # to discover.
+        has_ticker_type_filter=False,
+        # Run-on-demand screen over already-computed predictions, no natural daily
+        # cadence of its own - manual by default, same reasoning as win-rates/backtest.
         default_run_type="manual",
     ),
 }

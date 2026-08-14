@@ -76,6 +76,16 @@ def _bars_path(ticker: str, multiplier: int, timespan: str, start_date: dt.date,
     )
 
 
+def _pcnt_increase(open_price: float | None, close_price: float | None) -> float | None:
+    """Percent change from open to close, e.g. 1.5 for a 1.5% gain - same formula
+    db/models.py's OhlcBar.pcnt_increase used to compute as a DB-level generated
+    column, now computed here instead so it's stored plainly (see that column's
+    docstring)."""
+    if open_price is None or close_price is None or open_price == 0:
+        return None
+    return (close_price - open_price) / open_price * 100
+
+
 def _upsert_bar(session: Session, ticker: str, multiplier: int, timespan: str, result: dict[str, Any]) -> None:
     values: dict[str, Any] = {
         "ticker": ticker,
@@ -85,6 +95,7 @@ def _upsert_bar(session: Session, ticker: str, multiplier: int, timespan: str, r
     }
     for source, field in _BAR_FIELD_MAP.items():
         values[field] = result.get(source)
+    values["pcnt_increase"] = _pcnt_increase(values["open"], values["close"])
     stmt = sqlite_insert(OhlcBar).values(**values)
     stmt = stmt.on_conflict_do_update(
         index_elements=[OhlcBar.ticker, OhlcBar.multiplier, OhlcBar.timespan, OhlcBar.timestamp],
