@@ -56,6 +56,7 @@ def init_db() -> None:
     _add_job_configs_prediction_start_date_column()
     _add_job_configs_predicted_date_offset_days_column()
     _add_job_configs_mcmc_num_simulations_column()
+    _add_job_configs_ohlc_bars_columns()
     _add_job_runs_progress_columns()
     _add_job_runs_control_columns()
     _add_market_predictions_mcmc_columns()
@@ -63,6 +64,8 @@ def init_db() -> None:
     _add_ohlc_bars_pcnt_increase_column()
     _convert_ohlc_bars_pcnt_increase_generated_column()
     _drop_ticker_bar_sync_state_table()
+    _add_tickers_last_ohlc_sync_date_column()
+    _add_ticker_types_rank_status_columns()
 
 
 def _add_column_if_missing(table: str, column: str, ddl_type: str) -> None:
@@ -127,6 +130,12 @@ def _add_job_configs_predicted_date_offset_days_column() -> None:
 
 def _add_job_configs_mcmc_num_simulations_column() -> None:
     _add_job_configs_column("mcmc_num_simulations", "INTEGER")
+
+
+def _add_job_configs_ohlc_bars_columns() -> None:
+    _add_job_configs_column("ohlc_bars_start_date", "DATE")
+    _add_job_configs_column("ohlc_bars_end_date", "DATE")
+    _add_job_configs_column("ohlc_bars_limit", "INTEGER")
 
 
 def _add_job_runs_column(column: str, ddl_type: str) -> None:
@@ -220,6 +229,23 @@ def _drop_ticker_bar_sync_state_table() -> None:
     otherwise carry it around inertly forever."""
     with engine.begin() as conn:
         conn.execute(text("DROP TABLE IF EXISTS ticker_bar_sync_state"))
+
+
+def _add_tickers_last_ohlc_sync_date_column() -> None:
+    """See db/models.py's Ticker.last_ohlc_sync_date - left NULL on existing rows,
+    same as any other column added to a table with existing data; nothing writes it
+    yet."""
+    _add_column_if_missing("tickers", "last_ohlc_sync_date", "DATE")
+
+
+def _add_ticker_types_rank_status_columns() -> None:
+    """See db/models.py's TickerType.rank/status. status gets a DEFAULT in the ALTER
+    TABLE itself (unlike rank, which has none) so existing rows are backfilled to
+    "active" immediately rather than sitting at NULL until an operator visits the
+    Ticker Types page - same pattern as _add_job_configs_hidden_column's "BOOLEAN
+    DEFAULT 0"."""
+    _add_column_if_missing("ticker_types", "rank", "INTEGER")
+    _add_column_if_missing("ticker_types", "status", "VARCHAR DEFAULT 'active'")
 
 
 def get_session() -> Session:

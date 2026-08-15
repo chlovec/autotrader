@@ -29,6 +29,14 @@ SELECT
 	e.open as actual_entry_price,
 	e.close as actual_exit_price,
 	e.pcnt_increase as actual_gain,
+	(
+		SELECT i.vwap
+		FROM ohlc_bars i
+		WHERE i.ticker = a.ticker
+			AND date(i.timestamp) <= c.predicted_date
+		ORDER BY i.timestamp DESC
+		LIMIT 1
+	) as vwap,
 	CASE
 		WHEN e.pcnt_increase IS NULL THEN NULL
 		WHEN e.pcnt_increase <= 0  AND c.expected_return <= 0 THEN 'WON'

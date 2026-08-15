@@ -30,6 +30,13 @@ class Ticker(Base):
     share_class_figi: Mapped[str | None] = mapped_column(String)
     last_updated_utc: Mapped[str | None] = mapped_column(String)
 
+    # Last date this ticker's daily OHLC bars were synced, distinct from ohlc_bars'
+    # own MAX(timestamp) (which the stale-tickers report computes live - see
+    # app/main.py's stale_tickers_report) - this tracks when a sync last ran for the
+    # ticker, not the date of its most recent bar. Left NULL for now; not yet written
+    # by jobs/sync_bars.py - a future job will populate it.
+    last_ohlc_sync_date: Mapped[dt.date | None] = mapped_column(Date)
+
 
 class TickerType(Base):
     """One row per code/asset_class/locale combination returned by GET
@@ -44,6 +51,30 @@ class TickerType(Base):
     asset_class: Mapped[str] = mapped_column(String, primary_key=True)
     locale: Mapped[str] = mapped_column(String, primary_key=True)
     description: Mapped[str | None] = mapped_column(String)
+
+    # Operator-set display/priority ordering and active/inactive flag, edited from the
+    # dashboard's Settings > Ticker Types page (see app/main.py's ticker-types
+    # endpoints) - unrelated to massive.com's own data, so untouched by
+    # sync-ticker-types' upsert. rank is nullable (unranked sorts last); status
+    # defaults to "active" for both new rows and existing ones backfilled by this
+    # column's migration (see db/session.py's _add_ticker_types_rank_status_columns).
+    rank: Mapped[int | None] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String, default="active")
+
+
+class TickerGroup(Base):
+    """One row per (ticker, group) pairing - a plain many-to-many junction letting a
+    ticker belong to more than one group (e.g. "watchlist", "core_holdings"). group is
+    just a caller-chosen label rather than a foreign key into a separate group-catalog
+    table, since a group here carries no metadata of its own beyond its name.
+
+    created_at records when the ticker was added to the group."""
+
+    __tablename__ = "ticker_groups"
+
+    ticker: Mapped[str] = mapped_column(ForeignKey("tickers.ticker"), primary_key=True)
+    group: Mapped[str] = mapped_column(String, primary_key=True)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
 
 
 class SyncState(Base):
@@ -843,6 +874,14 @@ class JobConfig(Base):
     jobs/predict_market_state_mcmc.py resolves a None value to
     DEFAULT_NUM_SIMULATIONS (2000).
 
+    ohlc_bars_start_date/ohlc_bars_end_date/ohlc_bars_limit only apply to the
+    sync-ohlc-bars job (registry.JobDefinition.has_ohlc_bars_fields), same "left None,
+    resolved at run time" reasoning as average_volume_start_date -
+    jobs/sync_ohlc_bars.py's sync_ohlc_bars resolves a None ohlc_bars_start_date to 2
+    years before today (UTC), a None ohlc_bars_end_date to today (UTC; a caller-given
+    date after today is rejected, not clamped), and a None ohlc_bars_limit to 8000
+    (capped at 10000 regardless of what's stored here).
+
     run_requested_at is how app/main.py (the API process) asks job_runner.py (the
     separate process that actually executes jobs - see jobs/engine.py) to run this job
     now: POST /jobs/{name}/run sets it, job_runner.py's poll_run_requests clears it
@@ -871,6 +910,9 @@ class JobConfig(Base):
     prediction_start_date: Mapped[dt.date | None] = mapped_column(Date)
     predicted_date_offset_days: Mapped[int | None] = mapped_column(Integer)
     mcmc_num_simulations: Mapped[int | None] = mapped_column(Integer)
+    ohlc_bars_start_date: Mapped[dt.date | None] = mapped_column(Date)
+    ohlc_bars_end_date: Mapped[dt.date | None] = mapped_column(Date)
+    ohlc_bars_limit: Mapped[int | None] = mapped_column(Integer)
     # Hides the job's card from the Jobs page's default list (see app/main.py's
     # list_jobs) without affecting its schedule - a hidden job still runs normally.
     hidden: Mapped[bool] = mapped_column(default=False)

@@ -104,6 +104,10 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
   // DEFAULT_PREDICTED_DATE_OFFSET_DAYS.
   const [predictedDateOffsetDays, setPredictedDateOffsetDays] = useState(job.predicted_date_offset_days ?? 1)
   const [mcmcNumSimulations, setMcmcNumSimulations] = useState(job.mcmc_num_simulations ?? 2000)
+  const [ohlcBarsStartDate, setOhlcBarsStartDate] = useState(job.ohlc_bars_start_date ?? '')
+  const [ohlcBarsEndDate, setOhlcBarsEndDate] = useState(job.ohlc_bars_end_date ?? '')
+  // Default 8000 matches backend-v2 jobs/sync_ohlc_bars.py's DEFAULT_LIMIT.
+  const [ohlcBarsLimit, setOhlcBarsLimit] = useState(job.ohlc_bars_limit ?? 8000)
 
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
@@ -159,6 +163,13 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
         ...(job.has_prediction_start_date_field ? { prediction_start_date: predictionStartDate || null } : {}),
         ...(job.has_predicted_date_offset_field ? { predicted_date_offset_days: predictedDateOffsetDays } : {}),
         ...(job.has_monte_carlo_fields ? { mcmc_num_simulations: mcmcNumSimulations } : {}),
+        ...(job.has_ohlc_bars_fields
+          ? {
+              ohlc_bars_start_date: ohlcBarsStartDate || null,
+              ohlc_bars_end_date: ohlcBarsEndDate || null,
+              ohlc_bars_limit: ohlcBarsLimit,
+            }
+          : {}),
       })
       onSaved(updated)
     } catch (err) {
@@ -469,7 +480,8 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
                 !job.has_backtest_fields &&
                 !job.has_prediction_start_date_field &&
                 !job.has_predicted_date_offset_field &&
-                !job.has_monte_carlo_fields && (
+                !job.has_monte_carlo_fields &&
+                !job.has_ohlc_bars_fields && (
                   <p className="job-field-hint">This job has no run parameters to configure.</p>
                 )}
 
@@ -679,6 +691,40 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
                     </label>
                   </div>
                   <p className="job-field-hint">Simulated paths per ticker defaults to 2000.</p>
+                </>
+              )}
+
+              {job.has_ohlc_bars_fields && (
+                <>
+                  <div className="job-field-row">
+                    <label className="job-field">
+                      Start date (UTC)
+                      <input
+                        type="date"
+                        value={ohlcBarsStartDate}
+                        onChange={(e) => setOhlcBarsStartDate(e.target.value)}
+                      />
+                    </label>
+                    <label className="job-field">
+                      End date (UTC)
+                      <input type="date" value={ohlcBarsEndDate} onChange={(e) => setOhlcBarsEndDate(e.target.value)} />
+                    </label>
+                    <label className="job-field">
+                      Limit
+                      <input
+                        type="number"
+                        min={1}
+                        max={10000}
+                        value={ohlcBarsLimit}
+                        onChange={(e) => setOhlcBarsLimit(Number(e.target.value))}
+                      />
+                    </label>
+                  </div>
+                  <p className="job-field-hint">
+                    Leave start date blank to default to 2 years before today (UTC), and end date blank to default
+                    to today - end date can't be after today. Limit (max 10000) caps how many tickers this run
+                    selects; a backlog larger than that needs more than one run to fully catch up.
+                  </p>
                 </>
               )}
             </div>

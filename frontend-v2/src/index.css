@@ -1295,10 +1295,12 @@ body {
 /* The whole header cell is one click target - see components/ColumnHeaderMenu.tsx -
    opening a single dropdown with sort/freeze/filter rather than separate controls.
    Inherits the th's color/weight/etc. since it's a bare reset button, not a styled
-   one. */
+   one. align-items: flex-start (rather than center) so a label that wraps to two lines
+   still lines up with the sort/freeze/filter indicators at their top instead of
+   centering the whole row against a taller label. */
 .report-th-trigger {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 8px;
   width: 100%;
@@ -1309,7 +1311,8 @@ body {
   font: inherit;
   text-transform: inherit;
   letter-spacing: inherit;
-  white-space: nowrap;
+  white-space: normal;
+  text-align: left;
   cursor: pointer;
 }
 
@@ -1329,14 +1332,15 @@ body {
   flex-shrink: 0;
 }
 
-/* Truncates instead of overflowing into the next column once a header's own column
-   has been dragged narrower than its label. min-width: 0 overrides the flex item
-   default of auto, which otherwise refuses to shrink below the label's content size
-   and defeats the ellipsis. */
+/* Wraps onto multiple lines instead of overflowing into the next column once a
+   header's own column has been dragged narrower than its label. min-width: 0
+   overrides the flex item default of auto, which otherwise refuses to shrink below
+   the label's content size and would push the column wider than its set width instead
+   of wrapping. overflow-wrap so a single long word (rather than the more common
+   multi-word label) still breaks instead of overflowing. */
 .report-th-label {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow-wrap: break-word;
 }
 
 .report-sort-indicator {

@@ -34,7 +34,10 @@ const NAV_ITEMS: NavItem[] = [
       'Market Prediction Performance',
     ],
   },
-  { view: 'Settings' },
+  {
+    view: 'Settings',
+    children: ['Ticker Types'],
+  },
 ]
 
 export function SideMenu({ open, onClose, activeView, onNavigate }: SideMenuProps) {

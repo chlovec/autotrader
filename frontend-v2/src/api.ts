@@ -48,6 +48,7 @@ export interface Job {
   has_prediction_start_date_field: boolean
   has_predicted_date_offset_field: boolean
   has_monte_carlo_fields: boolean
+  has_ohlc_bars_fields: boolean
   // Always the full massive.com asset-class list (jobs/registry.py's
   // SNAPSHOT_TYPE_OPTIONS), regardless of has_snapshot_type_filter - fetched from the
   // backend rather than hardcoded here so the two never drift.
@@ -94,6 +95,16 @@ export interface Job {
   // predicted_date_offset_days above for the date that phase shares with the Markov
   // chain phase before it).
   mcmc_num_simulations: number | null
+  // ISO date ("YYYY-MM-DD"), or null to default to 2 years before today (UTC) at run
+  // time - see backend-v2 jobs/sync_ohlc_bars.py's sync_ohlc_bars. Only meaningful
+  // alongside has_ohlc_bars_fields (the sync-ohlc-bars job).
+  ohlc_bars_start_date: string | null
+  // ISO date ("YYYY-MM-DD"), or null to default to today (UTC) at run time - may not
+  // be a date after today. Only meaningful alongside has_ohlc_bars_fields.
+  ohlc_bars_end_date: string | null
+  // Max tickers selected per run, or null to default to 8000 at run time - capped at
+  // 10000 regardless of what's stored. Only meaningful alongside has_ohlc_bars_fields.
+  ohlc_bars_limit: number | null
   // Persisted (JobConfig.hidden), not display-only - keeps a job off the Jobs page's
   // default list across reloads until explicitly unhidden. Independent of running/
   // paused: a hidden job still runs on its schedule, it's just tucked away here.
@@ -125,6 +136,9 @@ export interface JobConfigInput {
   prediction_start_date?: string | null
   predicted_date_offset_days?: number | null
   mcmc_num_simulations?: number | null
+  ohlc_bars_start_date?: string | null
+  ohlc_bars_end_date?: string | null
+  ohlc_bars_limit?: number | null
 }
 
 export interface TickerOption {
@@ -136,6 +150,26 @@ export interface TickerTypeOption {
   code: string
   asset_class: string
   description: string | null
+}
+
+export type TickerTypeStatus = 'active' | 'inactive'
+
+// One row per code/asset_class/locale combination from backend-v2's ticker_types
+// table - backs the Settings > Ticker Types page. rank/status are operator-set (see
+// app/main.py's ticker-types endpoints), unrelated to the massive.com data the rest of
+// the row comes from.
+export interface TickerTypeRow {
+  code: string
+  asset_class: string
+  locale: string
+  description: string | null
+  rank: number | null
+  status: TickerTypeStatus
+}
+
+export interface TickerTypeUpdateInput {
+  rank: number | null
+  status: TickerTypeStatus
 }
 
 // One row per (ticker, direction) from backend-v2's top_market_movers table, joined
@@ -578,6 +612,7 @@ export interface MarketPredictionPerformanceRow {
   actual_entry_price: number | null
   actual_exit_price: number | null
   actual_gain: number | null
+  vwap: number | null
   markov_result: 'WON' | 'WIN' | 'FAILED' | null
   mcmc_result: 'WON' | 'WIN' | 'FAILED' | null
   mcmc_win_count: number | null
@@ -734,6 +769,12 @@ export const api = {
     getJSON<TickerOption[]>(`/tickers/search?q=${encodeURIComponent(q)}&limit=${limit}`),
   searchTickerTypes: (q: string, limit = 20) =>
     getJSON<TickerTypeOption[]>(`/ticker-types/search?q=${encodeURIComponent(q)}&limit=${limit}`),
+  tickerTypes: () => getJSON<TickerTypeRow[]>('/ticker-types'),
+  updateTickerType: (code: string, assetClass: string, locale: string, body: TickerTypeUpdateInput) =>
+    putJSON<TickerTypeRow>(
+      `/ticker-types/${encodeURIComponent(code)}/${encodeURIComponent(assetClass)}/${encodeURIComponent(locale)}`,
+      body,
+    ),
   topMoversReport: (tickerTypes: string[] = []) =>
     getJSON<TopMarketMoverRow[]>(`/reports/top-movers?ticker_types=${encodeURIComponent(tickerTypes.join(','))}`).then(
       (rows) => rows.map(withAbsExpectedReturnPct),

@@ -30,6 +30,8 @@ BACKTEST_MARKET_STATE_JOB = "backtest-market-state"
 PREDICT_10_DAY_MARKET_STATE_JOB = "predict-10-day-market-state"
 WIN_RATE_JOB = "compute-win-rates"
 RESEARCH_PICKS_JOB = "research-picks"
+ETF_CONSTITUENTS_JOB = "sync-etf-constituents"
+OHLC_BARS_JOB = "sync-ohlc-bars"
 
 # job name -> massive.com indicator path segment (GET /v1/indicators/{indicator}/
 # {ticker}) - jobs/sync_indicators.py's sync_indicator takes the latter, app/main.py's
@@ -74,6 +76,8 @@ DEFAULT_SCHEDULES: dict[str, tuple[str, int]] = {
     PREDICT_10_DAY_MARKET_STATE_JOB: ("days", 1),
     WIN_RATE_JOB: ("days", 1),
     RESEARCH_PICKS_JOB: ("days", 1),
+    ETF_CONSTITUENTS_JOB: ("days", 1),
+    OHLC_BARS_JOB: ("days", 1),
 }
 
 
@@ -142,6 +146,14 @@ class JobDefinition:
     # has_predicted_date_offset_field above, since both phases share the same
     # resolved predicted date.
     has_monte_carlo_fields: bool = False
+    # Whether this job offers the "Start date"/"End date"/"Limit" trio (see
+    # jobs/sync_ohlc_bars.py) - only the sync-ohlc-bars job takes this. Independent of
+    # the other flags, same layering as has_backtest_fields; unlike has_bars_fields
+    # (sync-bars-nightly's multiplier/timespan/backfill_days/end-date-offset), this job
+    # takes no ticker_types/tickers selector at all - its own query
+    # (jobs/sync_ohlc_bars.py's _select_tickers_to_sync) is the only ticker selection
+    # mechanism it has.
+    has_ohlc_bars_fields: bool = False
     # Seeded into JobConfig.run_type the first time this job's config row is created
     # (see app/main.py's _get_or_create_config). "auto" unless overridden below.
     default_run_type: str = "auto"
@@ -390,6 +402,57 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
         has_ticker_type_filter=False,
         # Run-on-demand screen over already-computed predictions, no natural daily
         # cadence of its own - manual by default, same reasoning as win-rates/backtest.
+        default_run_type="manual",
+    ),
+    ETF_CONSTITUENTS_JOB: JobDefinition(
+        name=ETF_CONSTITUENTS_JOB,
+        label="Download ETF holdings",
+        description=(
+            "Downloads each selected ticker's daily holdings workbook from SSGA "
+            "(holdings-daily-us-en-{ticker}.xlsx) and saves the raw file under "
+            "backend-v2/data/etf_holdings/, overwriting whatever was saved for that "
+            "ticker last run. Parsing the workbook into structured rows is a separate, "
+            "not-yet-built step - this job only fetches and saves the raw files. Only "
+            "works for ETFs State Street itself manages (SPY and other SPDR funds) - "
+            "the Ticker types field below has no effect on this job (there's no "
+            "meaningful asset-class filter for a per-ticker file URL); only the "
+            "Tickers field matters, and leaving it blank downloads nothing rather than "
+            "'every ticker' the way it does for sync-bars/sync-snapshots."
+        ),
+        has_bars_fields=False,
+        # Reuses sync_bars/sync_snapshots' dual ticker_types+tickers picker purely for
+        # its Tickers half - see this job's description above for why ticker_types
+        # itself is inert here. has_ticker_type_filter is left at its default True,
+        # same as BARS_JOB/SNAPSHOTS_JOB, since has_ticker_selector supersedes it in
+        # JobCard.tsx's render order regardless of this value.
+        has_ticker_selector=True,
+        # Fetches whatever's on the Tickers field with no natural daily cadence of its
+        # own (and an empty field is a no-op run, not "sync everything") - manual by
+        # default, same reasoning as ticker-types/top-movers.
+        default_run_type="manual",
+    ),
+    OHLC_BARS_JOB: JobDefinition(
+        name=OHLC_BARS_JOB,
+        label="Sync OHLC bars (batch)",
+        description=(
+            "Selects up to Limit tickers (default 8000, max 10000) whose "
+            "tickers.last_ohlc_sync_date is NULL or before End date - ordered by "
+            "ticker_types.rank, then ticker - computes each one's own new_start_date "
+            "(Start date, or last_ohlc_sync_date + 1 day if that's later) and syncs GET "
+            "/v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{from}/{to} for "
+            "[new_start_date, End date] into ohlc_bars, fanned out across a thread "
+            "pool. Each ticker's worker then stamps tickers.last_ohlc_sync_date with "
+            "End date, so a run smaller than the full backlog naturally rotates on to "
+            "different tickers next time rather than reselecting the same batch. "
+            "Distinct from the sync-bars-nightly job: this one is limit-bounded and "
+            "selection-query-driven rather than covering every known ticker every run."
+        ),
+        has_bars_fields=False,
+        has_ticker_type_filter=False,
+        has_ohlc_bars_fields=True,
+        # Batch-limited backfill run with no natural daily cadence of its own (a limit
+        # smaller than the backlog needs several runs to catch up) - manual by default,
+        # same reasoning as ticker-types/snapshots/movers.
         default_run_type="manual",
     ),
 }

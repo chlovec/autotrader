@@ -38,10 +38,12 @@ from jobs.registry import (
     AVERAGE_VOLUME_JOB,
     BACKTEST_MARKET_STATE_JOB,
     BARS_JOB,
+    ETF_CONSTITUENTS_JOB,
     INDICATOR_NAMES,
     JOB_DEFINITIONS,
     MOVERS_JOB,
     NEWS_JOB,
+    OHLC_BARS_JOB,
     PREDICT_10_DAY_MARKET_STATE_JOB,
     PREDICT_MARKET_STATE_JOB,
     RESEARCH_PICKS_JOB,
@@ -60,8 +62,11 @@ from jobs.sync_bars import (
     DEFAULT_TIMESPAN,
     sync_bars_nightly,
 )
+from jobs.sync_etf_constituents import sync_etf_constituents
 from jobs.sync_indicators import sync_indicator
 from jobs.sync_news import sync_news
+from jobs.sync_ohlc_bars import DEFAULT_LIMIT as DEFAULT_OHLC_BARS_LIMIT
+from jobs.sync_ohlc_bars import sync_ohlc_bars
 from jobs.sync_snapshots import sync_snapshots
 from jobs.sync_ticker_details import sync_ticker_details
 from jobs.sync_ticker_types import sync_ticker_types
@@ -268,6 +273,16 @@ async def run_job(job_name: str, trigger: str) -> None:
             # local, off the event loop via asyncio.to_thread.
             count = await asyncio.to_thread(compute_research_picks, session, run_id, control=control)
             summary = f"{count} research pick(s) selected"
+        elif job_name == ETF_CONSTITUENTS_JOB:
+            # No DB session and no massive.com DataClient here - this job only
+            # downloads raw files from SSGA to disk (see jobs/sync_etf_constituents.py),
+            # so unlike the branches in the `else` block below it doesn't need this
+            # run's shared DataClient, and unlike the asyncio.to_thread branches above
+            # it's already async and lightweight (a handful of tickers), so it runs
+            # directly on the event loop the same way sync_ticker_types does.
+            tickers = split_csv(config.tickers) or []
+            count = await sync_etf_constituents(tickers, control=control)
+            summary = f"{count}/{len(tickers)} etf holdings file(s) downloaded"
         elif job_name == BACKTEST_MARKET_STATE_JOB:
             # Same reasoning as the average-volume/predict-market-state branches above -
             # purely local, off the event loop via asyncio.to_thread.
@@ -318,6 +333,20 @@ async def run_job(job_name: str, trigger: str) -> None:
                     if config.bars_end_date_offset_days is not None
                     else DEFAULT_END_DATE_OFFSET_DAYS
                 ),
+                control=control,
+                run_id=run_id,
+            )
+            summary = f"{len(results)} ticker(s) synced, {sum(results.values())} bar(s) fetched"
+        elif job_name == OHLC_BARS_JOB:
+            # Same no-shared-DataClient, thread-pool-fan-out reasoning as the BARS_JOB
+            # branch above (see jobs/sync_ohlc_bars.py) - selection-query-driven and
+            # limit-bounded rather than covering every known ticker every run.
+            results = await asyncio.to_thread(
+                sync_ohlc_bars,
+                session,
+                start_date=config.ohlc_bars_start_date,
+                end_date=config.ohlc_bars_end_date,
+                limit=config.ohlc_bars_limit or DEFAULT_OHLC_BARS_LIMIT,
                 control=control,
                 run_id=run_id,
             )

@@ -9,6 +9,7 @@ import { Next10DayPredictionsPage } from './components/Next10DayPredictionsPage'
 import { MarketPredictionsPage } from './components/MarketPredictionsPage'
 import { MarketPredictionsPerformancePage } from './components/MarketPredictionsPerformancePage'
 import { ResearchPage } from './components/ResearchPage'
+import { TickerTypesPage } from './components/TickerTypesPage'
 
 // Below this width the side menu renders as an overlay drawer (see index.css) and
 // should start closed; at/above it, it renders inline and should start open.
@@ -28,6 +29,7 @@ export type View =
   | 'Market Predictions'
   | 'Market Prediction Performance'
   | 'Settings'
+  | 'Ticker Types'
 
 function App() {
   const [menuOpen, setMenuOpen] = useState(
@@ -65,6 +67,8 @@ function App() {
             <MarketPredictionsPerformancePage />
           ) : activeView === 'Research' ? (
             <ResearchPage />
+          ) : activeView === 'Ticker Types' ? (
+            <TickerTypesPage />
           ) : (
             <p className="placeholder-note">{activeView} goes here.</p>
           )}

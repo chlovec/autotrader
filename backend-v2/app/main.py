@@ -55,10 +55,12 @@ from jobs.registry import (
     BACKTEST_MARKET_STATE_JOB,
     BARS_JOB,
     DEFAULT_START_TIME,
+    ETF_CONSTITUENTS_JOB,
     INDICATOR_NAMES,
     JOB_DEFINITIONS,
     MOVERS_JOB,
     NEWS_JOB,
+    OHLC_BARS_JOB,
     PREDICT_10_DAY_MARKET_STATE_JOB,
     PREDICT_MARKET_STATE_JOB,
     RESEARCH_PICKS_JOB,
@@ -72,6 +74,7 @@ from jobs.registry import (
     WIN_RATE_JOB,
 )
 from jobs.sync_bars import DEFAULT_MULTIPLIER, DEFAULT_TIMESPAN
+from jobs.sync_ohlc_bars import MAX_LIMIT as OHLC_BARS_MAX_LIMIT
 
 logger = logging.getLogger("backend_v2.app")
 
@@ -163,6 +166,7 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         "has_prediction_start_date_field": definition.has_prediction_start_date_field,
         "has_predicted_date_offset_field": definition.has_predicted_date_offset_field,
         "has_monte_carlo_fields": definition.has_monte_carlo_fields,
+        "has_ohlc_bars_fields": definition.has_ohlc_bars_fields,
         "snapshot_type_options": SNAPSHOT_TYPE_OPTIONS,
         "run_type": config.run_type,
         "schedule_interval_unit": config.schedule_interval_unit,
@@ -187,6 +191,9 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         ),
         "predicted_date_offset_days": config.predicted_date_offset_days,
         "mcmc_num_simulations": config.mcmc_num_simulations,
+        "ohlc_bars_start_date": config.ohlc_bars_start_date.isoformat() if config.ohlc_bars_start_date else None,
+        "ohlc_bars_end_date": config.ohlc_bars_end_date.isoformat() if config.ohlc_bars_end_date else None,
+        "ohlc_bars_limit": config.ohlc_bars_limit,
         "hidden": config.hidden,
         "running": config.run_requested_at is not None or run is not None,
         "paused": run.pause_requested if run is not None else False,
@@ -207,11 +214,20 @@ def _require_job(job_name: str) -> None:
 _RESET_TABLES: dict[str, list[type[Base]]] = {
     TICKERS_JOB: [Ticker],
     BARS_JOB: [OhlcBar],
+    # Shares ohlc_bars with BARS_JOB (see jobs/sync_ohlc_bars.py) - resetting either
+    # empties the whole table, same as resetting BARS_JOB already does today.
+    OHLC_BARS_JOB: [OhlcBar],
     TICKER_TYPES_JOB: [TickerType],
     SNAPSHOTS_JOB: [CurrentSnapshot],
     TICKER_DETAILS_JOB: [TickerDetail],
     MOVERS_JOB: [TopMarketMover],
     UNIFIED_SNAPSHOT_JOB: [UnifiedSnapshot],
+    # No DB table - this job only downloads raw files to disk (see
+    # jobs/sync_etf_constituents.py's DOWNLOAD_DIR). Still needs an entry here since
+    # reset_job below indexes _RESET_TABLES unconditionally for every job not in
+    # INDICATOR_NAMES; an empty list just means "nothing to empty" - the downloaded
+    # files themselves aren't touched by Reset.
+    ETF_CONSTITUENTS_JOB: [],
     NEWS_JOB: [News],
     AVERAGE_VOLUME_JOB: [AverageVolume],
     # predict-market-state now runs both the Markov chain and Monte Carlo phases in
@@ -252,6 +268,14 @@ class JobConfigIn(BaseModel):
     prediction_start_date: str | None = None
     predicted_date_offset_days: int | None = None
     mcmc_num_simulations: int | None = None
+    ohlc_bars_start_date: str | None = None
+    ohlc_bars_end_date: str | None = None
+    ohlc_bars_limit: int | None = None
+
+
+class TickerTypeUpdateIn(BaseModel):
+    rank: int | None = None
+    status: Literal["active", "inactive"]
 
 
 @app.get("/health")
@@ -281,6 +305,53 @@ def search_ticker_types(q: str = "", limit: int = 20) -> list[dict]:
         query = query.distinct().order_by(TickerType.code).limit(limit)
         rows = session.execute(query).all()
         return [{"code": row.code, "asset_class": row.asset_class, "description": row.description} for row in rows]
+
+
+def _ticker_type_to_dict(ticker_type: TickerType) -> dict[str, Any]:
+    return {
+        "code": ticker_type.code,
+        "asset_class": ticker_type.asset_class,
+        "locale": ticker_type.locale,
+        "description": ticker_type.description,
+        "rank": ticker_type.rank,
+        "status": ticker_type.status,
+    }
+
+
+@app.get("/ticker-types")
+def list_ticker_types() -> list[dict]:
+    """Backs the Settings > Ticker Types page, where an operator sets rank/status per
+    code/asset_class/locale combination. Unlike /ticker-types/search (typeahead for the
+    Jobs page's combobox), this returns every row unfiltered and unpaginated - matches
+    db/models.py's TickerType docstring describing the table as a short, mostly-static
+    reference list, so there's no report-style paging/filtering needed here.
+
+    Ordered by rank ascending with unranked (NULL) rows last, then by code - the same
+    "nulls sort last regardless of direction" convention as ReportGrid's compareRows,
+    applied here since rank is meant to drive the page's default display order."""
+    with SessionLocal() as session:
+        rows = (
+            session.execute(
+                select(TickerType).order_by(TickerType.rank.is_(None), TickerType.rank, TickerType.code)
+            )
+            .scalars()
+            .all()
+        )
+        return [_ticker_type_to_dict(t) for t in rows]
+
+
+@app.put("/ticker-types/{code}/{asset_class}/{locale}")
+def update_ticker_type(code: str, asset_class: str, locale: str, body: TickerTypeUpdateIn) -> dict:
+    if body.rank is not None and body.rank < 1:
+        raise HTTPException(status_code=400, detail="rank must be at least 1")
+    with SessionLocal() as session:
+        ticker_type = session.get(TickerType, (code, asset_class, locale))
+        if ticker_type is None:
+            raise HTTPException(status_code=404, detail="ticker type not found")
+        ticker_type.rank = body.rank
+        ticker_type.status = body.status
+        session.commit()
+        return _ticker_type_to_dict(ticker_type)
 
 
 @app.get("/tickers/search")
@@ -1775,6 +1846,14 @@ SELECT
 	e.open as actual_entry_price,
 	e.close as actual_exit_price,
 	e.pcnt_increase as actual_gain,
+	(
+		SELECT i.vwap
+		FROM ohlc_bars i
+		WHERE i.ticker = a.ticker
+			AND date(i.timestamp) <= c.predicted_date
+		ORDER BY i.timestamp DESC
+		LIMIT 1
+	) as vwap,
 	CASE
 		WHEN e.pcnt_increase IS NULL THEN NULL
 		WHEN e.pcnt_increase <= 0  AND c.expected_return <= 0 THEN 'WON'
@@ -1863,6 +1942,7 @@ MARKET_PREDICTIONS_PERFORMANCE_ORDERABLE_FIELDS = frozenset(
         "actual_entry_price",
         "actual_exit_price",
         "actual_gain",
+        "vwap",
         "markov_result",
         "mcmc_result",
         "mcmc_win_count",
@@ -1917,8 +1997,10 @@ def market_predictions_performance_report(
     market_predictions row in [start_date, end_date], each ticker's type description,
     its paired market_predictions_mcmc row (if any), the ohlc_bars row realized on
     predicted_date (if synced yet, which is what markov_result/mcmc_result score the
-    prediction against), win_rates' ticker-level running tallies, ticker_details'
-    market_cap, and average_volumes' most recently computed average_volume (same
+    prediction against), `vwap` (the latest ohlc_bars.vwap for the ticker on or before
+    predicted_date, via a correlated subquery - not tied to the same bar as
+    actual_entry_price/actual_exit_price), win_rates' ticker-level running tallies,
+    ticker_details' market_cap, and average_volumes' most recently computed average_volume (same
     latest-row-per-ticker join as market_predictions_report's average_volume_by_ticker).
 
     `start_date`/`end_date` (ISO dates) each independently default to today (UTC) when
@@ -2166,6 +2248,32 @@ def update_job_config(job_name: str, body: JobConfigIn) -> dict:
             ) from exc
     if body.mcmc_num_simulations is not None and body.mcmc_num_simulations < 1:
         raise HTTPException(status_code=400, detail="mcmc_num_simulations must be at least 1")
+    ohlc_bars_start_date: dt.date | None = None
+    if body.ohlc_bars_start_date is not None:
+        try:
+            ohlc_bars_start_date = dt.date.fromisoformat(body.ohlc_bars_start_date)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail="ohlc_bars_start_date must be an ISO date, e.g. '2026-08-06'"
+            ) from exc
+    ohlc_bars_end_date: dt.date | None = None
+    if body.ohlc_bars_end_date is not None:
+        try:
+            ohlc_bars_end_date = dt.date.fromisoformat(body.ohlc_bars_end_date)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail="ohlc_bars_end_date must be an ISO date, e.g. '2026-08-06'"
+            ) from exc
+        if ohlc_bars_end_date > dt.datetime.now(dt.timezone.utc).date():
+            raise HTTPException(status_code=400, detail="ohlc_bars_end_date cannot be greater than today")
+    if (
+        ohlc_bars_start_date is not None
+        and ohlc_bars_end_date is not None
+        and ohlc_bars_start_date > ohlc_bars_end_date
+    ):
+        raise HTTPException(status_code=400, detail="ohlc_bars_start_date must not be after ohlc_bars_end_date")
+    if body.ohlc_bars_limit is not None and not (1 <= body.ohlc_bars_limit <= OHLC_BARS_MAX_LIMIT):
+        raise HTTPException(status_code=400, detail=f"ohlc_bars_limit must be between 1 and {OHLC_BARS_MAX_LIMIT}")
 
     with SessionLocal() as session:
         definition = JOB_DEFINITIONS[job_name]
@@ -2210,6 +2318,14 @@ def update_job_config(job_name: str, body: JobConfigIn) -> dict:
             body.predicted_date_offset_days if definition.has_predicted_date_offset_field else None
         )
         config.mcmc_num_simulations = body.mcmc_num_simulations if definition.has_monte_carlo_fields else None
+        if definition.has_ohlc_bars_fields:
+            config.ohlc_bars_start_date = ohlc_bars_start_date
+            config.ohlc_bars_end_date = ohlc_bars_end_date
+            config.ohlc_bars_limit = body.ohlc_bars_limit
+        else:
+            config.ohlc_bars_start_date = None
+            config.ohlc_bars_end_date = None
+            config.ohlc_bars_limit = None
         config.updated_at = dt.datetime.utcnow()
         session.commit()
 
