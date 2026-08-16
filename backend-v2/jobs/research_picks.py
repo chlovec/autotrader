@@ -390,6 +390,7 @@ def compute_research_picks(session: Session, run_id: int, control: JobControl | 
                 backtest_score=entry["backtest_score"],
                 rsi_adjustment=entry["rsi_adj"],
                 news_adjustment=entry["news_adj"],
+                entry_price=entry["markov"].entry_price,
                 markov_predicted_state=entry["markov"].predicted_state,
                 markov_expected_return=entry["markov"].expected_return,
                 markov_state_confidence=entry["markov"].state_confidence,

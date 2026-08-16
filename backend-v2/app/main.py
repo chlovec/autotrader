@@ -2123,6 +2123,7 @@ def _research_pick_to_dict(pick: ResearchPick, ticker: Ticker) -> dict[str, Any]
         "backtest_score": pick.backtest_score,
         "rsi_adjustment": pick.rsi_adjustment,
         "news_adjustment": pick.news_adjustment,
+        "entry_price": pick.entry_price,
         "markov_predicted_state": pick.markov_predicted_state,
         "markov_expected_return": pick.markov_expected_return,
         "markov_state_confidence": pick.markov_state_confidence,

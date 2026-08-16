@@ -742,7 +742,14 @@ class ResearchPick(Base):
     rsi_adjustment: Mapped[float] = mapped_column(Float)
     news_adjustment: Mapped[float] = mapped_column(Float)
 
-    # Raw values behind the scores above, for display.
+    # Raw values behind the scores above, for display. entry_price is shared between
+    # the Markov and Monte Carlo predictions (both mean the same thing - today's/
+    # predicted_date's last close - see db/models.py's MarketPredictionMonteCarlo
+    # docstring), so it's stored once rather than duplicated as markov_/mcmc_ variants.
+    # Nullable since it was added after this table already had live rows (see
+    # db/session.py's _add_research_picks_entry_price_column) - existing rows stay
+    # NULL until their next run.
+    entry_price: Mapped[float | None] = mapped_column(Float)
     markov_predicted_state: Mapped[str] = mapped_column(String)
     markov_expected_return: Mapped[float] = mapped_column(Float)
     markov_state_confidence: Mapped[float] = mapped_column(Float)

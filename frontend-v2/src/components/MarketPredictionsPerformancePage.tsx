@@ -8,8 +8,9 @@ import {
 } from '../api'
 import { NUMERIC_FILTER_OPS, type NumericFilterOp } from '../numericFilter'
 import { loadReportParams, saveReportParams } from '../reportParams'
+import { loadReportProfiles, upsertReportProfile, deleteReportProfile, type ReportProfile } from '../reportProfiles'
 import { ChevronIcon } from './icons'
-import { ReportGrid, type ReportColumn } from './ReportGrid'
+import { ReportGrid, readRawGridView, writeRawGridView, type ReportColumn } from './ReportGrid'
 import { SearchableSelect, type SelectOption } from './SearchableSelect'
 
 const REPORT_PARAMS_ID = 'market-predictions-performance'
@@ -261,33 +262,129 @@ export function MarketPredictionsPerformancePage() {
   const runReport = () => fetchPage(1, pageSizeInput)
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
 
+  // Single object every persistence path (the "Save parameters" slot below, and every
+  // report-profile save) builds from the same current control values.
+  const captureCurrentParams = (): SavedParams => ({
+    startDate,
+    endDate,
+    tickerTypes,
+    tickers,
+    pageSize: pageSizeInput,
+    orderBy,
+    marketCapOp,
+    marketCapValue,
+    markovExitPriceConfidenceOp,
+    markovExitPriceConfidenceValue,
+    mcmcExitPriceConfidenceOp,
+    mcmcExitPriceConfidenceValue,
+    markovWinRateOp,
+    markovWinRateValue,
+    mcmcWinRateOp,
+    mcmcWinRateValue,
+  })
+
   const [paramsJustSaved, setParamsJustSaved] = useState(false)
   const paramsSavedFlashTimeout = useRef<number | null>(null)
   useEffect(() => () => {
     if (paramsSavedFlashTimeout.current) window.clearTimeout(paramsSavedFlashTimeout.current)
   }, [])
   const saveParams = () => {
-    saveReportParams<SavedParams>(REPORT_PARAMS_ID, {
-      startDate,
-      endDate,
-      tickerTypes,
-      tickers,
-      pageSize: pageSizeInput,
-      orderBy,
-      marketCapOp,
-      marketCapValue,
-      markovExitPriceConfidenceOp,
-      markovExitPriceConfidenceValue,
-      mcmcExitPriceConfidenceOp,
-      mcmcExitPriceConfidenceValue,
-      markovWinRateOp,
-      markovWinRateValue,
-      mcmcWinRateOp,
-      mcmcWinRateValue,
-    })
+    saveReportParams<SavedParams>(REPORT_PARAMS_ID, captureCurrentParams())
     setParamsJustSaved(true)
     if (paramsSavedFlashTimeout.current) window.clearTimeout(paramsSavedFlashTimeout.current)
     paramsSavedFlashTimeout.current = window.setTimeout(() => setParamsJustSaved(false), 1500)
+  }
+
+  // Named, multiple presets (params + grid view) - a step up from the single
+  // save-parameters/save-view slots above. See reportProfiles.ts.
+  const [profiles, setProfiles] = useState<ReportProfile<SavedParams>[]>(() =>
+    loadReportProfiles<SavedParams>(REPORT_PARAMS_ID),
+  )
+  const [activeProfileName, setActiveProfileName] = useState<string | null>(null)
+  const [savingAsNewProfile, setSavingAsNewProfile] = useState(false)
+  const [newProfileNameInput, setNewProfileNameInput] = useState('')
+  const [profileJustSaved, setProfileJustSaved] = useState(false)
+  const profileSavedFlashTimeout = useRef<number | null>(null)
+  useEffect(() => () => {
+    if (profileSavedFlashTimeout.current) window.clearTimeout(profileSavedFlashTimeout.current)
+  }, [])
+  // Bumped on every profile load to force ReportGrid (via its `key` prop below) to
+  // remount, so its mount-time view-loading logic re-reads the view JSON handleLoadProfile
+  // just wrote into localStorage - ReportGrid itself stays an uncontrolled component.
+  const [gridInstanceKey, setGridInstanceKey] = useState(0)
+
+  const flashProfileSaved = () => {
+    setProfileJustSaved(true)
+    if (profileSavedFlashTimeout.current) window.clearTimeout(profileSavedFlashTimeout.current)
+    profileSavedFlashTimeout.current = window.setTimeout(() => setProfileJustSaved(false), 1500)
+  }
+
+  const applyProfileParams = (params: SavedParams) => {
+    setStartDate(params.startDate)
+    setEndDate(params.endDate)
+    setTickerTypes(params.tickerTypes)
+    setTickers(params.tickers)
+    setOrderBy(params.orderBy)
+    setPageSizeInput(params.pageSize)
+    setMarketCapOp(params.marketCapOp)
+    setMarketCapValue(params.marketCapValue)
+    setMarkovExitPriceConfidenceOp(params.markovExitPriceConfidenceOp)
+    setMarkovExitPriceConfidenceValue(params.markovExitPriceConfidenceValue)
+    setMcmcExitPriceConfidenceOp(params.mcmcExitPriceConfidenceOp)
+    setMcmcExitPriceConfidenceValue(params.mcmcExitPriceConfidenceValue)
+    setMarkovWinRateOp(params.markovWinRateOp)
+    setMarkovWinRateValue(params.markovWinRateValue)
+    setMcmcWinRateOp(params.mcmcWinRateOp)
+    setMcmcWinRateValue(params.mcmcWinRateValue)
+  }
+
+  // Populates the controls (and the grid's view) from a saved profile - never runs the
+  // report, same "loading never auto-runs" convention as reportParams.ts's own load.
+  // Nothing is written back to storage here, so freely editing afterward can't affect
+  // the saved profile until Update/Save as... is clicked again.
+  const handleLoadProfile = (name: string) => {
+    const profile = profiles.find((p) => p.name === name)
+    if (!profile) return
+    applyProfileParams(profile.params)
+    writeRawGridView(REPORT_PARAMS_ID, profile.view)
+    setActiveProfileName(profile.name)
+    setGridInstanceKey((key) => key + 1)
+  }
+
+  const handleUpdateActiveProfile = () => {
+    if (!activeProfileName) return
+    upsertReportProfile<SavedParams>(REPORT_PARAMS_ID, {
+      name: activeProfileName,
+      params: captureCurrentParams(),
+      view: readRawGridView(REPORT_PARAMS_ID),
+      updatedAt: new Date().toISOString(),
+    })
+    setProfiles(loadReportProfiles<SavedParams>(REPORT_PARAMS_ID))
+    flashProfileSaved()
+  }
+
+  const handleSaveAsNewProfile = () => {
+    const name = newProfileNameInput.trim()
+    if (!name) return
+    upsertReportProfile<SavedParams>(REPORT_PARAMS_ID, {
+      name,
+      params: captureCurrentParams(),
+      view: readRawGridView(REPORT_PARAMS_ID),
+      updatedAt: new Date().toISOString(),
+    })
+    setProfiles(loadReportProfiles<SavedParams>(REPORT_PARAMS_ID))
+    setActiveProfileName(name)
+    setNewProfileNameInput('')
+    setSavingAsNewProfile(false)
+    flashProfileSaved()
+  }
+
+  const handleDeleteActiveProfile = () => {
+    if (!activeProfileName) return
+    if (!window.confirm(`Delete profile "${activeProfileName}"?`)) return
+    deleteReportProfile(REPORT_PARAMS_ID, activeProfileName)
+    setProfiles(loadReportProfiles<SavedParams>(REPORT_PARAMS_ID))
+    setActiveProfileName(null)
   }
 
   const addOrderField = (field: string) => {
@@ -324,17 +421,23 @@ export function MarketPredictionsPerformancePage() {
         specific tickers before running.
       </p>
 
-      <div className="report-controls">
-        <button
-          type="button"
-          className="report-filters-toggle"
-          aria-expanded={!filtersCollapsed}
-          onClick={() => setFiltersCollapsed((value) => !value)}
-        >
-          <ChevronIcon className={`icon${filtersCollapsed ? ' job-collapse-icon-collapsed' : ''}`} />
-          <span>Filters</span>
-        </button>
+      <section className="job-card report-filters-card">
+        <div className="job-card-header">
+          <div className="job-card-header-left">
+            <button
+              type="button"
+              className="icon-button job-collapse-button"
+              aria-expanded={!filtersCollapsed}
+              aria-label={filtersCollapsed ? 'Expand filters' : 'Collapse filters'}
+              onClick={() => setFiltersCollapsed((value) => !value)}
+            >
+              <ChevronIcon className={`icon${filtersCollapsed ? ' job-collapse-icon-collapsed' : ''}`} />
+            </button>
+            <h2 className="job-card-title">Filters</h2>
+          </div>
+        </div>
         {!filtersCollapsed && (
+          <>
           <div className="report-controls-fields market-predictions-performance-fields">
             <div className="job-field">
               <span className="job-field-label">Start date</span>
@@ -559,33 +662,103 @@ export function MarketPredictionsPerformancePage() {
               </div>
             </div>
           </div>
+          <div className="report-controls-actions">
+            <button
+              type="button"
+              className="job-button job-button-primary"
+              disabled={loading || !Number.isFinite(pageSizeInput) || pageSizeInput < 1}
+              onClick={runReport}
+            >
+              {loading ? 'Running...' : 'Run report'}
+            </button>
+            <button type="button" className="job-button" onClick={saveParams}>
+              {paramsJustSaved ? 'Saved' : 'Save parameters'}
+            </button>
+          </div>
+          <div className="report-profiles-bar">
+            <span className="job-field-label">Profile</span>
+            <select
+              className="report-profile-select"
+              value={activeProfileName ?? ''}
+              onChange={(event) => (event.target.value ? handleLoadProfile(event.target.value) : setActiveProfileName(null))}
+            >
+              <option value="">— Select a profile —</option>
+              {[...profiles]
+                .sort((a, b) => a.name.localeCompare(b.name))
+                .map((profile) => (
+                  <option key={profile.name} value={profile.name}>
+                    {profile.name}
+                  </option>
+                ))}
+            </select>
+            <button type="button" className="job-button" disabled={!activeProfileName} onClick={handleUpdateActiveProfile}>
+              {profileJustSaved && !savingAsNewProfile ? 'Saved' : 'Update'}
+            </button>
+            {savingAsNewProfile ? (
+              <>
+                <input
+                  type="text"
+                  className="report-profile-name-input"
+                  placeholder="Profile name"
+                  value={newProfileNameInput}
+                  autoFocus
+                  onChange={(event) => setNewProfileNameInput(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      event.preventDefault()
+                      handleSaveAsNewProfile()
+                    } else if (event.key === 'Escape') {
+                      setSavingAsNewProfile(false)
+                      setNewProfileNameInput('')
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  className="job-button job-button-primary"
+                  disabled={!newProfileNameInput.trim()}
+                  onClick={handleSaveAsNewProfile}
+                >
+                  {profileJustSaved ? 'Saved' : 'Confirm'}
+                </button>
+                <button
+                  type="button"
+                  className="job-button"
+                  onClick={() => {
+                    setSavingAsNewProfile(false)
+                    setNewProfileNameInput('')
+                  }}
+                >
+                  Cancel
+                </button>
+              </>
+            ) : (
+              <button type="button" className="job-button" onClick={() => setSavingAsNewProfile(true)}>
+                Save as...
+              </button>
+            )}
+            <button type="button" className="job-button job-button-danger" disabled={!activeProfileName} onClick={handleDeleteActiveProfile}>
+              Delete
+            </button>
+          </div>
+          </>
         )}
-        <div className="report-controls-actions">
-          <button
-            type="button"
-            className="job-button job-button-primary"
-            disabled={loading || !Number.isFinite(pageSizeInput) || pageSizeInput < 1}
-            onClick={runReport}
-          >
-            {loading ? 'Running...' : 'Run report'}
-          </button>
-          <button type="button" className="job-button" onClick={saveParams}>
-            {paramsJustSaved ? 'Saved' : 'Save parameters'}
-          </button>
-        </div>
-      </div>
+      </section>
 
       {error && <p className="jobs-error">{error}</p>}
 
       {!loading && rows && (
         <>
           <ReportGrid
+            key={gridInstanceKey}
             columns={COLUMNS}
             rows={rows}
             rowKey={rowKey}
             formatCell={formatCell}
             emptyMessage="No market predictions found for this range."
-            storageKey="market-predictions-performance"
+            storageKey={REPORT_PARAMS_ID}
+            exportFilename="market-prediction-performance"
+            exportTitle="Market Prediction Performance"
           />
           <div className="report-pager">
             <button

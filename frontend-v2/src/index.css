@@ -1001,27 +1001,47 @@ body {
   gap: 12px;
 }
 
-/* Toggles .report-controls-fields visibility - same ChevronIcon/rotation convention as
-   JobCard's .job-collapse-button, just with a text label since this button isn't
-   paired with an adjacent title the way each job card's is. */
-.report-filters-toggle {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  align-self: flex-start;
-  background: none;
-  border: none;
-  padding: 0;
-  color: var(--text-secondary);
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
+/* Wraps the report's filter/param controls in the same card look JobCard.tsx uses
+   (.job-card/.job-card-header/.job-collapse-button, all reused as-is) - margin-bottom
+   takes over .report-controls' old 20px gap now that this is the outer element. */
+.report-filters-card {
+  margin-bottom: 20px;
 }
 
-.report-filters-toggle .icon {
-  width: 14px;
-  height: 14px;
-  transition: transform 0.15s ease;
+/* Row of named-profile controls (load/update/save as/delete) - same shape as
+   .report-controls-actions just for the profile-specific buttons, with its own select/
+   text input styled to match .job-field input/select since they're not wrapped in a
+   .job-field (this bar is a single inline row, not a label-above-control field). */
+.report-profiles-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.report-profile-select,
+.report-profile-name-input {
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--page);
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.report-profile-select {
+  min-width: 200px;
+}
+
+.report-profile-name-input {
+  width: 180px;
+}
+
+.report-profile-select:focus,
+.report-profile-name-input:focus {
+  outline: 2px solid var(--series-1);
+  outline-offset: -1px;
 }
 
 .report-ticker-type-field {

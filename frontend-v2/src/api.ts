@@ -651,6 +651,7 @@ export interface ResearchPickRow {
   backtest_score: number
   rsi_adjustment: number
   news_adjustment: number
+  entry_price: number | null
   markov_predicted_state: string
   markov_expected_return: number
   markov_state_confidence: number

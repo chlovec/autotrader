@@ -1,6 +1,7 @@
 import { createPortal } from 'react-dom'
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react'
 import { isNumericFilterOp, matchesCondition, type NumericCondition } from '../numericFilter'
+import { downloadCsv, downloadPdf } from '../reportExport'
 import { ColumnHeaderMenu } from './ColumnHeaderMenu'
 import { useAnchoredDropdown } from './useAnchoredDropdown'
 
@@ -32,11 +33,18 @@ type ReportGridProps<T> = {
   // Right-click menu shown for any row, e.g. [{ label: 'View Details', onSelect: ... }] -
   // omit to leave rows without a context menu (the browser's native one still shows).
   rowContextMenu?: RowMenuItem<T>[]
+  // Base filename (no extension - each export button appends its own) for the "Export
+  // CSV"/"Export PDF" toolbar buttons. Omit to leave the grid without export buttons,
+  // same opt-in shape as storageKey.
+  exportFilename?: string
+  // Title printed above the table in the exported PDF - only used when exportFilename
+  // is set. Defaults to exportFilename itself if omitted.
+  exportTitle?: string
 }
 
 type SortDir = 'asc' | 'desc'
 
-type SavedView<Key extends string> = {
+export type SavedView<Key extends string> = {
   sortKey: Key | null
   sortDir: SortDir
   filters: Partial<Record<Key, string[]>>
@@ -48,6 +56,29 @@ type SavedView<Key extends string> = {
 
 function viewStorageKey(id: string): string {
   return `report-grid-view:${id}`
+}
+
+// Raw (unsanitized) read/write of a report's "Save view" JSON, keyed by the same
+// `storageKey` prop this component already uses for its own load/save. Lets a page
+// bundle the grid's view into something bigger (see reportProfiles.ts) without this
+// component needing to know about profiles at all - sanitization against the current
+// columns still happens on mount, in loadSavedView below, same as a normal reload.
+export function readRawGridView(id: string): unknown | null {
+  try {
+    const raw = window.localStorage.getItem(viewStorageKey(id))
+    return raw ? JSON.parse(raw) : null
+  } catch {
+    return null
+  }
+}
+
+export function writeRawGridView(id: string, view: unknown): void {
+  try {
+    if (view == null) window.localStorage.removeItem(viewStorageKey(id))
+    else window.localStorage.setItem(viewStorageKey(id), JSON.stringify(view))
+  } catch {
+    // Storage full/unavailable (private browsing, quota) - same reasoning as saveView.
+  }
 }
 
 // Sanitizes against the *current* column list rather than trusting the saved JSON
@@ -208,6 +239,8 @@ export function ReportGrid<T>({
   emptyMessage,
   storageKey,
   rowContextMenu,
+  exportFilename,
+  exportTitle,
 }: ReportGridProps<T>) {
   type Key = Extract<keyof T, string>
 
@@ -375,6 +408,16 @@ export function ReportGrid<T>({
     if (!sortKey) return filteredRows
     return [...filteredRows].sort((a, b) => compareRows(a, b, sortKey, sortDir))
   }, [filteredRows, sortKey, sortDir])
+
+  const handleExportCsv = () => {
+    if (!exportFilename) return
+    downloadCsv(`${exportFilename}.csv`, visibleColumns, sortedRows, formatCell)
+  }
+
+  const handleExportPdf = () => {
+    if (!exportFilename) return
+    downloadPdf(`${exportFilename}.pdf`, exportTitle ?? exportFilename, visibleColumns, sortedRows, formatCell)
+  }
 
   const setSort = (key: Key, dir: SortDir) => {
     setSortKey(key)
@@ -544,6 +587,16 @@ export function ReportGrid<T>({
           </>
         )}
         <ColumnsMenu columns={columns} hiddenKeys={hiddenKeys} onToggle={toggleHidden} />
+        {exportFilename && (
+          <>
+            <button type="button" className="job-button" onClick={handleExportCsv}>
+              Export CSV
+            </button>
+            <button type="button" className="job-button" onClick={handleExportPdf}>
+              Export PDF
+            </button>
+          </>
+        )}
       </div>
 
       {/* thead renders unconditionally, even when no rows survive the current filters -

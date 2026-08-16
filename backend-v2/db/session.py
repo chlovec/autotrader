@@ -66,6 +66,7 @@ def init_db() -> None:
     _drop_ticker_bar_sync_state_table()
     _add_tickers_last_ohlc_sync_date_column()
     _add_ticker_types_rank_status_columns()
+    _add_research_picks_entry_price_column()
 
 
 def _add_column_if_missing(table: str, column: str, ddl_type: str) -> None:
@@ -246,6 +247,14 @@ def _add_ticker_types_rank_status_columns() -> None:
     DEFAULT 0"."""
     _add_column_if_missing("ticker_types", "rank", "INTEGER")
     _add_column_if_missing("ticker_types", "status", "VARCHAR DEFAULT 'active'")
+
+
+def _add_research_picks_entry_price_column() -> None:
+    """See db/models.py's ResearchPick.entry_price - left NULL on existing rows, same
+    as any other column added to a table with existing data (e.g.
+    _add_tickers_last_ohlc_sync_date_column); only jobs/research_picks.py's next run
+    populates it."""
+    _add_column_if_missing("research_picks", "entry_price", "FLOAT")
 
 
 def get_session() -> Session:

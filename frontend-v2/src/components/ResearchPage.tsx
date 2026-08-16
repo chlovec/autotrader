@@ -9,6 +9,7 @@ const COLUMNS: ReportColumn<ResearchPickRow>[] = [
   { key: 'ticker', label: 'Ticker' },
   { key: 'name', label: 'Name' },
   { key: 'predicted_direction', label: 'Direction' },
+  { key: 'entry_price', label: 'Entry Price' },
   { key: 'markov_expected_return', label: 'Markov Expected Return' },
   { key: 'mcmc_expected_return', label: 'MCMC Expected Return' },
   { key: 'markov_state_confidence', label: 'Markov Confidence' },
@@ -158,6 +159,8 @@ export function ResearchPage() {
             formatCell={formatCell}
             emptyMessage="No research picks yet - run the job from the button above."
             storageKey="research-picks"
+            exportFilename="research-picks"
+            exportTitle="Research Picks"
           />
         </>
       )}
