@@ -566,9 +566,15 @@ body {
 
 .job-progress {
   display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0 20px 12px;
+}
+
+.job-progress-row {
+  display: flex;
   align-items: center;
   gap: 10px;
-  padding: 0 20px 12px;
 }
 
 .job-progress-bar {
@@ -601,6 +607,11 @@ body {
   font-weight: 600;
   color: var(--text-muted);
   white-space: nowrap;
+}
+
+.job-progress-timing {
+  font-size: 11px;
+  color: var(--text-muted);
 }
 
 .job-status-badge.paused {

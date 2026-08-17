@@ -664,6 +664,153 @@ class MarketPredictionMonteCarlo(Base):
     computed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
 
 
+class LstmModelVersion(Base):
+    """One row per completed run of jobs/train_lstm_holdout.py's train_lstm_holdout or
+    jobs/train_lstm_walkforward.py's train_lstm_walkforward - a pooled (cross-ticker,
+    not per-ticker) LSTM trained on the same STATE_LABELS quantile buckets
+    jobs/predict_market_state.py fits, plus a regression head for the raw next-period
+    return, so its predictions mean the same thing as the Markov/Monte Carlo tables'
+    and are directly comparable. Unlike those two, features are engineered fresh from
+    ohlc_bars (close-to-close pcnt_increase, (high - low) / close, log-volume z-scored
+    within each ticker's own lookback window) rather than reusing a fitted transition
+    matrix - see jobs/lstm_common.py.
+
+    training_method is "holdout" (jobs/train_lstm_holdout.py: one chronological
+    train/validation split) or "walkforward" (jobs/train_lstm_walkforward.py: several
+    rolling-cutoff folds, evaluated the way jobs/backtest_market_state.py evaluates the
+    Markov chain, but coarsened to per-fold blocks rather than every day since
+    retraining a network daily would be computationally prohibitive). Both flavors
+    exist side by side specifically so their JobRun.started_at/finished_at - and this
+    row's own duration_seconds - can be compared directly, before committing to running
+    the more expensive one regularly. A walkforward run's num_folds folds are each
+    logged into that run's JobRun.result_summary (no per-fold table - the folds
+    themselves are an evaluation detail, not something other jobs need to query); only
+    the *final* fold's trained weights (the ones fit on the most data) are saved here as
+    this row's usable checkpoint, so a walkforward run still produces a model the
+    inference job can consume, not just an evaluation report.
+
+    Both training jobs evaluate on their validation split after *every* epoch (each
+    fold's own split, for walkforward) and keep whichever epoch had the lowest val_loss
+    - not necessarily the last epoch trained, since training loss keeps falling by
+    construction while validation loss can start rising again once the model overfits.
+    train_loss/val_loss/val_accuracy are that *best* epoch's metrics (that fold's best
+    epoch, for walkforward's final fold), and model_path's checkpoint is that same best
+    epoch's weights - see jobs/train_lstm_holdout.py/jobs/train_lstm_walkforward.py's
+    own docstrings. duration_seconds is this run's own wall-clock training time (every
+    epoch, not just the best one) - the number the two-flavor split exists to compare.
+    model_path is a checkpoint file under backend-v2/data/lstm_models/{id}.pt (same
+    data/-directory convention as jobs/sync_etf_constituents.py's holdings files),
+    written after this row is inserted (so its id is known) and then backfilled onto
+    this row.
+
+    Not upserted - unlike MarketPrediction/MarketPredictionMonteCarlo, every training
+    run is its own new row (there's no natural (ticker, date) key to overwrite), so
+    inference can pick a specific past version - see LstmInference.model_version_id and
+    JobConfig.lstm_model_version_id - not just always "whatever's newest"."""
+
+    __tablename__ = "lstm_model_versions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    training_method: Mapped[str] = mapped_column(String)
+    job_run_id: Mapped[int] = mapped_column(ForeignKey("job_runs.id"))
+    trained_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
+    train_start_date: Mapped[dt.date] = mapped_column(Date)
+    train_end_date: Mapped[dt.date] = mapped_column(Date)
+    lookback_days: Mapped[int] = mapped_column(Integer)
+    epochs: Mapped[int] = mapped_column(Integer)
+    learning_rate: Mapped[float] = mapped_column(Float)
+    batch_size: Mapped[int] = mapped_column(Integer)
+    # Only set for training_method == "walkforward" - see this class's docstring.
+    num_folds: Mapped[int | None] = mapped_column(Integer)
+    # Comma-separated, same convention as JobConfig.ticker_types/tickers - None means
+    # the whole ticker universe was used to train this version.
+    ticker_types: Mapped[str | None] = mapped_column(String)
+    tickers: Mapped[str | None] = mapped_column(String)
+    train_loss: Mapped[float] = mapped_column(Float)
+    val_loss: Mapped[float] = mapped_column(Float)
+    val_accuracy: Mapped[float] = mapped_column(Float)
+    duration_seconds: Mapped[float] = mapped_column(Float)
+    model_path: Mapped[str] = mapped_column(String)
+
+
+class LstmInference(Base):
+    """One row per (ticker, predicted_date, training_method), produced by
+    jobs/predict_lstm_market_state.py's compute_lstm_market_state_predictions - the
+    LSTM counterpart to MarketPrediction/MarketPredictionMonteCarlo, for the
+    Prediction Comparison report (see app/main.py's prediction_comparison_report) to
+    show all three side by side.
+
+    training_method ("holdout" or "walkforward", same values as
+    LstmModelVersion.training_method) is part of the primary key, not just a display
+    field: predict-lstm-market-state-holdout and predict-lstm-market-state-walkforward
+    are two independent jobs (registry.py's PREDICT_LSTM_HOLDOUT_JOB/
+    PREDICT_LSTM_WALKFORWARD_JOB) specifically so each flavor's predictions can be
+    compared side by side rather than one silently overwriting the other's row for the
+    same (ticker, predicted_date) - see jobs/predict_lstm_market_state.py's
+    compute_lstm_market_state_predictions, which always resolves its LstmModelVersion
+    from *that job's own* training_method (or an explicit model_version_id override
+    that must match it - see JobConfig.lstm_model_version_id).
+
+    current_state/predicted_state/state_confidence/expected_return/entry_price/
+    exit_price/entry_time/exit_time/history_days mean the same thing as the other two
+    tables' columns of the same name - predicted_state comes from the same
+    STATE_LABELS quantile buckets (see LstmModelVersion's docstring), so a "predicted
+    up" from any of the three models means the same thing. state_confidence is the
+    predicted state's own softmax probability (prob_<predicted_state> below), not an
+    argmax-of-transition-counts or simulated frequency the way the other two compute
+    it.
+
+    prob_strong_down/prob_down/prob_flat/prob_up/prob_strong_up are the model's full
+    softmax output - richer than the other two tables, which only ever surface their
+    single most-likely state. expected_return is the regression head's raw predicted
+    next-period return (a fraction, same convention as the other two tables);
+    exit_price is entry_price * (1 + expected_return), same formula as
+    MarketPrediction.exit_price.
+
+    exit_price_confidence is 1 - (predicted_state's historical return std / (1 +
+    expected_return)) - same coefficient-of-variation formula shape as
+    MarketPrediction.exit_price_confidence, using this ticker's own historical return
+    distribution (jobs/lstm_common.build_inference_windows' bucket_stds, fit the same
+    way jobs/predict_market_state.py's own compute_market_state_predictions fits its
+    bucket_stds) rather than the LSTM's own regression head, which has no native
+    notion of its own uncertainty. Distinct from state_confidence, which measures
+    confidence in the predicted *state* (the classifier's softmax probability), not the
+    predicted return/price's own spread - a state predicted with high state_confidence
+    can still have a wide historical return spread within that bucket, and vice versa.
+
+    model_version_id (FK to LstmModelVersion.id) records exactly which trained model
+    produced this row - i.e. which of possibly several retrainings of this same
+    training_method (see JobConfig.lstm_model_version_id).
+
+    Upserted - a re-run for the same (ticker, predicted_date, training_method)
+    overwrites that flavor's prior prediction rather than accumulating rows, same
+    semantics as MarketPrediction; the *other* flavor's row for that (ticker,
+    predicted_date) is untouched."""
+
+    __tablename__ = "lstm_inferences"
+
+    ticker: Mapped[str] = mapped_column(ForeignKey("tickers.ticker"), primary_key=True)
+    predicted_date: Mapped[dt.date] = mapped_column(Date, primary_key=True)
+    training_method: Mapped[str] = mapped_column(String, primary_key=True)
+    current_state: Mapped[str] = mapped_column(String)
+    predicted_state: Mapped[str] = mapped_column(String)
+    state_confidence: Mapped[float] = mapped_column(Float)
+    prob_strong_down: Mapped[float] = mapped_column(Float)
+    prob_down: Mapped[float] = mapped_column(Float)
+    prob_flat: Mapped[float] = mapped_column(Float)
+    prob_up: Mapped[float] = mapped_column(Float)
+    prob_strong_up: Mapped[float] = mapped_column(Float)
+    expected_return: Mapped[float] = mapped_column(Float)
+    entry_price: Mapped[float] = mapped_column(Float)
+    exit_price: Mapped[float] = mapped_column(Float)
+    exit_price_confidence: Mapped[float] = mapped_column(Float)
+    entry_time: Mapped[str] = mapped_column(String)
+    exit_time: Mapped[str] = mapped_column(String)
+    history_days: Mapped[int] = mapped_column(Integer)
+    model_version_id: Mapped[int] = mapped_column(ForeignKey("lstm_model_versions.id"))
+    computed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
+
+
 class WinRate(Base):
     """One row per ticker, produced by jobs/win_rates.py's compute_win_rates. Purely
     local - no massive.com call, reads market_predictions/market_predictions_mcmc
@@ -698,6 +845,86 @@ class WinRate(Base):
     markov_win_count: Mapped[int] = mapped_column(Integer)
     markov_predictions_count: Mapped[int] = mapped_column(Integer)
     markov_win_rate: Mapped[float | None] = mapped_column(Float)
+
+
+class PredictionAccuracy(Base):
+    """One row per (ticker, predicted_date), produced by
+    jobs/prediction_accuracy.py's compute_prediction_accuracy - scores each of the four
+    prediction sources' (Markov/MarketPrediction, Monte Carlo/MarketPredictionMonteCarlo,
+    LSTM holdout/LstmInference, LSTM walkforward/LstmInference) predicted exit_price for
+    a given (ticker, predicted_date) against what actually happened
+    (ohlc_bars.close on predicted_date), all four side by side in one table - the
+    accuracy counterpart to app/main.py's prediction_comparison_report, which shows the
+    same four sources' raw predictions rather than scoring them.
+
+    Unlike WinRate above (a per-ticker running tally of *directional* agreement,
+    Markov/MCMC only), this scores whether the predicted *price* landed close enough to
+    the actual price, one row per evaluation event rather than a lifetime aggregate,
+    and covers all four sources rather than two.
+
+    actual_exit_price is ohlc_bars.close on predicted_date - only computed once that bar
+    is synced (a (ticker, predicted_date) pair with no such bar yet isn't evaluable, so
+    no row is stored for it until it is).
+
+    price_std is the shared yardstick every one of the four sources is graded against -
+    NOT any model's own self-reported spread (MarketPredictionMonteCarlo.exit_price_std,
+    or a value backed out of *_exit_price_confidence), but this ticker's own historical
+    close-to-close return standard deviation (fit over its own bar history strictly
+    before predicted_date, no lookahead - same causal-cutoff discipline
+    jobs/backtest_market_state.py's own walk-forward evaluation already uses),
+    multiplied by entry_price to rescale it from return-space to price-space (same
+    rescaling jobs/predict_market_state.py's own exit_price_confidence already applies).
+    A single shared std keeps the four sources on equal footing - each is graded
+    against how volatile the ticker actually is, not against how (over- or under-)
+    confident that particular model's own uncertainty estimate happened to be.
+    history_days is how many historical returns price_std was fit on;
+    pass_threshold_std is a snapshot of the JobConfig.prediction_accuracy_pass_threshold_std
+    value in effect for this row (JobConfig itself isn't versioned, so a later config
+    edit shouldn't silently change what an old, already-computed row's pass/fail meant).
+
+    Per source (markov_/mcmc_/lstm_holdout_/lstm_walkforward_ prefix): predicted_exit_price
+    is that source's own stored exit_price for this (ticker, predicted_date) - null if
+    that source has no prediction for it. error is actual_exit_price -
+    predicted_exit_price (signed - positive means the actual price came in higher than
+    predicted). error_std is abs(error) / price_std - how many standard deviations off
+    the prediction was, null if price_std is 0 (can't meaningfully score against a flat
+    price history) or that source has no prediction. passed is
+    error_std <= pass_threshold_std, null under the same conditions as error_std (an
+    unscored source is neither a pass nor a fail).
+
+    Upserted - a re-run overwrites the prior row for a (ticker, predicted_date) rather
+    than accumulating history, same semantics as MarketPredictionBacktest."""
+
+    __tablename__ = "prediction_accuracy"
+
+    ticker: Mapped[str] = mapped_column(ForeignKey("tickers.ticker"), primary_key=True)
+    predicted_date: Mapped[dt.date] = mapped_column(Date, primary_key=True)
+    actual_exit_price: Mapped[float] = mapped_column(Float)
+    price_std: Mapped[float] = mapped_column(Float)
+    history_days: Mapped[int] = mapped_column(Integer)
+    pass_threshold_std: Mapped[float] = mapped_column(Float)
+
+    markov_predicted_exit_price: Mapped[float | None] = mapped_column(Float)
+    markov_error: Mapped[float | None] = mapped_column(Float)
+    markov_error_std: Mapped[float | None] = mapped_column(Float)
+    markov_passed: Mapped[bool | None] = mapped_column(Boolean)
+
+    mcmc_predicted_exit_price: Mapped[float | None] = mapped_column(Float)
+    mcmc_error: Mapped[float | None] = mapped_column(Float)
+    mcmc_error_std: Mapped[float | None] = mapped_column(Float)
+    mcmc_passed: Mapped[bool | None] = mapped_column(Boolean)
+
+    lstm_holdout_predicted_exit_price: Mapped[float | None] = mapped_column(Float)
+    lstm_holdout_error: Mapped[float | None] = mapped_column(Float)
+    lstm_holdout_error_std: Mapped[float | None] = mapped_column(Float)
+    lstm_holdout_passed: Mapped[bool | None] = mapped_column(Boolean)
+
+    lstm_walkforward_predicted_exit_price: Mapped[float | None] = mapped_column(Float)
+    lstm_walkforward_error: Mapped[float | None] = mapped_column(Float)
+    lstm_walkforward_error_std: Mapped[float | None] = mapped_column(Float)
+    lstm_walkforward_passed: Mapped[bool | None] = mapped_column(Boolean)
+
+    computed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
 
 
 class ResearchPick(Base):
@@ -889,6 +1116,32 @@ class JobConfig(Base):
     date after today is rejected, not clamped), and a None ohlc_bars_limit to 8000
     (capped at 10000 regardless of what's stored here).
 
+    lstm_train_start_date/lstm_train_end_date/lstm_epochs/lstm_lookback_days/
+    lstm_learning_rate/lstm_batch_size only apply to the train-lstm-holdout and
+    train-lstm-walkforward jobs (registry.JobDefinition.has_lstm_training_fields), same
+    "left None, resolved at run time" reasoning as average_volume_start_date -
+    jobs/lstm_common.py resolves a None lstm_train_end_date to yesterday (UTC), a None
+    lstm_train_start_date to 730 days before that, and every other None field to that
+    module's own DEFAULT_* constant.
+
+    lstm_walkforward_num_folds only applies to the train-lstm-walkforward job
+    (registry.JobDefinition.has_lstm_walkforward_fields), same "left None, resolved at
+    run time" reasoning - jobs/train_lstm_walkforward.py resolves a None value to
+    jobs/lstm_common.py's DEFAULT_WALKFORWARD_NUM_FOLDS (3).
+
+    lstm_model_version_id only applies to the predict-lstm-market-state job
+    (registry.JobDefinition.has_lstm_inference_fields) - an explicit override to run
+    inference off one specific LstmModelVersion (e.g. to compare the "holdout" and
+    "walkforward" flavors' prediction quality head-to-head) instead of the default
+    behavior of jobs/predict_lstm_market_state.py, which uses whichever LstmModelVersion
+    has the most recent trained_at when this is left None.
+
+    prediction_accuracy_pass_threshold_std only applies to the compute-prediction-
+    accuracy job (registry.JobDefinition.has_prediction_accuracy_fields), same "left
+    None, resolved at run time" reasoning as average_volume_start_date -
+    jobs/prediction_accuracy.py resolves a None value to
+    DEFAULT_PASS_THRESHOLD_STD (1.0).
+
     run_requested_at is how app/main.py (the API process) asks job_runner.py (the
     separate process that actually executes jobs - see jobs/engine.py) to run this job
     now: POST /jobs/{name}/run sets it, job_runner.py's poll_run_requests clears it
@@ -920,6 +1173,15 @@ class JobConfig(Base):
     ohlc_bars_start_date: Mapped[dt.date | None] = mapped_column(Date)
     ohlc_bars_end_date: Mapped[dt.date | None] = mapped_column(Date)
     ohlc_bars_limit: Mapped[int | None] = mapped_column(Integer)
+    lstm_train_start_date: Mapped[dt.date | None] = mapped_column(Date)
+    lstm_train_end_date: Mapped[dt.date | None] = mapped_column(Date)
+    lstm_epochs: Mapped[int | None] = mapped_column(Integer)
+    lstm_lookback_days: Mapped[int | None] = mapped_column(Integer)
+    lstm_learning_rate: Mapped[float | None] = mapped_column(Float)
+    lstm_batch_size: Mapped[int | None] = mapped_column(Integer)
+    lstm_walkforward_num_folds: Mapped[int | None] = mapped_column(Integer)
+    lstm_model_version_id: Mapped[int | None] = mapped_column(Integer)
+    prediction_accuracy_pass_threshold_std: Mapped[float | None] = mapped_column(Float)
     # Hides the job's card from the Jobs page's default list (see app/main.py's
     # list_jobs) without affecting its schedule - a hidden job still runs normally.
     hidden: Mapped[bool] = mapped_column(default=False)

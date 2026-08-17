@@ -57,6 +57,25 @@ function formatDuration(seconds: number | null): string {
   return `${minutes}m ${remainder}s`
 }
 
+// started_at is naive-UTC, same "Z" append as formatTimestamp needs to parse it
+// correctly in the browser's local timezone.
+function elapsedSeconds(startedAt: string): number {
+  return (Date.now() - new Date(`${startedAt}Z`).getTime()) / 1000
+}
+
+// Rate-based ETA from elapsed time / units completed so far - the same estimator
+// shape a download progress bar uses. No backend field needed: progress_completed/
+// progress_total (reported live by the job - see jobs/control.py's
+// report_job_progress) plus started_at (already on every JobRun) are enough to derive
+// both "time spent" and "time remaining" purely client-side, recomputed on every
+// JobsPage poll tick (see JobsPage.tsx's POLL_INTERVAL_MS).
+function formatEta(startedAt: string, completed: number, total: number): string {
+  if (completed <= 0) return 'estimating...'
+  if (completed >= total) return 'finishing up...'
+  const remaining = (elapsedSeconds(startedAt) / completed) * (total - completed)
+  return formatDuration(remaining)
+}
+
 function runStatusLabel(status: JobRun['status']): string {
   if (status === 'in_progress') return 'In progress'
   if (status === 'failed') return 'Failed'
@@ -108,6 +127,22 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
   const [ohlcBarsEndDate, setOhlcBarsEndDate] = useState(job.ohlc_bars_end_date ?? '')
   // Default 8000 matches backend-v2 jobs/sync_ohlc_bars.py's DEFAULT_LIMIT.
   const [ohlcBarsLimit, setOhlcBarsLimit] = useState(job.ohlc_bars_limit ?? 8000)
+  const [lstmTrainStartDate, setLstmTrainStartDate] = useState(job.lstm_train_start_date ?? '')
+  const [lstmTrainEndDate, setLstmTrainEndDate] = useState(job.lstm_train_end_date ?? '')
+  // Defaults match backend-v2 jobs/lstm_common.py's DEFAULT_EPOCHS/
+  // DEFAULT_LOOKBACK_DAYS/DEFAULT_LEARNING_RATE/DEFAULT_BATCH_SIZE.
+  const [lstmEpochs, setLstmEpochs] = useState(job.lstm_epochs ?? 5)
+  const [lstmLookbackDays, setLstmLookbackDays] = useState(job.lstm_lookback_days ?? 60)
+  const [lstmLearningRate, setLstmLearningRate] = useState(job.lstm_learning_rate ?? 0.001)
+  const [lstmBatchSize, setLstmBatchSize] = useState(job.lstm_batch_size ?? 256)
+  // Default 3 matches backend-v2 jobs/lstm_common.py's DEFAULT_WALKFORWARD_NUM_FOLDS.
+  const [lstmWalkforwardNumFolds, setLstmWalkforwardNumFolds] = useState(job.lstm_walkforward_num_folds ?? 3)
+  const [lstmModelVersionId, setLstmModelVersionId] = useState(job.lstm_model_version_id ?? '')
+  // Default 1.0 matches backend-v2 jobs/prediction_accuracy.py's
+  // DEFAULT_PASS_THRESHOLD_STD.
+  const [predictionAccuracyPassThresholdStd, setPredictionAccuracyPassThresholdStd] = useState(
+    job.prediction_accuracy_pass_threshold_std ?? 1.0,
+  )
 
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
@@ -169,6 +204,23 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
               ohlc_bars_end_date: ohlcBarsEndDate || null,
               ohlc_bars_limit: ohlcBarsLimit,
             }
+          : {}),
+        ...(job.has_lstm_training_fields
+          ? {
+              lstm_train_start_date: lstmTrainStartDate || null,
+              lstm_train_end_date: lstmTrainEndDate || null,
+              lstm_epochs: lstmEpochs,
+              lstm_lookback_days: lstmLookbackDays,
+              lstm_learning_rate: lstmLearningRate,
+              lstm_batch_size: lstmBatchSize,
+            }
+          : {}),
+        ...(job.has_lstm_walkforward_fields ? { lstm_walkforward_num_folds: lstmWalkforwardNumFolds } : {}),
+        ...(job.has_lstm_inference_fields
+          ? { lstm_model_version_id: lstmModelVersionId === '' ? null : Number(lstmModelVersionId) }
+          : {}),
+        ...(job.has_prediction_accuracy_fields
+          ? { prediction_accuracy_pass_threshold_std: predictionAccuracyPassThresholdStd }
           : {}),
       })
       onSaved(updated)
@@ -336,14 +388,21 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
       </div>
       {job.running && job.last_run?.progress_total != null && job.last_run.progress_completed != null && (
         <div className="job-progress">
-          <progress
-            className="job-progress-bar"
-            value={job.last_run.progress_completed}
-            max={job.last_run.progress_total}
-          />
-          <span className="job-progress-label">
-            {job.last_run.progress_completed.toLocaleString()} / {job.last_run.progress_total.toLocaleString()} (
-            {Math.round((job.last_run.progress_completed / job.last_run.progress_total) * 100)}%)
+          <div className="job-progress-row">
+            <progress
+              className="job-progress-bar"
+              value={job.last_run.progress_completed}
+              max={job.last_run.progress_total}
+            />
+            <span className="job-progress-label">
+              {job.last_run.progress_completed.toLocaleString()} / {job.last_run.progress_total.toLocaleString()} (
+              {Math.round((job.last_run.progress_completed / job.last_run.progress_total) * 100)}%)
+            </span>
+          </div>
+          <span className="job-progress-timing">
+            {formatDuration(elapsedSeconds(job.last_run.started_at))} elapsed · ~
+            {formatEta(job.last_run.started_at, job.last_run.progress_completed, job.last_run.progress_total)}{' '}
+            remaining
           </span>
         </div>
       )}
@@ -481,7 +540,11 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
                 !job.has_prediction_start_date_field &&
                 !job.has_predicted_date_offset_field &&
                 !job.has_monte_carlo_fields &&
-                !job.has_ohlc_bars_fields && (
+                !job.has_ohlc_bars_fields &&
+                !job.has_lstm_training_fields &&
+                !job.has_lstm_walkforward_fields &&
+                !job.has_lstm_inference_fields &&
+                !job.has_prediction_accuracy_fields && (
                   <p className="job-field-hint">This job has no run parameters to configure.</p>
                 )}
 
@@ -724,6 +787,142 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
                     Leave start date blank to default to 2 years before today (UTC), and end date blank to default
                     to today - end date can't be after today. Limit (max 10000) caps how many tickers this run
                     selects; a backlog larger than that needs more than one run to fully catch up.
+                  </p>
+                </>
+              )}
+
+              {job.has_lstm_training_fields && (
+                <>
+                  <div className="job-field-row">
+                    <label className="job-field">
+                      Start date (UTC)
+                      <input
+                        type="date"
+                        value={lstmTrainStartDate}
+                        onChange={(e) => setLstmTrainStartDate(e.target.value)}
+                      />
+                    </label>
+                    <label className="job-field">
+                      End date (UTC)
+                      <input
+                        type="date"
+                        value={lstmTrainEndDate}
+                        onChange={(e) => setLstmTrainEndDate(e.target.value)}
+                      />
+                    </label>
+                  </div>
+                  <div className="job-field-row">
+                    <label className="job-field">
+                      Epochs
+                      <input
+                        type="number"
+                        min={1}
+                        value={lstmEpochs}
+                        onChange={(e) => setLstmEpochs(Number(e.target.value))}
+                      />
+                    </label>
+                    <label className="job-field">
+                      Lookback days
+                      <input
+                        type="number"
+                        min={2}
+                        value={lstmLookbackDays}
+                        onChange={(e) => setLstmLookbackDays(Number(e.target.value))}
+                      />
+                    </label>
+                  </div>
+                  <div className="job-field-row">
+                    <label className="job-field">
+                      Learning rate
+                      <input
+                        type="number"
+                        min={0}
+                        step={0.0001}
+                        value={lstmLearningRate}
+                        onChange={(e) => setLstmLearningRate(Number(e.target.value))}
+                      />
+                    </label>
+                    <label className="job-field">
+                      Batch size
+                      <input
+                        type="number"
+                        min={1}
+                        value={lstmBatchSize}
+                        onChange={(e) => setLstmBatchSize(Number(e.target.value))}
+                      />
+                    </label>
+                  </div>
+                  <p className="job-field-hint">
+                    Leave end date blank to default to yesterday (UTC) at run time, and start date blank to default
+                    to 730 days before that. Trains a pooled model across every selected ticker at once - not one
+                    model per ticker - so scoping down Tickers/Ticker types above is the fastest way to get a
+                    first timing comparison against the other LSTM training job.
+                  </p>
+                </>
+              )}
+
+              {job.has_lstm_walkforward_fields && (
+                <>
+                  <div className="job-field-row">
+                    <label className="job-field">
+                      Number of folds
+                      <input
+                        type="number"
+                        min={1}
+                        value={lstmWalkforwardNumFolds}
+                        onChange={(e) => setLstmWalkforwardNumFolds(Number(e.target.value))}
+                      />
+                    </label>
+                  </div>
+                  <p className="job-field-hint">
+                    Retrains from scratch at this many rolling cutoffs across the date range above and evaluates
+                    each on the block of days up to the next cutoff - more folds means a slower but more rigorous
+                    run. Only the final fold's model is kept for inference.
+                  </p>
+                </>
+              )}
+
+              {job.has_lstm_inference_fields && (
+                <>
+                  <div className="job-field-row">
+                    <label className="job-field">
+                      Model version (optional)
+                      <input
+                        type="number"
+                        min={1}
+                        placeholder="Latest"
+                        value={lstmModelVersionId}
+                        onChange={(e) => setLstmModelVersionId(e.target.value === '' ? '' : Number(e.target.value))}
+                      />
+                    </label>
+                  </div>
+                  <p className="job-field-hint">
+                    Leave blank to use whichever trained lstm_model_versions row is most recent, from either
+                    training job; set it to compare the "holdout" and "walkforward" flavors' predictions
+                    head-to-head. See the Predicted date offset field above for which session this run targets.
+                  </p>
+                </>
+              )}
+
+              {job.has_prediction_accuracy_fields && (
+                <>
+                  <div className="job-field-row">
+                    <label className="job-field">
+                      Pass threshold (std devs)
+                      <input
+                        type="number"
+                        min={0}
+                        step={0.1}
+                        value={predictionAccuracyPassThresholdStd}
+                        onChange={(e) => setPredictionAccuracyPassThresholdStd(Number(e.target.value))}
+                      />
+                    </label>
+                  </div>
+                  <p className="job-field-hint">
+                    A source's prediction passes when the actual price lands within this many standard deviations
+                    of that source's predicted exit price - the standard deviation used is the ticker's own
+                    historical return volatility, not any model's own self-reported confidence. Use Tickers/Ticker
+                    types above to scope which tickers get scored.
                   </p>
                 </>
               )}

@@ -57,6 +57,7 @@ def init_db() -> None:
     _add_job_configs_predicted_date_offset_days_column()
     _add_job_configs_mcmc_num_simulations_column()
     _add_job_configs_ohlc_bars_columns()
+    _add_job_configs_lstm_columns()
     _add_job_runs_progress_columns()
     _add_job_runs_control_columns()
     _add_market_predictions_mcmc_columns()
@@ -67,6 +68,9 @@ def init_db() -> None:
     _add_tickers_last_ohlc_sync_date_column()
     _add_ticker_types_rank_status_columns()
     _add_research_picks_entry_price_column()
+    _migrate_lstm_inferences_training_method_pk()
+    _add_lstm_inferences_exit_price_confidence_column()
+    _add_job_configs_prediction_accuracy_pass_threshold_std_column()
 
 
 def _add_column_if_missing(table: str, column: str, ddl_type: str) -> None:
@@ -137,6 +141,22 @@ def _add_job_configs_ohlc_bars_columns() -> None:
     _add_job_configs_column("ohlc_bars_start_date", "DATE")
     _add_job_configs_column("ohlc_bars_end_date", "DATE")
     _add_job_configs_column("ohlc_bars_limit", "INTEGER")
+
+
+def _add_job_configs_lstm_columns() -> None:
+    """See db/models.py's JobConfig.lstm_train_start_date etc. - added after
+    job_configs itself (a table with live production data going back to before these
+    columns existed), same reasoning as _add_job_configs_ohlc_bars_columns. Left NULL
+    on existing rows; each resolves to its own jobs/lstm_common.py DEFAULT_* at run
+    time until an operator visits one of the three LSTM jobs' cards on the Jobs page."""
+    _add_job_configs_column("lstm_train_start_date", "DATE")
+    _add_job_configs_column("lstm_train_end_date", "DATE")
+    _add_job_configs_column("lstm_epochs", "INTEGER")
+    _add_job_configs_column("lstm_lookback_days", "INTEGER")
+    _add_job_configs_column("lstm_learning_rate", "FLOAT")
+    _add_job_configs_column("lstm_batch_size", "INTEGER")
+    _add_job_configs_column("lstm_walkforward_num_folds", "INTEGER")
+    _add_job_configs_column("lstm_model_version_id", "INTEGER")
 
 
 def _add_job_runs_column(column: str, ddl_type: str) -> None:
@@ -255,6 +275,65 @@ def _add_research_picks_entry_price_column() -> None:
     _add_tickers_last_ohlc_sync_date_column); only jobs/research_picks.py's next run
     populates it."""
     _add_column_if_missing("research_picks", "entry_price", "FLOAT")
+
+
+def _migrate_lstm_inferences_training_method_pk() -> None:
+    """LstmInference gained a `training_method` column as part of its primary key
+    (ticker, predicted_date, training_method) - two independent jobs
+    (predict-lstm-market-state-holdout/predict-lstm-market-state-walkforward) now both
+    store a prediction for the same (ticker, predicted_date), one per flavor, which the
+    original (ticker, predicted_date)-only PK couldn't represent (a re-run of either
+    job would have silently overwritten the other's row). SQLite has no ALTER TABLE
+    that changes a PRIMARY KEY in place, so - same recreate-copy-drop pattern as
+    _convert_ohlc_bars_pcnt_increase_generated_column - this recreates the table under
+    db/models.py's current (new) schema, backfilling training_method for any
+    pre-existing row by joining back to lstm_model_versions.training_method via
+    model_version_id, which already unambiguously recorded which flavor produced it -
+    not a guess."""
+    inspector = inspect(engine)
+    if "lstm_inferences" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("lstm_inferences")}
+    if "training_method" in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE lstm_inferences RENAME TO lstm_inferences_old"))
+        Base.metadata.tables["lstm_inferences"].create(conn)
+        conn.execute(
+            text(
+                """
+                INSERT INTO lstm_inferences (
+                    ticker, predicted_date, training_method, current_state, predicted_state,
+                    state_confidence, prob_strong_down, prob_down, prob_flat, prob_up,
+                    prob_strong_up, expected_return, entry_price, exit_price, entry_time,
+                    exit_time, history_days, model_version_id, computed_at
+                )
+                SELECT
+                    o.ticker, o.predicted_date, v.training_method, o.current_state, o.predicted_state,
+                    o.state_confidence, o.prob_strong_down, o.prob_down, o.prob_flat, o.prob_up,
+                    o.prob_strong_up, o.expected_return, o.entry_price, o.exit_price, o.entry_time,
+                    o.exit_time, o.history_days, o.model_version_id, o.computed_at
+                FROM lstm_inferences_old o
+                JOIN lstm_model_versions v ON v.id = o.model_version_id
+                """
+            )
+        )
+        conn.execute(text("DROP TABLE lstm_inferences_old"))
+
+
+def _add_job_configs_prediction_accuracy_pass_threshold_std_column() -> None:
+    """See db/models.py's JobConfig.prediction_accuracy_pass_threshold_std - added
+    after job_configs itself, same "left NULL on existing rows, resolved at run time"
+    reasoning as _add_job_configs_mcmc_num_simulations_column."""
+    _add_job_configs_column("prediction_accuracy_pass_threshold_std", "FLOAT")
+
+
+def _add_lstm_inferences_exit_price_confidence_column() -> None:
+    """See db/models.py's LstmInference.exit_price_confidence - added after
+    lstm_inferences itself, same reasoning as _add_market_predictions_exit_price_confidence_column.
+    Existing rows get NULL until their next predict-lstm-market-state-holdout/-walkforward
+    run recomputes them."""
+    _add_column_if_missing("lstm_inferences", "exit_price_confidence", "FLOAT")
 
 
 def get_session() -> Session:

@@ -12,3 +12,9 @@ pandas>=2.2
 backtesting>=0.3.3
 pytest>=8.3
 httpx>=0.27
+# CPU-only - used only by backend-v2/jobs/lstm_common.py and the LSTM training/
+# inference jobs built on it (train-lstm-holdout, train-lstm-walkforward,
+# predict-lstm-market-state). See backend-v2/pyproject.toml, which lists it
+# separately for backend-v2's own isolated dev venv/test runs - restart-v2.sh
+# actually runs backend-v2 out of this root venv, so it needs to be here too.
+torch>=2.2

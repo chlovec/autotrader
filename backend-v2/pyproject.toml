@@ -10,6 +10,12 @@ dependencies = [
     "python-dotenv>=1.0",
     "fastapi>=0.110",
     "uvicorn>=0.29",
+    # CPU-only build - no GPU available/needed for this project's data volume. Only
+    # used by jobs/lstm_common.py and the three jobs built on it (train-lstm-holdout,
+    # train-lstm-walkforward, predict-lstm-market-state) - every other job here is
+    # pure stdlib/SQLAlchemy.
+    "torch>=2.2",
+    "numpy>=2.4.6",
 ]
 
 [project.optional-dependencies]

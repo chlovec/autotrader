@@ -49,6 +49,21 @@ export interface Job {
   has_predicted_date_offset_field: boolean
   has_monte_carlo_fields: boolean
   has_ohlc_bars_fields: boolean
+  // Whether this job offers the Start date/End date/Epochs/Lookback days/Learning
+  // rate/Batch size group (see lstm_train_start_date etc. below) - the
+  // train-lstm-holdout and train-lstm-walkforward jobs both set this.
+  has_lstm_training_fields: boolean
+  // Whether this job offers the one extra "Number of folds" field (see
+  // lstm_walkforward_num_folds below) - only train-lstm-walkforward sets this,
+  // layered on top of has_lstm_training_fields.
+  has_lstm_walkforward_fields: boolean
+  // Whether this job offers the optional "Model version" override field (see
+  // lstm_model_version_id below) - only predict-lstm-market-state sets this.
+  has_lstm_inference_fields: boolean
+  // Whether this job offers the single "Pass threshold (std devs)" field (see
+  // prediction_accuracy_pass_threshold_std below) - only compute-prediction-accuracy
+  // sets this.
+  has_prediction_accuracy_fields: boolean
   // Always the full massive.com asset-class list (jobs/registry.py's
   // SNAPSHOT_TYPE_OPTIONS), regardless of has_snapshot_type_filter - fetched from the
   // backend rather than hardcoded here so the two never drift.
@@ -105,6 +120,32 @@ export interface Job {
   // Max tickers selected per run, or null to default to 8000 at run time - capped at
   // 10000 regardless of what's stored. Only meaningful alongside has_ohlc_bars_fields.
   ohlc_bars_limit: number | null
+  // ISO dates ("YYYY-MM-DD"), or null to default to a trailing 730-day window ending
+  // yesterday (UTC) at run time - see backend-v2 jobs/lstm_common.py. Only meaningful
+  // alongside has_lstm_training_fields (the two LSTM training jobs).
+  lstm_train_start_date: string | null
+  lstm_train_end_date: string | null
+  // Or null to default to jobs/lstm_common.py's DEFAULT_EPOCHS/DEFAULT_LOOKBACK_DAYS/
+  // DEFAULT_LEARNING_RATE/DEFAULT_BATCH_SIZE at run time. Only meaningful alongside
+  // has_lstm_training_fields.
+  lstm_epochs: number | null
+  lstm_lookback_days: number | null
+  lstm_learning_rate: number | null
+  lstm_batch_size: number | null
+  // Or null to default to jobs/lstm_common.py's DEFAULT_WALKFORWARD_NUM_FOLDS (3) at
+  // run time. Only meaningful alongside has_lstm_walkforward_fields
+  // (train-lstm-walkforward).
+  lstm_walkforward_num_folds: number | null
+  // An explicit lstm_model_versions.id to run inference off, instead of the default
+  // behavior of using whichever version was trained most recently - lets the
+  // "holdout" and "walkforward" flavors' prediction quality be compared head-to-head.
+  // Only meaningful alongside has_lstm_inference_fields (predict-lstm-market-state).
+  lstm_model_version_id: number | null
+  // Actual exit price within this many standard deviations of predicted exit price =
+  // a pass, or null to default to 1.0 at run time - see backend-v2
+  // jobs/prediction_accuracy.py's compute_prediction_accuracy. Only meaningful
+  // alongside has_prediction_accuracy_fields (compute-prediction-accuracy).
+  prediction_accuracy_pass_threshold_std: number | null
   // Persisted (JobConfig.hidden), not display-only - keeps a job off the Jobs page's
   // default list across reloads until explicitly unhidden. Independent of running/
   // paused: a hidden job still runs on its schedule, it's just tucked away here.
@@ -139,6 +180,15 @@ export interface JobConfigInput {
   ohlc_bars_start_date?: string | null
   ohlc_bars_end_date?: string | null
   ohlc_bars_limit?: number | null
+  lstm_train_start_date?: string | null
+  lstm_train_end_date?: string | null
+  lstm_epochs?: number | null
+  lstm_lookback_days?: number | null
+  lstm_learning_rate?: number | null
+  lstm_batch_size?: number | null
+  lstm_walkforward_num_folds?: number | null
+  lstm_model_version_id?: number | null
+  prediction_accuracy_pass_threshold_std?: number | null
 }
 
 export interface TickerOption {
@@ -687,6 +737,157 @@ export interface MarketPredictionPerformanceOrderField {
   dir: 'asc' | 'desc'
 }
 
+// One row per ticker with a Markov, Monte Carlo, and/or either LSTM flavor's
+// prediction for the requested predicted_date - backs the Prediction Comparison report
+// grid (see app/main.py's prediction_comparison_report). Unlike MarketPredictionRow,
+// this deliberately carries no average_volume/market_cap/validation_score/
+// survivor_score - see that endpoint's docstring for why it's a focused four-way
+// comparison view rather than a fifth copy of market_predictions_report's screening
+// filters.
+//
+// lstm_holdout_*/lstm_walkforward_* are two independent sets, not one shared lstm_*
+// set - predict-lstm-market-state-holdout and predict-lstm-market-state-walkforward
+// are separate jobs (see api.ts's Job.has_lstm_inference_fields) specifically so both
+// flavors' predictions for the same ticker/date can be compared side by side, rather
+// than one silently overwriting the other.
+export interface PredictionComparisonRow {
+  ticker: string
+  name: string | null
+  predicted_date: string
+  markov_current_state: string | null
+  markov_predicted_state: string | null
+  markov_state_confidence: number | null
+  markov_expected_return: number | null
+  markov_entry_price: number | null
+  markov_exit_price: number | null
+  markov_exit_price_confidence: number | null
+  markov_entry_time: string | null
+  markov_exit_time: string | null
+  markov_history_days: number | null
+  markov_computed_at: string | null
+  mcmc_current_state: string | null
+  mcmc_predicted_state: string | null
+  mcmc_state_confidence: number | null
+  mcmc_expected_return: number | null
+  mcmc_entry_price: number | null
+  mcmc_exit_price: number | null
+  mcmc_exit_price_mean: number | null
+  mcmc_exit_price_std: number | null
+  mcmc_exit_price_confidence: number | null
+  mcmc_exit_price_p10: number | null
+  mcmc_exit_price_p50: number | null
+  mcmc_exit_price_p90: number | null
+  mcmc_entry_time: string | null
+  mcmc_exit_time: string | null
+  mcmc_num_simulations: number | null
+  mcmc_history_days: number | null
+  mcmc_computed_at: string | null
+  lstm_holdout_current_state: string | null
+  lstm_holdout_predicted_state: string | null
+  lstm_holdout_state_confidence: number | null
+  lstm_holdout_prob_strong_down: number | null
+  lstm_holdout_prob_down: number | null
+  lstm_holdout_prob_flat: number | null
+  lstm_holdout_prob_up: number | null
+  lstm_holdout_prob_strong_up: number | null
+  lstm_holdout_expected_return: number | null
+  lstm_holdout_entry_price: number | null
+  lstm_holdout_exit_price: number | null
+  lstm_holdout_exit_price_confidence: number | null
+  lstm_holdout_entry_time: string | null
+  lstm_holdout_exit_time: string | null
+  lstm_holdout_history_days: number | null
+  lstm_holdout_model_version_id: number | null
+  lstm_holdout_computed_at: string | null
+  lstm_walkforward_current_state: string | null
+  lstm_walkforward_predicted_state: string | null
+  lstm_walkforward_state_confidence: number | null
+  lstm_walkforward_prob_strong_down: number | null
+  lstm_walkforward_prob_down: number | null
+  lstm_walkforward_prob_flat: number | null
+  lstm_walkforward_prob_up: number | null
+  lstm_walkforward_prob_strong_up: number | null
+  lstm_walkforward_expected_return: number | null
+  lstm_walkforward_entry_price: number | null
+  lstm_walkforward_exit_price: number | null
+  lstm_walkforward_exit_price_confidence: number | null
+  lstm_walkforward_entry_time: string | null
+  lstm_walkforward_exit_time: string | null
+  lstm_walkforward_history_days: number | null
+  lstm_walkforward_model_version_id: number | null
+  lstm_walkforward_computed_at: string | null
+}
+
+// Backend caps page_size at 1000 (same MARKET_PREDICTIONS_MAX_PAGE_SIZE cap
+// app/main.py's prediction_comparison_report reuses from market_predictions_report).
+export const PREDICTION_COMPARISON_MAX_PAGE_SIZE = 1000
+
+export interface PredictionComparisonReport {
+  rows: PredictionComparisonRow[]
+  total: number
+  page: number
+  page_size: number
+}
+
+// Sort priority for the Prediction Comparison report - same shape as
+// MarketPredictionOrderField, against app/main.py's
+// PREDICTION_COMPARISON_ORDERABLE_FIELDS instead (a much smaller field set).
+export interface PredictionComparisonOrderField {
+  field: string
+  dir: 'asc' | 'desc'
+}
+
+// One row per (ticker, predicted_date) already scored by jobs/prediction_accuracy.py's
+// compute_prediction_accuracy - backs the Prediction Accuracy report grid (see
+// app/main.py's prediction_accuracy_report). markov_*/mcmc_*/lstm_holdout_*/
+// lstm_walkforward_* quadruples are null when that source had no prediction for this
+// (ticker, predicted_date) - see PredictionAccuracy's own docstring in db/models.py.
+export interface PredictionAccuracyRow {
+  ticker: string
+  name: string | null
+  predicted_date: string
+  actual_exit_price: number
+  price_std: number
+  history_days: number
+  pass_threshold_std: number
+  computed_at: string
+  markov_predicted_exit_price: number | null
+  markov_error: number | null
+  markov_error_std: number | null
+  markov_passed: boolean | null
+  mcmc_predicted_exit_price: number | null
+  mcmc_error: number | null
+  mcmc_error_std: number | null
+  mcmc_passed: boolean | null
+  lstm_holdout_predicted_exit_price: number | null
+  lstm_holdout_error: number | null
+  lstm_holdout_error_std: number | null
+  lstm_holdout_passed: boolean | null
+  lstm_walkforward_predicted_exit_price: number | null
+  lstm_walkforward_error: number | null
+  lstm_walkforward_error_std: number | null
+  lstm_walkforward_passed: boolean | null
+}
+
+export interface PredictionAccuracyReport {
+  rows: PredictionAccuracyRow[]
+  total: number
+  page: number
+  page_size: number
+}
+
+// Sort priority for the Prediction Accuracy report - same shape as
+// PredictionComparisonOrderField, against app/main.py's
+// PREDICTION_ACCURACY_ORDERABLE_FIELDS instead.
+export interface PredictionAccuracyOrderField {
+  field: string
+  dir: 'asc' | 'desc'
+}
+
+// Backend caps page_size at 1000 (same MARKET_PREDICTIONS_MAX_PAGE_SIZE cap
+// app/main.py's prediction_accuracy_report reuses).
+export const PREDICTION_ACCURACY_MAX_PAGE_SIZE = 1000
+
 async function getJSON<T>(path: string): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`)
   if (!res.ok) throw new Error(`${path} failed: ${res.status}`)
@@ -931,4 +1132,42 @@ export const api = {
   },
   researchPicks: (runId?: number) =>
     getJSON<ResearchPicksResult>(`/reports/research-picks${runId ? `?run_id=${runId}` : ''}`),
+  predictionComparisonReport: (
+    predictedDate: string,
+    tickerTypes: string[] = [],
+    tickers: string[] = [],
+    page = 1,
+    pageSize = PREDICTION_COMPARISON_MAX_PAGE_SIZE,
+    orderBy: PredictionComparisonOrderField[] = [],
+  ) => {
+    const orderByParam = orderBy.map(({ field, dir }) => `${field}:${dir}`).join(',')
+    const qs = new URLSearchParams()
+    qs.set('predicted_date', predictedDate)
+    qs.set('ticker_types', tickerTypes.join(','))
+    qs.set('tickers', tickers.join(','))
+    qs.set('page', String(page))
+    qs.set('page_size', String(pageSize))
+    qs.set('order_by', orderByParam)
+    return getJSON<PredictionComparisonReport>(`/reports/prediction-comparison?${qs.toString()}`)
+  },
+  predictionAccuracyReport: (
+    startDate: string,
+    endDate: string,
+    tickerTypes: string[] = [],
+    tickers: string[] = [],
+    page = 1,
+    pageSize = PREDICTION_ACCURACY_MAX_PAGE_SIZE,
+    orderBy: PredictionAccuracyOrderField[] = [],
+  ) => {
+    const orderByParam = orderBy.map(({ field, dir }) => `${field}:${dir}`).join(',')
+    const qs = new URLSearchParams()
+    qs.set('start_date', startDate)
+    qs.set('end_date', endDate)
+    qs.set('ticker_types', tickerTypes.join(','))
+    qs.set('tickers', tickers.join(','))
+    qs.set('page', String(page))
+    qs.set('page_size', String(pageSize))
+    qs.set('order_by', orderByParam)
+    return getJSON<PredictionAccuracyReport>(`/reports/prediction-accuracy?${qs.toString()}`)
+  },
 }

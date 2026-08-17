@@ -29,9 +29,33 @@ PREDICT_MARKET_STATE_JOB = "predict-market-state"
 BACKTEST_MARKET_STATE_JOB = "backtest-market-state"
 PREDICT_10_DAY_MARKET_STATE_JOB = "predict-10-day-market-state"
 WIN_RATE_JOB = "compute-win-rates"
+PREDICTION_ACCURACY_JOB = "compute-prediction-accuracy"
 RESEARCH_PICKS_JOB = "research-picks"
 ETF_CONSTITUENTS_JOB = "sync-etf-constituents"
 OHLC_BARS_JOB = "sync-ohlc-bars"
+# Two separate training jobs - one per jobs/lstm_common.py validation flavor - rather
+# than one job with a mode switch, specifically so their JobRun.started_at/finished_at
+# wall-clock time can be compared directly on the Jobs page (see jobs/train_lstm_holdout.py
+# and jobs/train_lstm_walkforward.py's module docstrings).
+TRAIN_LSTM_HOLDOUT_JOB = "train-lstm-holdout"
+TRAIN_LSTM_WALKFORWARD_JOB = "train-lstm-walkforward"
+# Two separate inference jobs - one per training flavor - rather than one job that
+# picks "whichever model is newest": that would let one flavor's re-run silently start
+# feeding the comparison report instead of the other, defeating the entire point of
+# comparing them. Each always resolves its LstmModelVersion by its own training_method
+# (see jobs/predict_lstm_market_state.py) and stores into its own
+# (ticker, predicted_date, training_method) row - see db/models.py's LstmInference.
+PREDICT_LSTM_HOLDOUT_JOB = "predict-lstm-market-state-holdout"
+PREDICT_LSTM_WALKFORWARD_JOB = "predict-lstm-market-state-walkforward"
+
+# job name -> training_method - jobs/engine.py's run_job looks up which of the two
+# flavors a given predict-lstm-market-state-* job name is via this dict, same "job name
+# -> parameter" dispatch pattern INDICATOR_NAMES already uses for the four
+# sync-{sma,ema,macd,rsi} jobs sharing one sync_indicator(indicator, ...) function.
+LSTM_INFERENCE_TRAINING_METHODS: dict[str, str] = {
+    PREDICT_LSTM_HOLDOUT_JOB: "holdout",
+    PREDICT_LSTM_WALKFORWARD_JOB: "walkforward",
+}
 
 # job name -> massive.com indicator path segment (GET /v1/indicators/{indicator}/
 # {ticker}) - jobs/sync_indicators.py's sync_indicator takes the latter, app/main.py's
@@ -75,9 +99,14 @@ DEFAULT_SCHEDULES: dict[str, tuple[str, int]] = {
     BACKTEST_MARKET_STATE_JOB: ("days", 1),
     PREDICT_10_DAY_MARKET_STATE_JOB: ("days", 1),
     WIN_RATE_JOB: ("days", 1),
+    PREDICTION_ACCURACY_JOB: ("days", 1),
     RESEARCH_PICKS_JOB: ("days", 1),
     ETF_CONSTITUENTS_JOB: ("days", 1),
     OHLC_BARS_JOB: ("days", 1),
+    TRAIN_LSTM_HOLDOUT_JOB: ("days", 1),
+    TRAIN_LSTM_WALKFORWARD_JOB: ("days", 1),
+    PREDICT_LSTM_HOLDOUT_JOB: ("days", 1),
+    PREDICT_LSTM_WALKFORWARD_JOB: ("days", 1),
 }
 
 
@@ -154,6 +183,33 @@ class JobDefinition:
     # (jobs/sync_ohlc_bars.py's _select_tickers_to_sync) is the only ticker selection
     # mechanism it has.
     has_ohlc_bars_fields: bool = False
+    # Whether this job offers the "Start date"/"End date"/"Epochs"/"Lookback days"/
+    # "Learning rate"/"Batch size" group (see jobs/lstm_common.py) - shared by both
+    # train-lstm-holdout and train-lstm-walkforward, since both train the same
+    # LstmModel over the same date-range-and-hyperparameters shape, just with a
+    # different validation strategy applied on top. Independent of the other flags,
+    # same layering as has_backtest_fields; also paired with has_ticker_selector on
+    # both jobs that set it, so a first exploratory run can scope down to a handful of
+    # tickers for a fast timing comparison.
+    has_lstm_training_fields: bool = False
+    # Whether this job offers the one extra "Number of folds" field (see
+    # jobs/train_lstm_walkforward.py) - only the train-lstm-walkforward job takes this,
+    # layered on top of has_lstm_training_fields above, same layering pattern as
+    # has_average_volume_fields on has_ticker_selector.
+    has_lstm_walkforward_fields: bool = False
+    # Whether this job offers the optional "Model version" override field (see
+    # jobs/predict_lstm_market_state.py) - only the predict-lstm-market-state job takes
+    # this. Independent of the other flags; always paired with
+    # has_predicted_date_offset_field on that job, since both fields resolve at run
+    # time (which model to use, which session to predict) rather than being fixed at
+    # config-creation time.
+    has_lstm_inference_fields: bool = False
+    # Whether this job offers the single "Pass threshold (std devs)" field (see
+    # jobs/prediction_accuracy.py) - only the compute-prediction-accuracy job takes
+    # this. Independent of the other flags, same layering as has_average_volume_fields;
+    # also paired with has_ticker_selector, so a run can be scoped to a handful of
+    # tickers.
+    has_prediction_accuracy_fields: bool = False
     # Seeded into JobConfig.run_type the first time this job's config row is created
     # (see app/main.py's _get_or_create_config). "auto" unless overridden below.
     default_run_type: str = "auto"
@@ -380,6 +436,32 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
         # average-volume/predict-market-state.
         default_run_type="manual",
     ),
+    PREDICTION_ACCURACY_JOB: JobDefinition(
+        name=PREDICTION_ACCURACY_JOB,
+        label="Compute prediction accuracy",
+        description=(
+            "For each (ticker, predicted_date) with a known actual outcome "
+            "(ohlc_bars.close already synced for predicted_date), scores every one of "
+            "the four prediction sources' (Markov, Monte Carlo, LSTM holdout, LSTM "
+            "walk-forward) predicted exit price against that actual close: a pass if "
+            "the actual price falls within Pass threshold standard deviations of the "
+            "predicted price, a fail otherwise. The standard deviation used is this "
+            "ticker's own historical return volatility (fit on bar history strictly "
+            "before predicted_date, no lookahead), not any model's own self-reported "
+            "confidence - the same yardstick for all four, so no source grades itself "
+            "against its own uncertainty estimate. Stores one row per (ticker, "
+            "predicted_date) with all four sources' predicted price/error/pass-fail "
+            "side by side in the prediction_accuracy table. Purely local - no "
+            "massive.com call, reads predictions and bars already computed/synced by "
+            "other jobs."
+        ),
+        has_bars_fields=False,
+        has_ticker_selector=True,
+        has_prediction_accuracy_fields=True,
+        # Run-on-demand aggregation over already-computed predictions, no natural
+        # daily cadence of its own - manual by default, same reasoning as win-rates.
+        default_run_type="manual",
+    ),
     RESEARCH_PICKS_JOB: JobDefinition(
         name=RESEARCH_PICKS_JOB,
         label="Research picks",
@@ -453,6 +535,98 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
         # Batch-limited backfill run with no natural daily cadence of its own (a limit
         # smaller than the backlog needs several runs to catch up) - manual by default,
         # same reasoning as ticker-types/snapshots/movers.
+        default_run_type="manual",
+    ),
+    TRAIN_LSTM_HOLDOUT_JOB: JobDefinition(
+        name=TRAIN_LSTM_HOLDOUT_JOB,
+        label="Train LSTM (holdout)",
+        description=(
+            "Trains a pooled (cross-ticker) LSTM over the selected tickers' ohlc_bars "
+            "history within the chosen date range, reserving the last ~15% of days as "
+            "a single chronological validation holdout. Predicts the same STATE_LABELS "
+            "quantile bucket predict-market-state fits, plus a regression head for the "
+            "raw next-period return, from features engineered fresh from ohlc_bars - no "
+            "dependency on technical_indicators/average_volumes' sparser coverage. "
+            "Stores the trained checkpoint and its holdout metrics as a new row in the "
+            "lstm_model_versions table. Fast - one training pass - but only tests one "
+            "train/validation boundary; see train-lstm-walkforward for the more "
+            "rigorous (and much slower) alternative. Purely local - no massive.com "
+            "call, reads bars already synced by the bars job."
+        ),
+        has_bars_fields=False,
+        has_ticker_selector=True,
+        has_lstm_training_fields=True,
+        # Expensive, run-on-demand training run - manual by default, same reasoning as
+        # predict-market-state/backtest-market-state.
+        default_run_type="manual",
+    ),
+    TRAIN_LSTM_WALKFORWARD_JOB: JobDefinition(
+        name=TRAIN_LSTM_WALKFORWARD_JOB,
+        label="Train LSTM (walk-forward)",
+        description=(
+            "Same pooled LSTM as train-lstm-holdout, but validated the more rigorous "
+            "way: splits the chosen date range into Number of folds rolling cutoffs, "
+            "retraining from scratch on data through each cutoff and evaluating on the "
+            "block up to the next one - the same expanding-window, no-lookahead "
+            "principle backtest-market-state applies to the Markov chain, coarsened to "
+            "per-fold blocks since retraining a network daily would be prohibitively "
+            "slow. Only the final fold's weights (fit on the most data) are saved as "
+            "this run's usable lstm_model_versions row; every fold's metrics are logged "
+            "in this run's history entry. Exists as a separate job from train-lstm-"
+            "holdout specifically so the two flavors' run times can be compared before "
+            "deciding whether walk-forward retraining is affordable to run regularly. "
+            "Purely local - no massive.com call, reads bars already synced by the bars "
+            "job."
+        ),
+        has_bars_fields=False,
+        has_ticker_selector=True,
+        has_lstm_training_fields=True,
+        has_lstm_walkforward_fields=True,
+        # Expensive, run-on-demand training run - manual by default, same reasoning as
+        # train-lstm-holdout.
+        default_run_type="manual",
+    ),
+    PREDICT_LSTM_HOLDOUT_JOB: JobDefinition(
+        name=PREDICT_LSTM_HOLDOUT_JOB,
+        label="Predict market state (LSTM, holdout)",
+        description=(
+            "Runs the most recently trained train-lstm-holdout model (or a specific "
+            "holdout-trained lstm_model_versions row, via the optional Model version "
+            "field) over the selected tickers' ohlc_bars history for a chosen predicted "
+            "date (default: tomorrow, UTC - see the Predicted date field), storing each "
+            "ticker's predicted state, full softmax state probabilities, and expected "
+            "return in the lstm_inferences table. Always uses a 'holdout'-flavor model - "
+            "see predict-market-state-lstm-walkforward for the walk-forward-trained "
+            "counterpart, kept as a fully independent job (own schedule, own run "
+            "history, own inference rows) specifically so the two flavors' predictions "
+            "for the same ticker/date can be compared side by side on the Prediction "
+            "Comparison report rather than one silently overwriting the other. Purely "
+            "local - no massive.com call, reads bars already synced by the bars job, "
+            "and only bars from before the predicted date."
+        ),
+        has_bars_fields=False,
+        has_ticker_selector=True,
+        has_predicted_date_offset_field=True,
+        has_lstm_inference_fields=True,
+        # Run-on-demand inference over an already-trained model, no natural daily
+        # cadence of its own - manual by default, same reasoning as predict-market-state.
+        default_run_type="manual",
+    ),
+    PREDICT_LSTM_WALKFORWARD_JOB: JobDefinition(
+        name=PREDICT_LSTM_WALKFORWARD_JOB,
+        label="Predict market state (LSTM, walk-forward)",
+        description=(
+            "Same as predict-market-state-lstm-holdout, but always uses the most "
+            "recently trained train-lstm-walkforward model (or a specific "
+            "walkforward-flavor lstm_model_versions row, via the optional Model "
+            "version field) - see that job's description for why the two are kept as "
+            "fully independent jobs rather than one job that just picks whichever "
+            "model is newest."
+        ),
+        has_bars_fields=False,
+        has_ticker_selector=True,
+        has_predicted_date_offset_field=True,
+        has_lstm_inference_fields=True,
         default_run_type="manual",
     ),
 }

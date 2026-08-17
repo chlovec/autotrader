@@ -32,6 +32,8 @@ const NAV_ITEMS: NavItem[] = [
       'Next 10 Day Predictions',
       'Market Predictions',
       'Market Prediction Performance',
+      'Prediction Comparison',
+      'Prediction Accuracy',
     ],
   },
   {

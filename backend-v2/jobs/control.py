@@ -96,7 +96,9 @@ class JobControl:
                 raise JobCancelled()
 
 
-def report_job_progress(session: Session, run_id: int | None, completed: int, total: int) -> None:
+def report_job_progress(
+    session: Session, run_id: int | None, completed: int, total: int, *, force: bool = False
+) -> None:
     """Persists (completed, total) onto the JobRun row identified by run_id, so the
     dashboard's Jobs page can show a live "N / M" progress bar (see app/main.py's
     _run_to_dict) - throttled to every _PROGRESS_COMMIT_INTERVAL calls, plus always on
@@ -109,11 +111,18 @@ def report_job_progress(session: Session, run_id: int | None, completed: int, to
     the duration of that loop, so reusing it here doesn't race any worker thread's own
     SessionLocal().
 
+    force=True bypasses the throttle and always commits - for callers whose own units
+    of work are already coarse-grained and individually slow enough (a training epoch,
+    a walk-forward fold - see jobs/train_lstm_holdout.py/jobs/train_lstm_walkforward.py)
+    that a total under _PROGRESS_COMMIT_INTERVAL would otherwise mean every update
+    except the very last gets silently dropped by the modulo check below, leaving the
+    dashboard's progress bar frozen at 0 until the run's final unit completes.
+
     No-op if run_id is None - callers (e.g. sync_bars_manual's CLI entry point) that
     don't have a JobRun row simply don't get progress tracked."""
     if run_id is None:
         return
-    if completed != total and completed % _PROGRESS_COMMIT_INTERVAL != 0:
+    if not force and completed != total and completed % _PROGRESS_COMMIT_INTERVAL != 0:
         return
     run = session.get(JobRun, run_id)
     if run is None:

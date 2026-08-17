@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import Float, case, cast, delete, func, or_, select, text, update
 from sqlalchemy.sql.elements import ColumnElement
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from db.models import (
     AverageVolume,
@@ -31,12 +31,15 @@ from db.models import (
     CurrentSnapshot,
     JobConfig,
     JobRun,
+    LstmInference,
+    LstmModelVersion,
     MarketPrediction,
     MarketPrediction10Day,
     MarketPredictionBacktest,
     MarketPredictionMonteCarlo,
     News,
     OhlcBar,
+    PredictionAccuracy,
     ResearchPick,
     SyncProgress,
     SyncState,
@@ -50,6 +53,7 @@ from db.models import (
 )
 from db.session import SessionLocal, init_db
 from jobs.config_store import get_or_create_config, interval_trigger, job_is_active, split_csv
+from jobs.lstm_common import DEFAULT_WALKFORWARD_NUM_FOLDS
 from jobs.registry import (
     AVERAGE_VOLUME_JOB,
     BACKTEST_MARKET_STATE_JOB,
@@ -58,11 +62,15 @@ from jobs.registry import (
     ETF_CONSTITUENTS_JOB,
     INDICATOR_NAMES,
     JOB_DEFINITIONS,
+    LSTM_INFERENCE_TRAINING_METHODS,
     MOVERS_JOB,
     NEWS_JOB,
     OHLC_BARS_JOB,
     PREDICT_10_DAY_MARKET_STATE_JOB,
+    PREDICT_LSTM_HOLDOUT_JOB,
+    PREDICT_LSTM_WALKFORWARD_JOB,
     PREDICT_MARKET_STATE_JOB,
+    PREDICTION_ACCURACY_JOB,
     RESEARCH_PICKS_JOB,
     SNAPSHOT_TYPE_OPTIONS,
     SNAPSHOTS_JOB,
@@ -70,6 +78,8 @@ from jobs.registry import (
     TICKER_DETAILS_JOB,
     TICKER_TYPES_JOB,
     TICKERS_JOB,
+    TRAIN_LSTM_HOLDOUT_JOB,
+    TRAIN_LSTM_WALKFORWARD_JOB,
     UNIFIED_SNAPSHOT_JOB,
     WIN_RATE_JOB,
 )
@@ -167,6 +177,10 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         "has_predicted_date_offset_field": definition.has_predicted_date_offset_field,
         "has_monte_carlo_fields": definition.has_monte_carlo_fields,
         "has_ohlc_bars_fields": definition.has_ohlc_bars_fields,
+        "has_lstm_training_fields": definition.has_lstm_training_fields,
+        "has_lstm_walkforward_fields": definition.has_lstm_walkforward_fields,
+        "has_lstm_inference_fields": definition.has_lstm_inference_fields,
+        "has_prediction_accuracy_fields": definition.has_prediction_accuracy_fields,
         "snapshot_type_options": SNAPSHOT_TYPE_OPTIONS,
         "run_type": config.run_type,
         "schedule_interval_unit": config.schedule_interval_unit,
@@ -194,6 +208,17 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         "ohlc_bars_start_date": config.ohlc_bars_start_date.isoformat() if config.ohlc_bars_start_date else None,
         "ohlc_bars_end_date": config.ohlc_bars_end_date.isoformat() if config.ohlc_bars_end_date else None,
         "ohlc_bars_limit": config.ohlc_bars_limit,
+        "lstm_train_start_date": (
+            config.lstm_train_start_date.isoformat() if config.lstm_train_start_date else None
+        ),
+        "lstm_train_end_date": config.lstm_train_end_date.isoformat() if config.lstm_train_end_date else None,
+        "lstm_epochs": config.lstm_epochs,
+        "lstm_lookback_days": config.lstm_lookback_days,
+        "lstm_learning_rate": config.lstm_learning_rate,
+        "lstm_batch_size": config.lstm_batch_size,
+        "lstm_walkforward_num_folds": config.lstm_walkforward_num_folds,
+        "lstm_model_version_id": config.lstm_model_version_id,
+        "prediction_accuracy_pass_threshold_std": config.prediction_accuracy_pass_threshold_std,
         "hidden": config.hidden,
         "running": config.run_requested_at is not None or run is not None,
         "paused": run.pause_requested if run is not None else False,
@@ -237,7 +262,32 @@ _RESET_TABLES: dict[str, list[type[Base]]] = {
     PREDICT_10_DAY_MARKET_STATE_JOB: [MarketPrediction10Day],
     BACKTEST_MARKET_STATE_JOB: [MarketPredictionBacktest],
     WIN_RATE_JOB: [WinRate],
+    PREDICTION_ACCURACY_JOB: [PredictionAccuracy],
     RESEARCH_PICKS_JOB: [ResearchPick],
+    # train-lstm-holdout/train-lstm-walkforward share the lstm_model_versions table
+    # (distinguished by training_method), and predict-lstm-market-state-holdout/
+    # -walkforward share lstm_inferences (also distinguished by training_method) - the
+    # same way the four indicator jobs share technical_indicators. reset_job below
+    # special-cases all four the same way it already special-cases INDICATOR_NAMES,
+    # filtering by training_method instead of blanket-deleting the other flavor's rows
+    # too. Still listed here (with an empty list, same reasoning as
+    # ETF_CONSTITUENTS_JOB) since reset_job indexes _RESET_TABLES unconditionally for
+    # every job not in INDICATOR_NAMES/_LSTM_MODEL_VERSION_TRAINING_METHODS/
+    # LSTM_INFERENCE_TRAINING_METHODS.
+    TRAIN_LSTM_HOLDOUT_JOB: [],
+    TRAIN_LSTM_WALKFORWARD_JOB: [],
+    PREDICT_LSTM_HOLDOUT_JOB: [],
+    PREDICT_LSTM_WALKFORWARD_JOB: [],
+}
+
+# training_method value for each of the two lstm_model_versions-writing jobs - reset_job
+# below filters LstmModelVersion deletes by this, same reasoning as INDICATOR_NAMES'
+# TechnicalIndicator.indicator filter. LSTM_INFERENCE_TRAINING_METHODS (imported from
+# jobs.registry above) is the same mapping for the two lstm_inferences-writing jobs -
+# not redefined here since jobs/engine.py's run_job already needs that exact dict.
+_LSTM_MODEL_VERSION_TRAINING_METHODS: dict[str, str] = {
+    TRAIN_LSTM_HOLDOUT_JOB: "holdout",
+    TRAIN_LSTM_WALKFORWARD_JOB: "walkforward",
 }
 
 # job name -> the SyncState/SyncProgress job_name key it syncs incrementally under
@@ -271,6 +321,15 @@ class JobConfigIn(BaseModel):
     ohlc_bars_start_date: str | None = None
     ohlc_bars_end_date: str | None = None
     ohlc_bars_limit: int | None = None
+    lstm_train_start_date: str | None = None
+    lstm_train_end_date: str | None = None
+    lstm_epochs: int | None = None
+    lstm_lookback_days: int | None = None
+    lstm_learning_rate: float | None = None
+    lstm_batch_size: int | None = None
+    lstm_walkforward_num_folds: int | None = None
+    lstm_model_version_id: int | None = None
+    prediction_accuracy_pass_threshold_std: float | None = None
 
 
 class TickerTypeUpdateIn(BaseModel):
@@ -1424,6 +1483,40 @@ def _mcmc_prediction_fields(prediction: MarketPredictionMonteCarlo | None) -> di
     }
 
 
+def _lstm_prediction_fields(prediction: LstmInference | None, prefix: str) -> dict[str, Any]:
+    """Same shape/reasoning as _markov_prediction_fields/_mcmc_prediction_fields above,
+    `prefix`-prefixed, over jobs/predict_lstm_market_state.py's LstmInference - used by
+    prediction_comparison_report, called once per training_method flavor
+    ("lstm_holdout"/"lstm_walkforward") since predict-lstm-market-state-holdout and
+    predict-lstm-market-state-walkforward are independent jobs whose predictions for
+    the same (ticker, predicted_date) both need to be shown, not just whichever is
+    newest - see LstmInference's own docstring for why training_method is part of its
+    primary key."""
+    return {
+        f"{prefix}_current_state": prediction.current_state if prediction else None,
+        f"{prefix}_predicted_state": prediction.predicted_state if prediction else None,
+        f"{prefix}_state_confidence": prediction.state_confidence if prediction else None,
+        # Full softmax output, richer than state_confidence alone (which only surfaces
+        # the predicted state's own probability) - unique to LSTM among the three
+        # models, which is why _markov_prediction_fields/_mcmc_prediction_fields have no
+        # equivalent.
+        f"{prefix}_prob_strong_down": prediction.prob_strong_down if prediction else None,
+        f"{prefix}_prob_down": prediction.prob_down if prediction else None,
+        f"{prefix}_prob_flat": prediction.prob_flat if prediction else None,
+        f"{prefix}_prob_up": prediction.prob_up if prediction else None,
+        f"{prefix}_prob_strong_up": prediction.prob_strong_up if prediction else None,
+        f"{prefix}_expected_return": prediction.expected_return if prediction else None,
+        f"{prefix}_entry_price": prediction.entry_price if prediction else None,
+        f"{prefix}_exit_price": prediction.exit_price if prediction else None,
+        f"{prefix}_exit_price_confidence": prediction.exit_price_confidence if prediction else None,
+        f"{prefix}_entry_time": prediction.entry_time if prediction else None,
+        f"{prefix}_exit_time": prediction.exit_time if prediction else None,
+        f"{prefix}_history_days": prediction.history_days if prediction else None,
+        f"{prefix}_model_version_id": prediction.model_version_id if prediction else None,
+        f"{prefix}_computed_at": prediction.computed_at.isoformat() if prediction else None,
+    }
+
+
 def _survivor_score(markov: MarketPrediction | None, mcmc: MarketPredictionMonteCarlo | None) -> float | None:
     """Python-side mirror of the module-level SURVIVOR_SCORE_EXPR SQL expression -
     expected_return * exit_price_confidence averaged across whichever of markov/mcmc
@@ -1805,6 +1898,315 @@ def market_predictions_report(
                 mcmc_by_ticker.get(ticker.ticker),
             )
             for ticker in page_tickers
+        ]
+        return {"rows": rows, "total": total, "page": page, "page_size": page_size}
+
+
+# Two independent aliases of LstmInference, one per training_method flavor - predict-
+# lstm-market-state-holdout/-walkforward each write their own (ticker, predicted_date,
+# training_method) rows (see LstmInference's docstring), so a single unaliased join
+# would fan out into two rows per ticker whenever both flavors have a prediction for
+# the same date. Joining each alias with training_method pinned in its own ON clause
+# keeps this report at one row per ticker, with both flavors' columns side by side -
+# same "pin the filter in the join's ON clause, not a WHERE" reasoning every other join
+# in this report already uses for predicted_date.
+LstmInferenceHoldout = aliased(LstmInference, name="lstm_holdout")
+LstmInferenceWalkforward = aliased(LstmInference, name="lstm_walkforward")
+
+# Orderable fields for prediction_comparison_report - a much smaller set than
+# MARKET_PREDICTIONS_ORDERABLE_FIELDS above, since this report is a focused four-way
+# comparison view, not another screening tool (see prediction_comparison_report's
+# docstring for why it deliberately doesn't replicate that report's dozen filters).
+PREDICTION_COMPARISON_ORDERABLE_FIELDS: dict[str, ColumnElement] = {
+    "ticker": Ticker.ticker,
+    "name": Ticker.name,
+    "markov_predicted_state": MarketPrediction.predicted_state,
+    "markov_state_confidence": MarketPrediction.state_confidence,
+    "markov_expected_return": MarketPrediction.expected_return,
+    "mcmc_predicted_state": MarketPredictionMonteCarlo.predicted_state,
+    "mcmc_state_confidence": MarketPredictionMonteCarlo.state_confidence,
+    "mcmc_expected_return": MarketPredictionMonteCarlo.expected_return,
+    "lstm_holdout_predicted_state": LstmInferenceHoldout.predicted_state,
+    "lstm_holdout_state_confidence": LstmInferenceHoldout.state_confidence,
+    "lstm_holdout_expected_return": LstmInferenceHoldout.expected_return,
+    "lstm_walkforward_predicted_state": LstmInferenceWalkforward.predicted_state,
+    "lstm_walkforward_state_confidence": LstmInferenceWalkforward.state_confidence,
+    "lstm_walkforward_expected_return": LstmInferenceWalkforward.expected_return,
+}
+
+
+def _parse_prediction_comparison_order_by(order_by: str) -> list[tuple[str, str]]:
+    """Same shape as _parse_market_predictions_order_by, against
+    PREDICTION_COMPARISON_ORDERABLE_FIELDS instead."""
+    fields: list[tuple[str, str]] = []
+    for entry in split_csv(order_by) or []:
+        field, _, direction = entry.partition(":")
+        direction = direction.lower() or "asc"
+        if field not in PREDICTION_COMPARISON_ORDERABLE_FIELDS:
+            raise HTTPException(422, f"Unknown order_by field: {field}")
+        if direction not in ("asc", "desc"):
+            raise HTTPException(422, f"Unknown order_by direction: {direction}")
+        fields.append((field, direction))
+    return fields
+
+
+@app.get("/reports/prediction-comparison")
+def prediction_comparison_report(
+    predicted_date: str,
+    ticker_types: str = "",
+    tickers: str = "",
+    page: int = 1,
+    page_size: int = MARKET_PREDICTIONS_DEFAULT_PAGE_SIZE,
+    order_by: str = "",
+) -> dict[str, Any]:
+    """Backs the Prediction Comparison page's report grid - the Markov chain
+    (MarketPrediction), Monte Carlo (MarketPredictionMonteCarlo), and both LSTM flavors'
+    (LstmInferenceHoldout/LstmInferenceWalkforward - see those aliases' comment)
+    predictions for a chosen predicted date, shown side by side per ticker, so all four
+    can be compared directly by ticker and prediction date.
+
+    Deliberately a focused comparison view rather than a fifth copy of
+    market_predictions_report's dozen screening filters (exit-price-confidence,
+    survivor-score, consensus, average-volume/market-cap, ...) - those stay specific to
+    that report; this one only takes ticker_types/tickers/page/page_size/order_by, same
+    reasoning as trading_symbols_report's shared params (see that function's docstring).
+
+    One query, driven from Ticker: all four prediction sources are LEFT JOINed in, each
+    pinned to predicted_date *in the join's ON clause* (same reasoning as
+    market_predictions_report's markov_join/mcmc_join - an inner-join-shaped WHERE would
+    silently drop a ticker missing one source's row for this date); the two LSTM aliases
+    additionally pin their own training_method, so a ticker with both flavors' rows for
+    this date still comes back as one row, not two. A ticker only needs a prediction
+    from *any one* of the four sources to appear at all.
+
+    `order_by` picks among PREDICTION_COMPARISON_ORDERABLE_FIELDS, defaulting to ticker
+    ascending, always appended as a tiebreaker (same reasoning as
+    market_predictions_report)."""
+    try:
+        parsed_predicted_date = dt.date.fromisoformat(predicted_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="predicted_date must be an ISO date, e.g. '2026-08-11'") from exc
+
+    types = split_csv(ticker_types)
+    selected_tickers = split_csv(tickers)
+    page = max(1, page)
+    page_size = max(1, min(page_size, MARKET_PREDICTIONS_MAX_PAGE_SIZE))
+    order_fields = _parse_prediction_comparison_order_by(order_by) or [("ticker", "asc")]
+    if "ticker" not in {field for field, _ in order_fields}:
+        order_fields = [*order_fields, ("ticker", "asc")]
+
+    with SessionLocal() as session:
+        markov_join = (MarketPrediction.ticker == Ticker.ticker) & (
+            MarketPrediction.predicted_date == parsed_predicted_date
+        )
+        mcmc_join = (MarketPredictionMonteCarlo.ticker == Ticker.ticker) & (
+            MarketPredictionMonteCarlo.predicted_date == parsed_predicted_date
+        )
+        lstm_holdout_join = (
+            (LstmInferenceHoldout.ticker == Ticker.ticker)
+            & (LstmInferenceHoldout.predicted_date == parsed_predicted_date)
+            & (LstmInferenceHoldout.training_method == "holdout")
+        )
+        lstm_walkforward_join = (
+            (LstmInferenceWalkforward.ticker == Ticker.ticker)
+            & (LstmInferenceWalkforward.predicted_date == parsed_predicted_date)
+            & (LstmInferenceWalkforward.training_method == "walkforward")
+        )
+        inclusion_condition = (
+            MarketPrediction.ticker.isnot(None)
+            | MarketPredictionMonteCarlo.ticker.isnot(None)
+            | LstmInferenceHoldout.ticker.isnot(None)
+            | LstmInferenceWalkforward.ticker.isnot(None)
+        )
+
+        count_query = (
+            select(func.count(Ticker.ticker))
+            .outerjoin(MarketPrediction, markov_join)
+            .outerjoin(MarketPredictionMonteCarlo, mcmc_join)
+            .outerjoin(LstmInferenceHoldout, lstm_holdout_join)
+            .outerjoin(LstmInferenceWalkforward, lstm_walkforward_join)
+            .where(inclusion_condition)
+        )
+        base_query = (
+            select(Ticker, MarketPrediction, MarketPredictionMonteCarlo, LstmInferenceHoldout, LstmInferenceWalkforward)
+            .outerjoin(MarketPrediction, markov_join)
+            .outerjoin(MarketPredictionMonteCarlo, mcmc_join)
+            .outerjoin(LstmInferenceHoldout, lstm_holdout_join)
+            .outerjoin(LstmInferenceWalkforward, lstm_walkforward_join)
+            .where(inclusion_condition)
+        )
+        if types:
+            base_query = base_query.where(Ticker.type.in_(types))
+            count_query = count_query.where(Ticker.type.in_(types))
+        if selected_tickers:
+            base_query = base_query.where(Ticker.ticker.in_(selected_tickers))
+            count_query = count_query.where(Ticker.ticker.in_(selected_tickers))
+        total = session.execute(count_query).scalar_one()
+
+        order_clauses = []
+        for field, direction in order_fields:
+            column = PREDICTION_COMPARISON_ORDERABLE_FIELDS[field]
+            order_clauses.append((column.desc() if direction == "desc" else column.asc()).nulls_last())
+        query = base_query.order_by(*order_clauses).limit(page_size).offset((page - 1) * page_size)
+        page_rows = session.execute(query).all()
+
+        rows = [
+            {
+                "ticker": ticker.ticker,
+                "name": ticker.name,
+                "predicted_date": parsed_predicted_date.isoformat(),
+                **_markov_prediction_fields(markov),
+                **_mcmc_prediction_fields(mcmc),
+                **_lstm_prediction_fields(lstm_holdout, "lstm_holdout"),
+                **_lstm_prediction_fields(lstm_walkforward, "lstm_walkforward"),
+            }
+            for ticker, markov, mcmc, lstm_holdout, lstm_walkforward in page_rows
+        ]
+        return {"rows": rows, "total": total, "page": page, "page_size": page_size}
+
+
+def _prediction_accuracy_source_fields(row: PredictionAccuracy, prefix: str) -> dict[str, Any]:
+    """One quadruple's worth of columns off a prediction_accuracy row, `prefix`-
+    prefixed - used by prediction_accuracy_report, called once per source
+    ("markov"/"mcmc"/"lstm_holdout"/"lstm_walkforward") since PredictionAccuracy
+    itself stores all four side by side rather than one row per source (see that
+    table's own docstring)."""
+    return {
+        f"{prefix}_predicted_exit_price": getattr(row, f"{prefix}_predicted_exit_price"),
+        f"{prefix}_error": getattr(row, f"{prefix}_error"),
+        f"{prefix}_error_std": getattr(row, f"{prefix}_error_std"),
+        f"{prefix}_passed": getattr(row, f"{prefix}_passed"),
+    }
+
+
+# Orderable fields for prediction_accuracy_report - same "focused view, not a dozen
+# screening filters" scope as PREDICTION_COMPARISON_ORDERABLE_FIELDS above.
+PREDICTION_ACCURACY_ORDERABLE_FIELDS: dict[str, ColumnElement] = {
+    "ticker": Ticker.ticker,
+    "name": Ticker.name,
+    "predicted_date": PredictionAccuracy.predicted_date,
+    "price_std": PredictionAccuracy.price_std,
+    "markov_error_std": PredictionAccuracy.markov_error_std,
+    "markov_passed": PredictionAccuracy.markov_passed,
+    "mcmc_error_std": PredictionAccuracy.mcmc_error_std,
+    "mcmc_passed": PredictionAccuracy.mcmc_passed,
+    "lstm_holdout_error_std": PredictionAccuracy.lstm_holdout_error_std,
+    "lstm_holdout_passed": PredictionAccuracy.lstm_holdout_passed,
+    "lstm_walkforward_error_std": PredictionAccuracy.lstm_walkforward_error_std,
+    "lstm_walkforward_passed": PredictionAccuracy.lstm_walkforward_passed,
+}
+
+
+def _parse_prediction_accuracy_order_by(order_by: str) -> list[tuple[str, str]]:
+    """Same shape as _parse_prediction_comparison_order_by, against
+    PREDICTION_ACCURACY_ORDERABLE_FIELDS instead."""
+    fields: list[tuple[str, str]] = []
+    for entry in split_csv(order_by) or []:
+        field, _, direction = entry.partition(":")
+        direction = direction.lower() or "asc"
+        if field not in PREDICTION_ACCURACY_ORDERABLE_FIELDS:
+            raise HTTPException(422, f"Unknown order_by field: {field}")
+        if direction not in ("asc", "desc"):
+            raise HTTPException(422, f"Unknown order_by direction: {direction}")
+        fields.append((field, direction))
+    return fields
+
+
+@app.get("/reports/prediction-accuracy")
+def prediction_accuracy_report(
+    start_date: str = "",
+    end_date: str = "",
+    ticker_types: str = "",
+    tickers: str = "",
+    page: int = 1,
+    page_size: int = MARKET_PREDICTIONS_DEFAULT_PAGE_SIZE,
+    order_by: str = "",
+) -> dict[str, Any]:
+    """Backs the Prediction Accuracy page's report grid - jobs/prediction_accuracy.py's
+    compute_prediction_accuracy already stores all four sources' (Markov/Monte
+    Carlo/LSTM holdout/LSTM walk-forward) predicted-vs-actual scoring side by side per
+    (ticker, predicted_date) in the prediction_accuracy table, so this report is a
+    straight paginated read off it (joined to Ticker for name/type filtering) rather
+    than an ORM aliased-join assembly the way prediction_comparison_report's is - the
+    join work already happened once, at compute time, not on every report read.
+
+    `start_date`/`end_date` (ISO dates, each independently optional) narrow to
+    predicted_date within [start_date, end_date] - blank means unbounded on that side,
+    so a bare request shows every scored (ticker, predicted_date) rather than
+    requiring a single date the way prediction_comparison_report does (this table
+    accumulates one row per evaluation event over time, not a single date's
+    snapshot).
+
+    `order_by` picks among PREDICTION_ACCURACY_ORDERABLE_FIELDS, defaulting to
+    predicted_date descending (most recent evaluation first) then ticker ascending as
+    a tiebreaker."""
+    parsed_start_date: dt.date | None = None
+    if start_date:
+        try:
+            parsed_start_date = dt.date.fromisoformat(start_date)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="start_date must be an ISO date, e.g. '2026-08-11'") from exc
+    parsed_end_date: dt.date | None = None
+    if end_date:
+        try:
+            parsed_end_date = dt.date.fromisoformat(end_date)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="end_date must be an ISO date, e.g. '2026-08-11'") from exc
+    if parsed_start_date is not None and parsed_end_date is not None and parsed_start_date > parsed_end_date:
+        raise HTTPException(status_code=422, detail="start_date must not be after end_date")
+
+    types = split_csv(ticker_types)
+    selected_tickers = split_csv(tickers)
+    page = max(1, page)
+    page_size = max(1, min(page_size, MARKET_PREDICTIONS_MAX_PAGE_SIZE))
+    order_fields = _parse_prediction_accuracy_order_by(order_by) or [("predicted_date", "desc")]
+    if "ticker" not in {field for field, _ in order_fields}:
+        order_fields = [*order_fields, ("ticker", "asc")]
+
+    with SessionLocal() as session:
+        base_query = select(Ticker, PredictionAccuracy).join(
+            PredictionAccuracy, PredictionAccuracy.ticker == Ticker.ticker
+        )
+        count_query = select(func.count(PredictionAccuracy.ticker)).select_from(PredictionAccuracy).join(
+            Ticker, Ticker.ticker == PredictionAccuracy.ticker
+        )
+        if parsed_start_date is not None:
+            base_query = base_query.where(PredictionAccuracy.predicted_date >= parsed_start_date)
+            count_query = count_query.where(PredictionAccuracy.predicted_date >= parsed_start_date)
+        if parsed_end_date is not None:
+            base_query = base_query.where(PredictionAccuracy.predicted_date <= parsed_end_date)
+            count_query = count_query.where(PredictionAccuracy.predicted_date <= parsed_end_date)
+        if types:
+            base_query = base_query.where(Ticker.type.in_(types))
+            count_query = count_query.where(Ticker.type.in_(types))
+        if selected_tickers:
+            base_query = base_query.where(Ticker.ticker.in_(selected_tickers))
+            count_query = count_query.where(Ticker.ticker.in_(selected_tickers))
+        total = session.execute(count_query).scalar_one()
+
+        order_clauses = []
+        for field, direction in order_fields:
+            column = PREDICTION_ACCURACY_ORDERABLE_FIELDS[field]
+            order_clauses.append((column.desc() if direction == "desc" else column.asc()).nulls_last())
+        query = base_query.order_by(*order_clauses).limit(page_size).offset((page - 1) * page_size)
+        page_rows = session.execute(query).all()
+
+        rows = [
+            {
+                "ticker": ticker.ticker,
+                "name": ticker.name,
+                "predicted_date": row.predicted_date.isoformat(),
+                "actual_exit_price": row.actual_exit_price,
+                "price_std": row.price_std,
+                "history_days": row.history_days,
+                "pass_threshold_std": row.pass_threshold_std,
+                "computed_at": row.computed_at.isoformat(),
+                **_prediction_accuracy_source_fields(row, "markov"),
+                **_prediction_accuracy_source_fields(row, "mcmc"),
+                **_prediction_accuracy_source_fields(row, "lstm_holdout"),
+                **_prediction_accuracy_source_fields(row, "lstm_walkforward"),
+            }
+            for ticker, row in page_rows
         ]
         return {"rows": rows, "total": total, "page": page, "page_size": page_size}
 
@@ -2275,6 +2677,40 @@ def update_job_config(job_name: str, body: JobConfigIn) -> dict:
         raise HTTPException(status_code=400, detail="ohlc_bars_start_date must not be after ohlc_bars_end_date")
     if body.ohlc_bars_limit is not None and not (1 <= body.ohlc_bars_limit <= OHLC_BARS_MAX_LIMIT):
         raise HTTPException(status_code=400, detail=f"ohlc_bars_limit must be between 1 and {OHLC_BARS_MAX_LIMIT}")
+    lstm_train_start_date: dt.date | None = None
+    if body.lstm_train_start_date is not None:
+        try:
+            lstm_train_start_date = dt.date.fromisoformat(body.lstm_train_start_date)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail="lstm_train_start_date must be an ISO date, e.g. '2026-08-06'"
+            ) from exc
+    lstm_train_end_date: dt.date | None = None
+    if body.lstm_train_end_date is not None:
+        try:
+            lstm_train_end_date = dt.date.fromisoformat(body.lstm_train_end_date)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail="lstm_train_end_date must be an ISO date, e.g. '2026-08-06'"
+            ) from exc
+    if (
+        lstm_train_start_date is not None
+        and lstm_train_end_date is not None
+        and lstm_train_start_date >= lstm_train_end_date
+    ):
+        raise HTTPException(status_code=400, detail="lstm_train_start_date must be before lstm_train_end_date")
+    if body.lstm_epochs is not None and body.lstm_epochs < 1:
+        raise HTTPException(status_code=400, detail="lstm_epochs must be at least 1")
+    if body.lstm_lookback_days is not None and body.lstm_lookback_days < 2:
+        raise HTTPException(status_code=400, detail="lstm_lookback_days must be at least 2")
+    if body.lstm_learning_rate is not None and body.lstm_learning_rate <= 0:
+        raise HTTPException(status_code=400, detail="lstm_learning_rate must be greater than 0")
+    if body.lstm_batch_size is not None and body.lstm_batch_size < 1:
+        raise HTTPException(status_code=400, detail="lstm_batch_size must be at least 1")
+    if body.lstm_walkforward_num_folds is not None and body.lstm_walkforward_num_folds < 1:
+        raise HTTPException(status_code=400, detail="lstm_walkforward_num_folds must be at least 1")
+    if body.prediction_accuracy_pass_threshold_std is not None and body.prediction_accuracy_pass_threshold_std <= 0:
+        raise HTTPException(status_code=400, detail="prediction_accuracy_pass_threshold_std must be greater than 0")
 
     with SessionLocal() as session:
         definition = JOB_DEFINITIONS[job_name]
@@ -2327,6 +2763,29 @@ def update_job_config(job_name: str, body: JobConfigIn) -> dict:
             config.ohlc_bars_start_date = None
             config.ohlc_bars_end_date = None
             config.ohlc_bars_limit = None
+        if definition.has_lstm_training_fields:
+            config.lstm_train_start_date = lstm_train_start_date
+            config.lstm_train_end_date = lstm_train_end_date
+            config.lstm_epochs = body.lstm_epochs
+            config.lstm_lookback_days = body.lstm_lookback_days
+            config.lstm_learning_rate = body.lstm_learning_rate
+            config.lstm_batch_size = body.lstm_batch_size
+        else:
+            config.lstm_train_start_date = None
+            config.lstm_train_end_date = None
+            config.lstm_epochs = None
+            config.lstm_lookback_days = None
+            config.lstm_learning_rate = None
+            config.lstm_batch_size = None
+        config.lstm_walkforward_num_folds = (
+            body.lstm_walkforward_num_folds if definition.has_lstm_walkforward_fields else None
+        )
+        config.lstm_model_version_id = (
+            body.lstm_model_version_id if definition.has_lstm_inference_fields else None
+        )
+        config.prediction_accuracy_pass_threshold_std = (
+            body.prediction_accuracy_pass_threshold_std if definition.has_prediction_accuracy_fields else None
+        )
         config.updated_at = dt.datetime.utcnow()
         session.commit()
 
@@ -2444,6 +2903,18 @@ def reset_job(job_name: str) -> dict:
         if job_name in INDICATOR_NAMES:
             session.execute(
                 delete(TechnicalIndicator).where(TechnicalIndicator.indicator == INDICATOR_NAMES[job_name])
+            )
+        elif job_name in _LSTM_MODEL_VERSION_TRAINING_METHODS:
+            session.execute(
+                delete(LstmModelVersion).where(
+                    LstmModelVersion.training_method == _LSTM_MODEL_VERSION_TRAINING_METHODS[job_name]
+                )
+            )
+        elif job_name in LSTM_INFERENCE_TRAINING_METHODS:
+            session.execute(
+                delete(LstmInference).where(
+                    LstmInference.training_method == LSTM_INFERENCE_TRAINING_METHODS[job_name]
+                )
             )
         else:
             for model in _RESET_TABLES[job_name]:

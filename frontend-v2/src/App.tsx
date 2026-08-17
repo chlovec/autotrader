@@ -8,6 +8,8 @@ import { StaleTickersPage } from './components/StaleTickersPage'
 import { Next10DayPredictionsPage } from './components/Next10DayPredictionsPage'
 import { MarketPredictionsPage } from './components/MarketPredictionsPage'
 import { MarketPredictionsPerformancePage } from './components/MarketPredictionsPerformancePage'
+import { PredictionComparisonPage } from './components/PredictionComparisonPage'
+import { PredictionAccuracyPage } from './components/PredictionAccuracyPage'
 import { ResearchPage } from './components/ResearchPage'
 import { TickerTypesPage } from './components/TickerTypesPage'
 
@@ -28,6 +30,8 @@ export type View =
   | 'Next 10 Day Predictions'
   | 'Market Predictions'
   | 'Market Prediction Performance'
+  | 'Prediction Comparison'
+  | 'Prediction Accuracy'
   | 'Settings'
   | 'Ticker Types'
 
@@ -65,6 +69,10 @@ function App() {
             <MarketPredictionsPage />
           ) : activeView === 'Market Prediction Performance' ? (
             <MarketPredictionsPerformancePage />
+          ) : activeView === 'Prediction Comparison' ? (
+            <PredictionComparisonPage />
+          ) : activeView === 'Prediction Accuracy' ? (
+            <PredictionAccuracyPage />
           ) : activeView === 'Research' ? (
             <ResearchPage />
           ) : activeView === 'Ticker Types' ? (

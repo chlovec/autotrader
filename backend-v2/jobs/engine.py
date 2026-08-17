@@ -27,6 +27,14 @@ from jobs.average_volume import DEFAULT_DAYS_INTERVAL, compute_average_volume
 from jobs.backtest_market_state import compute_market_state_backtest
 from jobs.config_store import get_or_create_config, interval_trigger, split_csv
 from jobs.control import JobCancelled, JobControl
+from jobs.lstm_common import (
+    DEFAULT_BATCH_SIZE as DEFAULT_LSTM_BATCH_SIZE,
+    DEFAULT_EPOCHS as DEFAULT_LSTM_EPOCHS,
+    DEFAULT_LEARNING_RATE as DEFAULT_LSTM_LEARNING_RATE,
+    DEFAULT_LOOKBACK_DAYS as DEFAULT_LSTM_LOOKBACK_DAYS,
+    DEFAULT_WALKFORWARD_NUM_FOLDS,
+)
+from jobs.predict_lstm_market_state import compute_lstm_market_state_predictions
 from jobs.predict_market_state import (
     DEFAULT_MIN_HISTORY_DAYS,
     DEFAULT_PREDICTED_DATE_OFFSET_DAYS,
@@ -34,6 +42,7 @@ from jobs.predict_market_state import (
 )
 from jobs.predict_market_state_10_day import compute_10_day_market_state_predictions
 from jobs.predict_market_state_mcmc import DEFAULT_NUM_SIMULATIONS, compute_market_state_mcmc_predictions
+from jobs.prediction_accuracy import DEFAULT_PASS_THRESHOLD_STD, compute_prediction_accuracy
 from jobs.registry import (
     AVERAGE_VOLUME_JOB,
     BACKTEST_MARKET_STATE_JOB,
@@ -41,16 +50,20 @@ from jobs.registry import (
     ETF_CONSTITUENTS_JOB,
     INDICATOR_NAMES,
     JOB_DEFINITIONS,
+    LSTM_INFERENCE_TRAINING_METHODS,
     MOVERS_JOB,
     NEWS_JOB,
     OHLC_BARS_JOB,
     PREDICT_10_DAY_MARKET_STATE_JOB,
     PREDICT_MARKET_STATE_JOB,
+    PREDICTION_ACCURACY_JOB,
     RESEARCH_PICKS_JOB,
     SNAPSHOTS_JOB,
     TICKER_DETAILS_JOB,
     TICKER_TYPES_JOB,
     TICKERS_JOB,
+    TRAIN_LSTM_HOLDOUT_JOB,
+    TRAIN_LSTM_WALKFORWARD_JOB,
     UNIFIED_SNAPSHOT_JOB,
     WIN_RATE_JOB,
 )
@@ -73,6 +86,8 @@ from jobs.sync_ticker_types import sync_ticker_types
 from jobs.sync_tickers import sync_tickers
 from jobs.sync_top_movers import sync_top_movers
 from jobs.sync_unified_snapshot import sync_unified_snapshot
+from jobs.train_lstm_holdout import train_lstm_holdout
+from jobs.train_lstm_walkforward import train_lstm_walkforward
 from jobs.win_rates import compute_win_rates
 
 logger = logging.getLogger("backend_v2.jobs.engine")
@@ -268,6 +283,18 @@ async def run_job(job_name: str, trigger: str) -> None:
                 control=control,
             )
             summary = f"{count} ticker(s) win rate computed"
+        elif job_name == PREDICTION_ACCURACY_JOB:
+            # Same reasoning as the win-rate/average-volume branches above - purely
+            # local, off the event loop via asyncio.to_thread.
+            count = await asyncio.to_thread(
+                compute_prediction_accuracy,
+                session,
+                config.prediction_accuracy_pass_threshold_std or DEFAULT_PASS_THRESHOLD_STD,
+                split_csv(config.ticker_types),
+                split_csv(config.tickers),
+                control=control,
+            )
+            summary = f"{count} (ticker, predicted date) result(s) scored"
         elif job_name == RESEARCH_PICKS_JOB:
             # Same reasoning as the win-rate/average-volume branches above - purely
             # local, off the event loop via asyncio.to_thread.
@@ -283,6 +310,77 @@ async def run_job(job_name: str, trigger: str) -> None:
             tickers = split_csv(config.tickers) or []
             count = await sync_etf_constituents(tickers, control=control)
             summary = f"{count}/{len(tickers)} etf holdings file(s) downloaded"
+        elif job_name == TRAIN_LSTM_HOLDOUT_JOB:
+            # Same reasoning as the average-volume/predict-market-state branches above -
+            # purely local, off the event loop via asyncio.to_thread. Training can take
+            # a long time; asyncio.to_thread keeps that off this process's event loop
+            # the same way it does for every other CPU-bound branch here.
+            version = await asyncio.to_thread(
+                train_lstm_holdout,
+                session,
+                run_id,
+                config.lstm_train_start_date,
+                config.lstm_train_end_date,
+                config.lstm_epochs or DEFAULT_LSTM_EPOCHS,
+                config.lstm_lookback_days or DEFAULT_LSTM_LOOKBACK_DAYS,
+                config.lstm_learning_rate or DEFAULT_LSTM_LEARNING_RATE,
+                config.lstm_batch_size or DEFAULT_LSTM_BATCH_SIZE,
+                split_csv(config.ticker_types),
+                split_csv(config.tickers),
+                control=control,
+            )
+            summary = (
+                f"trained LSTM (holdout) - model version {version.id}, "
+                f"val_loss={version.val_loss:.4f} val_accuracy={version.val_accuracy:.4f} "
+                f"in {version.duration_seconds:.1f}s"
+            )
+        elif job_name == TRAIN_LSTM_WALKFORWARD_JOB:
+            # Same reasoning as the TRAIN_LSTM_HOLDOUT_JOB branch above.
+            version, fold_lines = await asyncio.to_thread(
+                train_lstm_walkforward,
+                session,
+                run_id,
+                config.lstm_train_start_date,
+                config.lstm_train_end_date,
+                config.lstm_epochs or DEFAULT_LSTM_EPOCHS,
+                config.lstm_lookback_days or DEFAULT_LSTM_LOOKBACK_DAYS,
+                config.lstm_learning_rate or DEFAULT_LSTM_LEARNING_RATE,
+                config.lstm_batch_size or DEFAULT_LSTM_BATCH_SIZE,
+                config.lstm_walkforward_num_folds or DEFAULT_WALKFORWARD_NUM_FOLDS,
+                split_csv(config.ticker_types),
+                split_csv(config.tickers),
+                control=control,
+            )
+            summary = (
+                f"trained LSTM (walk-forward) - model version {version.id}, "
+                f"final val_accuracy={version.val_accuracy:.4f} in {version.duration_seconds:.1f}s total. "
+                + "; ".join(fold_lines)
+            )
+        elif job_name in LSTM_INFERENCE_TRAINING_METHODS:
+            # Same reasoning as the predict-market-state branch above - purely local,
+            # off the event loop via asyncio.to_thread. training_method is fixed per
+            # job name (see jobs/registry.py's LSTM_INFERENCE_TRAINING_METHODS) - same
+            # "job name picks the parameter" dispatch as the INDICATOR_NAMES branch
+            # below, so predict-lstm-market-state-holdout/-walkforward always resolve
+            # their own flavor's model rather than "whichever is newest."
+            offset_days = (
+                config.predicted_date_offset_days
+                if config.predicted_date_offset_days is not None
+                else DEFAULT_PREDICTED_DATE_OFFSET_DAYS
+            )
+            prediction_date = dt.datetime.now(dt.timezone.utc).date() + dt.timedelta(days=offset_days)
+            count = await asyncio.to_thread(
+                compute_lstm_market_state_predictions,
+                session,
+                LSTM_INFERENCE_TRAINING_METHODS[job_name],
+                prediction_date,
+                split_csv(config.ticker_types),
+                split_csv(config.tickers),
+                config.lstm_model_version_id,
+                control=control,
+                run_id=run_id,
+            )
+            summary = f"{count} ticker(s) LSTM ({LSTM_INFERENCE_TRAINING_METHODS[job_name]}) market state predicted"
         elif job_name == BACKTEST_MARKET_STATE_JOB:
             # Same reasoning as the average-volume/predict-market-state branches above -
             # purely local, off the event loop via asyncio.to_thread.
