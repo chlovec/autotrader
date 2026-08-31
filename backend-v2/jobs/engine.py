@@ -54,6 +54,7 @@ from jobs.registry import (
     MOVERS_JOB,
     NEWS_JOB,
     OHLC_BARS_JOB,
+    OHLC_UPDATE_JOB,
     PREDICT_10_DAY_MARKET_STATE_JOB,
     PREDICT_MARKET_STATE_JOB,
     PREDICTION_ACCURACY_JOB,
@@ -73,6 +74,7 @@ from jobs.sync_bars import (
     DEFAULT_END_DATE_OFFSET_DAYS,
     DEFAULT_MULTIPLIER,
     DEFAULT_TIMESPAN,
+    sync_bars_manual,
     sync_bars_nightly,
 )
 from jobs.sync_etf_constituents import sync_etf_constituents
@@ -445,6 +447,28 @@ async def run_job(job_name: str, trigger: str) -> None:
                 start_date=config.ohlc_bars_start_date,
                 end_date=config.ohlc_bars_end_date,
                 limit=config.ohlc_bars_limit or DEFAULT_OHLC_BARS_LIMIT,
+                control=control,
+                run_id=run_id,
+            )
+            summary = f"{len(results)} ticker(s) synced, {sum(results.values())} bar(s) fetched"
+        elif job_name == OHLC_UPDATE_JOB:
+            # Always overwrites the exact given range, no incremental check - see
+            # jobs/sync_bars.py's sync_bars_manual (this job runs it directly) and
+            # db/models.py's JobConfig.ohlc_update_start_date docstring for why both
+            # dates are required here rather than defaulted like OHLC_BARS_JOB's are.
+            if config.ohlc_update_start_date is None or config.ohlc_update_end_date is None:
+                raise ValueError(
+                    "ohlc-data-update requires both Start date and End date to be set on this job's config"
+                )
+            if config.ohlc_update_start_date > config.ohlc_update_end_date:
+                raise ValueError("ohlc-data-update's Start date must not be after End date")
+            results = await asyncio.to_thread(
+                sync_bars_manual,
+                session,
+                config.ohlc_update_start_date,
+                config.ohlc_update_end_date,
+                split_csv(config.ticker_types),
+                split_csv(config.tickers),
                 control=control,
                 run_id=run_id,
             )

@@ -135,6 +135,19 @@ export function TrashIcon({ className }: IconProps) {
   )
 }
 
+export function DragHandleIcon({ className }: IconProps) {
+  return (
+    <svg className={className} viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+      <circle cx="7" cy="5.5" r="1.3" />
+      <circle cx="13" cy="5.5" r="1.3" />
+      <circle cx="7" cy="10" r="1.3" />
+      <circle cx="13" cy="10" r="1.3" />
+      <circle cx="7" cy="14.5" r="1.3" />
+      <circle cx="13" cy="14.5" r="1.3" />
+    </svg>
+  )
+}
+
 export function BellIcon({ className }: IconProps) {
   return (
     <svg className={className} viewBox="0 0 20 20" fill="none" aria-hidden="true">

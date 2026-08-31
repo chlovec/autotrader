@@ -22,6 +22,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import Float, case, cast, delete, func, or_, select, text, update
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.orm import Session, aliased
 
@@ -66,6 +67,7 @@ from jobs.registry import (
     MOVERS_JOB,
     NEWS_JOB,
     OHLC_BARS_JOB,
+    OHLC_UPDATE_JOB,
     PREDICT_10_DAY_MARKET_STATE_JOB,
     PREDICT_LSTM_HOLDOUT_JOB,
     PREDICT_LSTM_WALKFORWARD_JOB,
@@ -177,6 +179,7 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         "has_predicted_date_offset_field": definition.has_predicted_date_offset_field,
         "has_monte_carlo_fields": definition.has_monte_carlo_fields,
         "has_ohlc_bars_fields": definition.has_ohlc_bars_fields,
+        "has_ohlc_update_fields": definition.has_ohlc_update_fields,
         "has_lstm_training_fields": definition.has_lstm_training_fields,
         "has_lstm_walkforward_fields": definition.has_lstm_walkforward_fields,
         "has_lstm_inference_fields": definition.has_lstm_inference_fields,
@@ -208,6 +211,12 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         "ohlc_bars_start_date": config.ohlc_bars_start_date.isoformat() if config.ohlc_bars_start_date else None,
         "ohlc_bars_end_date": config.ohlc_bars_end_date.isoformat() if config.ohlc_bars_end_date else None,
         "ohlc_bars_limit": config.ohlc_bars_limit,
+        "ohlc_update_start_date": (
+            config.ohlc_update_start_date.isoformat() if config.ohlc_update_start_date else None
+        ),
+        "ohlc_update_end_date": (
+            config.ohlc_update_end_date.isoformat() if config.ohlc_update_end_date else None
+        ),
         "lstm_train_start_date": (
             config.lstm_train_start_date.isoformat() if config.lstm_train_start_date else None
         ),
@@ -220,6 +229,7 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         "lstm_model_version_id": config.lstm_model_version_id,
         "prediction_accuracy_pass_threshold_std": config.prediction_accuracy_pass_threshold_std,
         "hidden": config.hidden,
+        "sort_order": config.sort_order,
         "running": config.run_requested_at is not None or run is not None,
         "paused": run.pause_requested if run is not None else False,
         "last_run": _run_to_dict(last_run) if last_run is not None else None,
@@ -242,6 +252,9 @@ _RESET_TABLES: dict[str, list[type[Base]]] = {
     # Shares ohlc_bars with BARS_JOB (see jobs/sync_ohlc_bars.py) - resetting either
     # empties the whole table, same as resetting BARS_JOB already does today.
     OHLC_BARS_JOB: [OhlcBar],
+    # Also shares ohlc_bars (see jobs/sync_bars.py's sync_bars_manual, which this job
+    # runs directly) - same reasoning as OHLC_BARS_JOB above.
+    OHLC_UPDATE_JOB: [OhlcBar],
     TICKER_TYPES_JOB: [TickerType],
     SNAPSHOTS_JOB: [CurrentSnapshot],
     TICKER_DETAILS_JOB: [TickerDetail],
@@ -321,6 +334,8 @@ class JobConfigIn(BaseModel):
     ohlc_bars_start_date: str | None = None
     ohlc_bars_end_date: str | None = None
     ohlc_bars_limit: int | None = None
+    ohlc_update_start_date: str | None = None
+    ohlc_update_end_date: str | None = None
     lstm_train_start_date: str | None = None
     lstm_train_end_date: str | None = None
     lstm_epochs: int | None = None
@@ -332,9 +347,17 @@ class JobConfigIn(BaseModel):
     prediction_accuracy_pass_threshold_std: float | None = None
 
 
+class JobReorderIn(BaseModel):
+    job_names: list[str]
+
+
 class TickerTypeUpdateIn(BaseModel):
     rank: int | None = None
     status: Literal["active", "inactive"]
+
+
+class AdhocQueryIn(BaseModel):
+    sql: str
 
 
 @app.get("/health")
@@ -2511,6 +2534,280 @@ def market_predictions_performance_report(
         return {"rows": [dict(row) for row in page_rows], "total": total, "page": page, "page_size": page_size}
 
 
+# Aggregated on top of the tickers_daily_market_direction view (see
+# temp_queries/stock_price_direction.sql, the view's source query) - one row per ticker
+# rather than that view's one row per (ticker, day), same "copy the validated .sql
+# verbatim" convention as MARKET_PREDICTIONS_PERFORMANCE_SQL above. No trailing
+# semicolon: it's used as a subquery below, which a trailing semicolon would break.
+MARKET_DIRECTION_SQL = """
+SELECT
+    t.ticker,
+    t.name,
+    t.type,
+    t.market,
+    MAX(t.latest_price) AS latest_price,
+    MAX(d.market_cap) AS market_cap,
+    COUNT(*) AS total_records,
+    100.0 * SUM(CASE WHEN t.market_type = 'strong down' THEN 1 ELSE 0 END) / COUNT(*) AS pcnt_strong_down,
+    100.0 * SUM(CASE WHEN t.market_type = 'down' THEN 1 ELSE 0 END) / COUNT(*) AS pcnt_down,
+    100.0 * SUM(CASE WHEN t.market_type = 'neutral' THEN 1 ELSE 0 END) / COUNT(*) AS pcnt_neutral,
+    100.0 * SUM(CASE WHEN t.market_type = 'up' THEN 1 ELSE 0 END) / COUNT(*) AS pcnt_up,
+    100.0 * SUM(CASE WHEN t.market_type = 'strong up' THEN 1 ELSE 0 END) / COUNT(*) AS pcnt_strong_up
+FROM tickers_daily_market_direction t
+LEFT JOIN ticker_details d ON d.ticker = t.ticker
+WHERE date(t.timestamp) BETWEEN :start_date AND :end_date
+    AND (:types IS NULL OR t.type IN (SELECT value FROM json_each(:types)))
+    AND (:tickers IS NULL OR t.ticker IN (SELECT value FROM json_each(:tickers)))
+GROUP BY t.ticker, t.name, t.type, t.market
+"""
+
+MARKET_DIRECTION_MAX_PAGE_SIZE = 1000
+MARKET_DIRECTION_DEFAULT_PAGE_SIZE = 500
+
+# Every column MARKET_DIRECTION_SQL's SELECT produces (by its alias) - what
+# market_direction_report's order_by accepts, and (since there's no query-builder step
+# here the way every ORM-assembled report has) the allowlist that keeps order_by from
+# being a SQL injection vector into the raw ORDER BY clause built below - same reasoning
+# as MARKET_PREDICTIONS_PERFORMANCE_ORDERABLE_FIELDS.
+MARKET_DIRECTION_ORDERABLE_FIELDS = frozenset(
+    {
+        "ticker",
+        "name",
+        "type",
+        "market",
+        "latest_price",
+        "market_cap",
+        "total_records",
+        "pcnt_strong_down",
+        "pcnt_down",
+        "pcnt_neutral",
+        "pcnt_up",
+        "pcnt_strong_up",
+    }
+)
+
+
+def _parse_market_direction_order_by(order_by: str) -> list[tuple[str, str]]:
+    """Same shape as _parse_market_predictions_performance_order_by, validated against
+    MARKET_DIRECTION_ORDERABLE_FIELDS instead."""
+    fields: list[tuple[str, str]] = []
+    for entry in split_csv(order_by) or []:
+        field, _, direction = entry.partition(":")
+        direction = direction.lower() or "asc"
+        if field not in MARKET_DIRECTION_ORDERABLE_FIELDS:
+            raise HTTPException(422, f"Unknown order_by field: {field}")
+        if direction not in ("asc", "desc"):
+            raise HTTPException(422, f"Unknown order_by direction: {direction}")
+        fields.append((field, direction))
+    return fields
+
+
+@app.get("/reports/market-direction")
+def market_direction_report(
+    start_date: str = "",
+    end_date: str = "",
+    ticker_types: str = "",
+    tickers: str = "",
+    market_cap_op: str = "",
+    market_cap_value: float | None = None,
+    page: int = 1,
+    page_size: int = MARKET_DIRECTION_DEFAULT_PAGE_SIZE,
+    order_by: str = "",
+) -> dict[str, Any]:
+    """Backs the Analytics > Market Direction report grid: one row per ticker showing
+    what share of its daily bars in [start_date, end_date] fell into each
+    tickers_daily_market_direction.market_type bucket (strong down/down/neutral/up/
+    strong up - see temp_queries/stock_price_direction.sql for the open->close pcnt_diff
+    thresholds that decide the bucket), alongside latest_price - the view's own
+    "most recent ohlc_bars.close for this ticker" (not bounded by start_date/end_date;
+    joined in the view from a latest-bar-per-ticker derived table rather than a
+    per-row correlated subquery, which was a ~40s regression at this table's size - same
+    "latest row per ticker" join shape as MARKET_PREDICTIONS_PERFORMANCE_SQL's
+    average_volumes join) and market_cap (LEFT JOINed in from ticker_details, which is
+    upserted wholesale per ticker with no history - same plain lookup as
+    market_direction_report's market_cap_by_ticker elsewhere, just done as a join here
+    since this whole report is raw SQL rather than ORM rows; NULL for a ticker with no
+    ticker_details row, e.g. most ETFs). Both are wrapped in MAX() here only because they
+    have to be some aggregate to sit alongside the pcnt_* SUMs under GROUP BY ticker -
+    every row for a ticker carries the same value already, so MAX is just a pass-through.
+    Each pcnt_* column is
+    that bucket's share of the ticker's total bars in range, as a percentage (0-100) -
+    the five sum to 100 for every returned ticker; a ticker with no bars in range is
+    simply absent (a GROUP BY row can't have COUNT(*) = 0). total_records is that same
+    COUNT(*) - the number of daily bars the pcnt_* columns were computed over - so a
+    ticker with, say, 2 records in range can be sanity-checked against one with 200
+    rather than trusting the percentages blind.
+
+    `start_date`/`end_date` (ISO dates) each independently default to today (UTC) when
+    omitted, same as market_predictions_performance_report - a bare request still runs,
+    just against a single day.
+
+    `ticker_types`/`tickers` (comma-separated, e.g. "CS,ETF" / "AAPL,MSFT") bind to
+    MARKET_DIRECTION_SQL's :types/:tickers params as JSON arrays, or NULL (matching
+    everything) when left blank - same convention as
+    market_predictions_performance_report's.
+
+    `market_cap_op`/`market_cap_value` (e.g. ">=" / 2000000000) are the same shape as
+    trading_symbols_report's - both required together, op one of NUMERIC_FILTER_OPS -
+    but applied as a WHERE on the outer paginated/counted query rather than inside
+    MARKET_DIRECTION_SQL itself, since market_cap there is a MAX() sitting under
+    GROUP BY ticker; filtering it pre-aggregation would need a HAVING clause instead,
+    and doing it post-aggregation on the subquery's own market_cap column is simpler and
+    identical in effect. A ticker with no ticker_details row (NULL market_cap) never
+    matches any comparison, same as SQL NULL semantics everywhere else in this file.
+
+    Paginated/ordered around the query rather than baked into it, same as
+    market_predictions_performance_report: `order_by` (see
+    MARKET_DIRECTION_ORDERABLE_FIELDS) and LIMIT/OFFSET wrap it in an outer `SELECT *
+    FROM (<query>) ORDER BY ... LIMIT ... OFFSET ...`, and `total` comes from `SELECT
+    COUNT(*) FROM (<query>)` over the same unmodified inner query. Defaults to ticker
+    ascending, always appended as a tiebreaker."""
+    today = dt.datetime.now(dt.timezone.utc).date().isoformat()
+    parsed_start = start_date or today
+    parsed_end = end_date or today
+    try:
+        dt.date.fromisoformat(parsed_start)
+    except ValueError as exc:
+        raise HTTPException(422, "start_date must be an ISO date, e.g. '2026-08-12'") from exc
+    try:
+        dt.date.fromisoformat(parsed_end)
+    except ValueError as exc:
+        raise HTTPException(422, "end_date must be an ISO date, e.g. '2026-08-12'") from exc
+    if parsed_start > parsed_end:
+        raise HTTPException(422, "start_date must not be after end_date")
+    _validate_numeric_filter_pair(market_cap_op, market_cap_value, "market_cap")
+
+    types = split_csv(ticker_types)
+    selected_tickers = split_csv(tickers)
+    page = max(1, page)
+    page_size = max(1, min(page_size, MARKET_DIRECTION_MAX_PAGE_SIZE))
+    order_fields = _parse_market_direction_order_by(order_by) or [("ticker", "asc")]
+    if "ticker" not in {field for field, _ in order_fields}:
+        order_fields = [*order_fields, ("ticker", "asc")]
+    order_clause = ", ".join(f"{field} {direction.upper()}" for field, direction in order_fields)
+    # market_cap_op is validated above against NUMERIC_FILTER_OPS, a fixed allowlist of
+    # comparison symbols - safe to interpolate directly, same reasoning as order_clause.
+    market_cap_where = f" WHERE market_cap {market_cap_op} :market_cap_value" if market_cap_op else ""
+
+    params = {
+        "start_date": parsed_start,
+        "end_date": parsed_end,
+        "types": json.dumps(types) if types else None,
+        "tickers": json.dumps(selected_tickers) if selected_tickers else None,
+        "market_cap_value": market_cap_value,
+    }
+    with SessionLocal() as session:
+        total = session.execute(
+            text(f"SELECT COUNT(*) FROM ({MARKET_DIRECTION_SQL}) AS market_direction{market_cap_where}"),
+            params,
+        ).scalar_one()
+        page_rows = (
+            session.execute(
+                text(
+                    f"SELECT * FROM ({MARKET_DIRECTION_SQL}) AS market_direction{market_cap_where} "
+                    f"ORDER BY {order_clause} LIMIT :limit OFFSET :offset"
+                ),
+                {**params, "limit": page_size, "offset": (page - 1) * page_size},
+            )
+            .mappings()
+            .all()
+        )
+        return {"rows": [dict(row) for row in page_rows], "total": total, "page": page, "page_size": page_size}
+
+
+# One row per (ticker, day) rather than MARKET_DIRECTION_SQL's one row per ticker -
+# the tickers_daily_market_direction view's own rows for a single ticker, scoped by
+# date range (see temp_queries/tickers_daily_market_direction.sql, copied verbatim,
+# same convention as MARKET_DIRECTION_SQL above). No trailing semicolon, same reasoning.
+MARKET_DIRECTION_DAILY_SQL = """
+SELECT
+    ticker,
+    date(timestamp) AS date,
+    Start_Price AS open_price,
+    close_Price AS close_price,
+    pcnt_diff,
+    market_type
+FROM tickers_daily_market_direction
+WHERE ticker = :ticker
+    AND date(timestamp) BETWEEN :start_date AND :end_date
+"""
+
+MARKET_DIRECTION_DAILY_ORDERABLE_FIELDS = frozenset(
+    {"date", "open_price", "close_price", "pcnt_diff", "market_type"}
+)
+
+
+def _parse_market_direction_daily_order_by(order_by: str) -> list[tuple[str, str]]:
+    """Same shape as _parse_market_direction_order_by, validated against
+    MARKET_DIRECTION_DAILY_ORDERABLE_FIELDS instead."""
+    fields: list[tuple[str, str]] = []
+    for entry in split_csv(order_by) or []:
+        field, _, direction = entry.partition(":")
+        direction = direction.lower() or "asc"
+        if field not in MARKET_DIRECTION_DAILY_ORDERABLE_FIELDS:
+            raise HTTPException(422, f"Unknown order_by field: {field}")
+        if direction not in ("asc", "desc"):
+            raise HTTPException(422, f"Unknown order_by direction: {direction}")
+        fields.append((field, direction))
+    return fields
+
+
+@app.get("/reports/market-direction/daily")
+def market_direction_daily_report(
+    ticker: str,
+    start_date: str = "",
+    end_date: str = "",
+    order_by: str = "",
+) -> dict[str, Any]:
+    """Drill-down behind one market_direction_report row: every daily bar for `ticker`
+    in [start_date, end_date] with that day's open->close pcnt_diff and which
+    market_type bucket it fell into (see temp_queries/tickers_daily_market_direction.sql
+    for the thresholds) - what market_direction_report's pcnt_* columns summarize for
+    that ticker. Opened from the Market Direction report grid's row context menu.
+
+    `start_date`/`end_date` (ISO dates) each independently default to today (UTC) when
+    omitted, same as market_direction_report.
+
+    Not paginated: scoped to a single ticker, so the row count is bounded by trading
+    days in range rather than the whole tickers table. Defaults to date ascending,
+    always appended as a tiebreaker (see MARKET_DIRECTION_DAILY_ORDERABLE_FIELDS)."""
+    if not ticker:
+        raise HTTPException(422, "ticker is required")
+    today = dt.datetime.now(dt.timezone.utc).date().isoformat()
+    parsed_start = start_date or today
+    parsed_end = end_date or today
+    try:
+        dt.date.fromisoformat(parsed_start)
+    except ValueError as exc:
+        raise HTTPException(422, "start_date must be an ISO date, e.g. '2026-08-12'") from exc
+    try:
+        dt.date.fromisoformat(parsed_end)
+    except ValueError as exc:
+        raise HTTPException(422, "end_date must be an ISO date, e.g. '2026-08-12'") from exc
+    if parsed_start > parsed_end:
+        raise HTTPException(422, "start_date must not be after end_date")
+
+    order_fields = _parse_market_direction_daily_order_by(order_by) or [("date", "asc")]
+    if "date" not in {field for field, _ in order_fields}:
+        order_fields = [*order_fields, ("date", "asc")]
+    order_clause = ", ".join(f"{field} {direction.upper()}" for field, direction in order_fields)
+
+    params = {"ticker": ticker, "start_date": parsed_start, "end_date": parsed_end}
+    with SessionLocal() as session:
+        rows = (
+            session.execute(
+                text(
+                    f"SELECT * FROM ({MARKET_DIRECTION_DAILY_SQL}) AS market_direction_daily "
+                    f"ORDER BY {order_clause}"
+                ),
+                params,
+            )
+            .mappings()
+            .all()
+        )
+        return {"rows": [dict(row) for row in rows]}
+
+
 def _research_pick_to_dict(pick: ResearchPick, ticker: Ticker) -> dict[str, Any]:
     return {
         "ticker": pick.ticker,
@@ -2588,7 +2885,16 @@ def research_picks_report(run_id: int | None = None) -> dict[str, Any]:
 @app.get("/jobs")
 def list_jobs() -> list[dict]:
     with SessionLocal() as session:
-        return [_job_to_dict(session, name) for name in JOB_DEFINITIONS]
+        jobs = [_job_to_dict(session, name) for name in JOB_DEFINITIONS]
+    # Sorted by sort_order (set by reorder_jobs below) rather than returned in
+    # JOB_DEFINITIONS' fixed insertion order, so a drag-reordered Jobs page survives a
+    # reload. A job never dragged has sort_order None and sorts after every explicitly
+    # ordered job, in JOB_DEFINITIONS order among themselves - covers both a fresh
+    # database (nothing ordered yet) and a job added to JOB_DEFINITIONS after the last
+    # reorder (nothing to place it correctly by number, so it falls back to the end).
+    default_index = {name: i for i, name in enumerate(JOB_DEFINITIONS)}
+    jobs.sort(key=lambda job: (job["sort_order"] is None, job["sort_order"] or 0, default_index[job["name"]]))
+    return jobs
 
 
 @app.get("/jobs/{job_name}")
@@ -2677,6 +2983,28 @@ def update_job_config(job_name: str, body: JobConfigIn) -> dict:
         raise HTTPException(status_code=400, detail="ohlc_bars_start_date must not be after ohlc_bars_end_date")
     if body.ohlc_bars_limit is not None and not (1 <= body.ohlc_bars_limit <= OHLC_BARS_MAX_LIMIT):
         raise HTTPException(status_code=400, detail=f"ohlc_bars_limit must be between 1 and {OHLC_BARS_MAX_LIMIT}")
+    ohlc_update_start_date: dt.date | None = None
+    if body.ohlc_update_start_date is not None:
+        try:
+            ohlc_update_start_date = dt.date.fromisoformat(body.ohlc_update_start_date)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail="ohlc_update_start_date must be an ISO date, e.g. '2026-08-06'"
+            ) from exc
+    ohlc_update_end_date: dt.date | None = None
+    if body.ohlc_update_end_date is not None:
+        try:
+            ohlc_update_end_date = dt.date.fromisoformat(body.ohlc_update_end_date)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail="ohlc_update_end_date must be an ISO date, e.g. '2026-08-06'"
+            ) from exc
+    if (
+        ohlc_update_start_date is not None
+        and ohlc_update_end_date is not None
+        and ohlc_update_start_date > ohlc_update_end_date
+    ):
+        raise HTTPException(status_code=400, detail="ohlc_update_start_date must not be after ohlc_update_end_date")
     lstm_train_start_date: dt.date | None = None
     if body.lstm_train_start_date is not None:
         try:
@@ -2763,6 +3091,12 @@ def update_job_config(job_name: str, body: JobConfigIn) -> dict:
             config.ohlc_bars_start_date = None
             config.ohlc_bars_end_date = None
             config.ohlc_bars_limit = None
+        if definition.has_ohlc_update_fields:
+            config.ohlc_update_start_date = ohlc_update_start_date
+            config.ohlc_update_end_date = ohlc_update_end_date
+        else:
+            config.ohlc_update_start_date = None
+            config.ohlc_update_end_date = None
         if definition.has_lstm_training_fields:
             config.lstm_train_start_date = lstm_train_start_date
             config.lstm_train_end_date = lstm_train_end_date
@@ -2882,6 +3216,26 @@ def unhide_job(job_name: str) -> dict:
         return _job_to_dict(session, job_name)
 
 
+@app.post("/jobs/reorder")
+def reorder_jobs(body: JobReorderIn) -> list[dict]:
+    """Persists the Jobs page's drag-and-drop card order: body.job_names is every job
+    name in JOB_DEFINITIONS, in the new desired order (the frontend rebuilds this full
+    list - including hidden jobs, kept at their existing relative positions - from just
+    the visible cards' drop, so hidden jobs never lose their place). Stores each job's
+    list index as its sort_order, which list_jobs above then sorts by."""
+    if set(body.job_names) != set(JOB_DEFINITIONS):
+        raise HTTPException(status_code=400, detail="job_names must be exactly the set of known jobs")
+    with SessionLocal() as session:
+        for index, job_name in enumerate(body.job_names):
+            config = get_or_create_config(session, job_name)
+            config.sort_order = index
+        session.commit()
+        jobs = [_job_to_dict(session, name) for name in JOB_DEFINITIONS]
+    order = {name: index for index, name in enumerate(body.job_names)}
+    jobs.sort(key=lambda job: order[job["name"]])
+    return jobs
+
+
 @app.post("/jobs/{job_name}/reset")
 def reset_job(job_name: str) -> dict:
     """Empties the table(s) that job_name's data lives in - see _RESET_TABLES/
@@ -2939,3 +3293,50 @@ def job_runs(job_name: str, limit: int = 20) -> list[dict]:
             .all()
         )
         return [_run_to_dict(run) for run in rows]
+
+
+# Row cap for /admin/query's SELECT results - guards the response/browser against a
+# query like "SELECT * FROM ohlc_bars" with no LIMIT returning millions of rows. Purely
+# a transport cap on what's shipped back, not a rewrite of the query itself - the SQL
+# text sent by the caller runs against the database exactly as written.
+ADHOC_QUERY_MAX_ROWS = 1000
+
+
+@app.post("/admin/query")
+def run_adhoc_query(body: AdhocQueryIn) -> dict:
+    """Runs exactly one arbitrary SQL statement (SELECT or DML/DDL) against
+    backend_v2.db for the SQL console page. Statement type isn't sniffed from the SQL
+    text - CursorResult.returns_rows (set from the DBAPI cursor description after
+    execute) tells us whether to fetch rows or report a rowcount, which also means
+    this doesn't need to special-case WITH/PRAGMA/RETURNING or any other row-returning
+    statement shape. sqlite3's DBAPI itself rejects more than one statement per
+    execute() call, so no separate multi-statement guard is needed here."""
+    sql = body.sql.strip()
+    if not sql:
+        raise HTTPException(status_code=400, detail="SQL statement is required.")
+    with SessionLocal() as session:
+        try:
+            result = session.execute(text(sql))
+            if result.returns_rows:
+                columns = list(result.keys())
+                fetched = result.fetchmany(ADHOC_QUERY_MAX_ROWS + 1)
+                truncated = len(fetched) > ADHOC_QUERY_MAX_ROWS
+                fetched = fetched[:ADHOC_QUERY_MAX_ROWS]
+                session.commit()
+                return {
+                    "kind": "rows",
+                    "columns": columns,
+                    "rows": [dict(zip(columns, row, strict=True)) for row in fetched],
+                    "row_count": len(fetched),
+                    "truncated": truncated,
+                }
+            rowcount = result.rowcount
+            session.commit()
+            return {
+                "kind": "statement",
+                "rowcount": rowcount if rowcount is not None and rowcount >= 0 else None,
+            }
+        except SQLAlchemyError as exc:
+            session.rollback()
+            detail = str(getattr(exc, "orig", None) or exc)
+            raise HTTPException(status_code=400, detail=detail) from exc

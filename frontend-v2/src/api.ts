@@ -49,6 +49,10 @@ export interface Job {
   has_predicted_date_offset_field: boolean
   has_monte_carlo_fields: boolean
   has_ohlc_bars_fields: boolean
+  // Whether this job offers the Start date/End date pair (see ohlc_update_start_date/
+  // ohlc_update_end_date below) - only the ohlc-data-update job sets this. Unlike
+  // has_ohlc_bars_fields' pair, both fields here are required, not defaulted.
+  has_ohlc_update_fields: boolean
   // Whether this job offers the Start date/End date/Epochs/Lookback days/Learning
   // rate/Batch size group (see lstm_train_start_date etc. below) - the
   // train-lstm-holdout and train-lstm-walkforward jobs both set this.
@@ -120,6 +124,14 @@ export interface Job {
   // Max tickers selected per run, or null to default to 8000 at run time - capped at
   // 10000 regardless of what's stored. Only meaningful alongside has_ohlc_bars_fields.
   ohlc_bars_limit: number | null
+  // ISO dates ("YYYY-MM-DD") - unlike every other date field on this type, these are
+  // never defaulted at run time: a run with either left null fails outright (see
+  // backend-v2 db/models.py's JobConfig.ohlc_update_start_date docstring for why).
+  // Only meaningful alongside has_ohlc_update_fields (the ohlc-data-update job), which
+  // always overwrites this exact range for the selected tickers regardless of what's
+  // already synced - see backend-v2 jobs/sync_bars.py's sync_bars_manual.
+  ohlc_update_start_date: string | null
+  ohlc_update_end_date: string | null
   // ISO dates ("YYYY-MM-DD"), or null to default to a trailing 730-day window ending
   // yesterday (UTC) at run time - see backend-v2 jobs/lstm_common.py. Only meaningful
   // alongside has_lstm_training_fields (the two LSTM training jobs).
@@ -150,6 +162,12 @@ export interface Job {
   // default list across reloads until explicitly unhidden. Independent of running/
   // paused: a hidden job still runs on its schedule, it's just tucked away here.
   hidden: boolean
+  // Persisted (JobConfig.sort_order), not display-only - Jobs page card position, set
+  // by dragging a card there. null for a job never manually reordered; the backend
+  // (see app/main.py's list_jobs) falls back to its default order for those, so the
+  // array `api.jobs()` returns is already in display order - this field itself isn't
+  // otherwise read by the frontend.
+  sort_order: number | null
   running: boolean
   // Only meaningful while running - a job that isn't running can't be paused. Reflects
   // a pause *request*, not confirmation the run has actually parked at a checkpoint
@@ -180,6 +198,8 @@ export interface JobConfigInput {
   ohlc_bars_start_date?: string | null
   ohlc_bars_end_date?: string | null
   ohlc_bars_limit?: number | null
+  ohlc_update_start_date?: string | null
+  ohlc_update_end_date?: string | null
   lstm_train_start_date?: string | null
   lstm_train_end_date?: string | null
   lstm_epochs?: number | null
@@ -737,6 +757,72 @@ export interface MarketPredictionPerformanceOrderField {
   dir: 'asc' | 'desc'
 }
 
+// One row per ticker: what share of its daily bars in the requested date range fell
+// into each tickers_daily_market_direction.market_type bucket (see app/main.py's
+// market_direction_report, built on that view). Each pcnt_* field is a percentage
+// (0-100); the five sum to 100 for every row returned - a ticker with no bars in range
+// is simply absent rather than appearing with zeros/nulls. latest_price is the view's
+// most recent ohlc_bars.close for the ticker - not bounded by the report's date range,
+// so it stays the same across every date range chosen. market_cap is ticker_details'
+// (null for a ticker with no ticker_details row, e.g. most ETFs). total_records is the
+// COUNT(*) of daily bars the pcnt_* columns were computed over, for sanity-checking a
+// percentage against how many records actually backed it.
+export interface MarketDirectionRow {
+  ticker: string
+  name: string | null
+  type: string | null
+  market: string | null
+  latest_price: number | null
+  market_cap: number | null
+  total_records: number
+  pcnt_strong_down: number
+  pcnt_down: number
+  pcnt_neutral: number
+  pcnt_up: number
+  pcnt_strong_up: number
+}
+
+// Backend caps page_size at 1000 (see app/main.py's MARKET_DIRECTION_MAX_PAGE_SIZE).
+export const MARKET_DIRECTION_MAX_PAGE_SIZE = 1000
+
+export interface MarketDirectionReport {
+  rows: MarketDirectionRow[]
+  total: number
+  page: number
+  page_size: number
+}
+
+// Sort priority for the Market Direction report - same shape/reasoning as
+// StaleTickerOrderField, against MARKET_DIRECTION_ORDERABLE_FIELDS instead.
+export interface MarketDirectionOrderField {
+  field: string
+  dir: 'asc' | 'desc'
+}
+
+// One row per (ticker, day) rather than MarketDirectionRow's one row per ticker - the
+// drill-down behind a Market Direction report row's pcnt_* columns (see app/main.py's
+// market_direction_daily_report). pcnt_diff/market_type are that single day's
+// open->close move and which bucket it fell into.
+export interface MarketDirectionDailyRow {
+  ticker: string
+  date: string
+  open_price: number | null
+  close_price: number | null
+  pcnt_diff: number | null
+  market_type: string | null
+}
+
+export interface MarketDirectionDailyReport {
+  rows: MarketDirectionDailyRow[]
+}
+
+// Sort priority for the daily drill-down - same shape/reasoning as
+// MarketDirectionOrderField, against MARKET_DIRECTION_DAILY_ORDERABLE_FIELDS instead.
+export interface MarketDirectionDailyOrderField {
+  field: string
+  dir: 'asc' | 'desc'
+}
+
 // One row per ticker with a Markov, Monte Carlo, and/or either LSTM flavor's
 // prediction for the requested predicted_date - backs the Prediction Comparison report
 // grid (see app/main.py's prediction_comparison_report). Unlike MarketPredictionRow,
@@ -916,6 +1002,19 @@ async function postJSON<T>(path: string): Promise<T> {
   return res.json()
 }
 
+async function postJSONBody<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) {
+    const detail = await res.json().catch(() => null)
+    throw new Error(detail?.detail ?? `${path} failed: ${res.status}`)
+  }
+  return res.json()
+}
+
 // Fills in abs_expected_return_pct on a report row fetched from the backend, which only
 // sends expected_return (a signed fraction, e.g. -0.29) - shared by both report fetches
 // below so the derivation lives in one place.
@@ -950,6 +1049,14 @@ function addNumericFilter(qs: URLSearchParams, prefix: string, filter?: NumericF
 
 export type TriggerJobResult = { status: 'started' } | { status: 'already-running' }
 
+// Mirrors app/main.py's run_adhoc_query response - "rows" for SELECT/anything else
+// CursorResult.returns_rows is true for, "statement" for INSERT/UPDATE/DELETE/DDL.
+// row values are unknown rather than a narrower type since the SQL console can query
+// any table/column the caller writes.
+export type AdhocQueryResult =
+  | { kind: 'rows'; columns: string[]; rows: Record<string, unknown>[]; row_count: number; truncated: boolean }
+  | { kind: 'statement'; rowcount: number | null }
+
 export const api = {
   jobs: () => getJSON<Job[]>('/jobs'),
   job: (name: string) => getJSON<Job>(`/jobs/${name}`),
@@ -966,7 +1073,9 @@ export const api = {
   cancelJob: (name: string) => postJSON<{ status: string }>(`/jobs/${name}/cancel`),
   hideJob: (name: string) => postJSON<Job>(`/jobs/${name}/hide`),
   unhideJob: (name: string) => postJSON<Job>(`/jobs/${name}/unhide`),
+  reorderJobs: (jobNames: string[]) => postJSONBody<Job[]>('/jobs/reorder', { job_names: jobNames }),
   resetJob: (name: string) => postJSON<Job>(`/jobs/${name}/reset`),
+  runAdhocQuery: (sql: string) => postJSONBody<AdhocQueryResult>('/admin/query', { sql }),
   searchTickers: (q: string, limit = 20) =>
     getJSON<TickerOption[]>(`/tickers/search?q=${encodeURIComponent(q)}&limit=${limit}`),
   searchTickerTypes: (q: string, limit = 20) =>
@@ -1129,6 +1238,47 @@ export const api = {
     addNumericFilter(qs, 'markov_win_rate', markovWinRateFilter)
     addNumericFilter(qs, 'mcmc_win_rate', mcmcWinRateFilter)
     return getJSON<MarketPredictionsPerformanceReport>(`/reports/market-predictions-performance?${qs.toString()}`)
+  },
+  // startDate/endDate are ISO dates ("YYYY-MM-DD"); each independently defaults to
+  // today (UTC) server-side when omitted - see app/main.py's market_direction_report.
+  marketDirectionReport: (
+    startDate?: string,
+    endDate?: string,
+    tickerTypes: string[] = [],
+    tickers: string[] = [],
+    page = 1,
+    pageSize = MARKET_DIRECTION_MAX_PAGE_SIZE,
+    orderBy: MarketDirectionOrderField[] = [],
+    marketCapFilter?: NumericFilter,
+  ) => {
+    const orderByParam = orderBy.map(({ field, dir }) => `${field}:${dir}`).join(',')
+    const qs = new URLSearchParams()
+    qs.set('start_date', startDate ?? '')
+    qs.set('end_date', endDate ?? '')
+    qs.set('ticker_types', tickerTypes.join(','))
+    qs.set('tickers', tickers.join(','))
+    qs.set('page', String(page))
+    qs.set('page_size', String(pageSize))
+    qs.set('order_by', orderByParam)
+    addNumericFilter(qs, 'market_cap', marketCapFilter)
+    return getJSON<MarketDirectionReport>(`/reports/market-direction?${qs.toString()}`)
+  },
+  // startDate/endDate are ISO dates ("YYYY-MM-DD"); each independently defaults to
+  // today (UTC) server-side when omitted - see app/main.py's
+  // market_direction_daily_report. Not paginated: scoped to one ticker.
+  marketDirectionDailyReport: (
+    ticker: string,
+    startDate?: string,
+    endDate?: string,
+    orderBy: MarketDirectionDailyOrderField[] = [],
+  ) => {
+    const orderByParam = orderBy.map(({ field, dir }) => `${field}:${dir}`).join(',')
+    const qs = new URLSearchParams()
+    qs.set('ticker', ticker)
+    qs.set('start_date', startDate ?? '')
+    qs.set('end_date', endDate ?? '')
+    qs.set('order_by', orderByParam)
+    return getJSON<MarketDirectionDailyReport>(`/reports/market-direction/daily?${qs.toString()}`)
   },
   researchPicks: (runId?: number) =>
     getJSON<ResearchPicksResult>(`/reports/research-picks${runId ? `?run_id=${runId}` : ''}`),

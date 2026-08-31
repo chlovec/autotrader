@@ -51,6 +51,7 @@ def init_db() -> None:
     _add_job_configs_snapshot_types_column()
     _add_job_configs_average_volume_columns()
     _add_job_configs_hidden_column()
+    _add_job_configs_sort_order_column()
     _add_job_configs_backtest_columns()
     _add_job_configs_run_requested_at_column()
     _add_job_configs_prediction_start_date_column()
@@ -71,6 +72,7 @@ def init_db() -> None:
     _migrate_lstm_inferences_training_method_pk()
     _add_lstm_inferences_exit_price_confidence_column()
     _add_job_configs_prediction_accuracy_pass_threshold_std_column()
+    _add_job_configs_ohlc_update_columns()
 
 
 def _add_column_if_missing(table: str, column: str, ddl_type: str) -> None:
@@ -114,6 +116,12 @@ def _add_job_configs_average_volume_columns() -> None:
 
 def _add_job_configs_hidden_column() -> None:
     _add_job_configs_column("hidden", "BOOLEAN DEFAULT 0")
+
+
+def _add_job_configs_sort_order_column() -> None:
+    """See db/models.py's JobConfig.sort_order - left NULL on existing rows, same
+    "resolved at read time" fallback as the other nullable job_configs columns."""
+    _add_job_configs_column("sort_order", "INTEGER")
 
 
 def _add_job_configs_backtest_columns() -> None:
@@ -326,6 +334,16 @@ def _add_job_configs_prediction_accuracy_pass_threshold_std_column() -> None:
     after job_configs itself, same "left NULL on existing rows, resolved at run time"
     reasoning as _add_job_configs_mcmc_num_simulations_column."""
     _add_job_configs_column("prediction_accuracy_pass_threshold_std", "FLOAT")
+
+
+def _add_job_configs_ohlc_update_columns() -> None:
+    """See db/models.py's JobConfig.ohlc_update_start_date/ohlc_update_end_date - added
+    after job_configs itself, same "left NULL on existing rows" reasoning as
+    _add_job_configs_ohlc_bars_columns. Unlike that pair, these two are never defaulted
+    at run time (jobs/engine.py's run_job requires both to be set), so a NULL here just
+    means the ohlc-data-update job hasn't been configured yet."""
+    _add_job_configs_column("ohlc_update_start_date", "DATE")
+    _add_job_configs_column("ohlc_update_end_date", "DATE")
 
 
 def _add_lstm_inferences_exit_price_confidence_column() -> None:

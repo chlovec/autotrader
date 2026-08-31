@@ -58,6 +58,8 @@ function JobVisibilityMenu({ jobs, onToggle }: { jobs: Job[]; onToggle: (job: Jo
 export function JobsPage() {
   const [jobs, setJobs] = useState<Job[] | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [draggedJob, setDraggedJob] = useState<string | null>(null)
+  const [dragOverJob, setDragOverJob] = useState<string | null>(null)
 
   const loadJobs = async () => {
     try {
@@ -99,6 +101,42 @@ export function JobsPage() {
 
   const visibleJobs = jobs?.filter((job) => !job.hidden) ?? []
 
+  const handleDragEnd = () => {
+    setDraggedJob(null)
+    setDragOverJob(null)
+  }
+
+  // Reorders just the visible cards (dragged/target are both drawn from visibleJobs),
+  // then splices that new order back into the full job list in place of the old
+  // visible ordering - so hidden jobs (never rendered as cards, and thus never
+  // draggable) keep their existing relative slots instead of getting shuffled to the
+  // end. api.reorderJobs needs every job name, visible or not, since sort_order is
+  // stored per job on the backend (see app/main.py's reorder_jobs).
+  const handleDrop = async (targetName: string) => {
+    const sourceName = draggedJob
+    handleDragEnd()
+    if (!jobs || !sourceName || sourceName === targetName) return
+
+    const fromIndex = visibleJobs.findIndex((job) => job.name === sourceName)
+    const toIndex = visibleJobs.findIndex((job) => job.name === targetName)
+    if (fromIndex === -1 || toIndex === -1) return
+
+    const reorderedVisible = [...visibleJobs]
+    const [moved] = reorderedVisible.splice(fromIndex, 1)
+    reorderedVisible.splice(toIndex, 0, moved)
+
+    let nextVisible = 0
+    const merged = jobs.map((job) => (job.hidden ? job : reorderedVisible[nextVisible++]))
+
+    setJobs(merged)
+    try {
+      setJobs(await api.reorderJobs(merged.map((job) => job.name)))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to reorder jobs')
+      loadJobs()
+    }
+  }
+
   return (
     <div className="jobs-page">
       <h1 className="jobs-page-title">Jobs</h1>
@@ -117,7 +155,18 @@ export function JobsPage() {
           </div>
           <div className="jobs-list">
             {visibleJobs.map((job) => (
-              <JobCard key={job.name} job={job} onSaved={handleSaved} onRun={handleRun} />
+              <JobCard
+                key={job.name}
+                job={job}
+                onSaved={handleSaved}
+                onRun={handleRun}
+                dragging={draggedJob === job.name}
+                dragOver={dragOverJob === job.name && draggedJob !== job.name}
+                onDragStart={() => setDraggedJob(job.name)}
+                onDragEnter={() => draggedJob && draggedJob !== job.name && setDragOverJob(job.name)}
+                onDragEnd={handleDragEnd}
+                onDrop={() => handleDrop(job.name)}
+              />
             ))}
           </div>
         </>

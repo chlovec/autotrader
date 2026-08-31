@@ -9,7 +9,7 @@ import {
   type TickerTypeOption,
 } from '../api'
 import { CancelJobModal } from './CancelJobModal'
-import { ChevronIcon, EyeIcon, InfoIcon, PauseIcon, PlayIcon, StopIcon, TrashIcon } from './icons'
+import { ChevronIcon, DragHandleIcon, EyeIcon, InfoIcon, PauseIcon, PlayIcon, StopIcon, TrashIcon } from './icons'
 import { ResetJobModal } from './ResetJobModal'
 import { RunJobModal } from './RunJobModal'
 import { SearchableSelect, type SelectOption } from './SearchableSelect'
@@ -18,6 +18,16 @@ type JobCardProps = {
   job: Job
   onSaved: (job: Job) => void
   onRun: () => void
+  // Drag-to-reorder wiring, owned by JobsPage (it needs every visible card's dragged/
+  // drag-over state at once to compute the drop target) - this card only reports drag
+  // handle events and renders the resulting dragging/dragOver state, same split as
+  // every other JobCard control that mutates shared list state (e.g. onSaved/onRun).
+  dragging: boolean
+  dragOver: boolean
+  onDragStart: () => void
+  onDragEnter: () => void
+  onDragEnd: () => void
+  onDrop: () => void
 }
 
 function tickerTypeLabel(t: TickerTypeOption): string {
@@ -100,7 +110,17 @@ function StatusBadge({ job }: { job: Job }) {
   return <span className="job-status-badge succeeded">Succeeded</span>
 }
 
-export function JobCard({ job, onSaved, onRun }: JobCardProps) {
+export function JobCard({
+  job,
+  onSaved,
+  onRun,
+  dragging,
+  dragOver,
+  onDragStart,
+  onDragEnter,
+  onDragEnd,
+  onDrop,
+}: JobCardProps) {
   const [runType, setRunType] = useState<RunType>(job.run_type)
   const [scheduleIntervalUnit, setScheduleIntervalUnit] = useState<ScheduleIntervalUnit>(job.schedule_interval_unit)
   const [scheduleIntervalValue, setScheduleIntervalValue] = useState(job.schedule_interval_value)
@@ -127,6 +147,8 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
   const [ohlcBarsEndDate, setOhlcBarsEndDate] = useState(job.ohlc_bars_end_date ?? '')
   // Default 8000 matches backend-v2 jobs/sync_ohlc_bars.py's DEFAULT_LIMIT.
   const [ohlcBarsLimit, setOhlcBarsLimit] = useState(job.ohlc_bars_limit ?? 8000)
+  const [ohlcUpdateStartDate, setOhlcUpdateStartDate] = useState(job.ohlc_update_start_date ?? '')
+  const [ohlcUpdateEndDate, setOhlcUpdateEndDate] = useState(job.ohlc_update_end_date ?? '')
   const [lstmTrainStartDate, setLstmTrainStartDate] = useState(job.lstm_train_start_date ?? '')
   const [lstmTrainEndDate, setLstmTrainEndDate] = useState(job.lstm_train_end_date ?? '')
   // Defaults match backend-v2 jobs/lstm_common.py's DEFAULT_EPOCHS/
@@ -203,6 +225,12 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
               ohlc_bars_start_date: ohlcBarsStartDate || null,
               ohlc_bars_end_date: ohlcBarsEndDate || null,
               ohlc_bars_limit: ohlcBarsLimit,
+            }
+          : {}),
+        ...(job.has_ohlc_update_fields
+          ? {
+              ohlc_update_start_date: ohlcUpdateStartDate || null,
+              ohlc_update_end_date: ohlcUpdateEndDate || null,
             }
           : {}),
         ...(job.has_lstm_training_fields
@@ -285,9 +313,27 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
   }
 
   return (
-    <section className="job-card">
+    <section
+      className={`job-card${dragging ? ' job-card-dragging' : ''}${dragOver ? ' job-card-drag-over' : ''}`}
+      onDragOver={(event) => event.preventDefault()}
+      onDragEnter={onDragEnter}
+      onDrop={(event) => {
+        event.preventDefault()
+        onDrop()
+      }}
+    >
       <div className="job-card-header">
         <div className="job-card-header-left">
+          <button
+            type="button"
+            className="icon-button job-drag-handle"
+            aria-label={`Drag to reorder ${job.label} job.`}
+            draggable
+            onDragStart={onDragStart}
+            onDragEnd={onDragEnd}
+          >
+            <DragHandleIcon className="icon" />
+          </button>
           <button
             type="button"
             className="icon-button job-collapse-button"
@@ -541,6 +587,7 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
                 !job.has_predicted_date_offset_field &&
                 !job.has_monte_carlo_fields &&
                 !job.has_ohlc_bars_fields &&
+                !job.has_ohlc_update_fields &&
                 !job.has_lstm_training_fields &&
                 !job.has_lstm_walkforward_fields &&
                 !job.has_lstm_inference_fields &&
@@ -787,6 +834,34 @@ export function JobCard({ job, onSaved, onRun }: JobCardProps) {
                     Leave start date blank to default to 2 years before today (UTC), and end date blank to default
                     to today - end date can't be after today. Limit (max 10000) caps how many tickers this run
                     selects; a backlog larger than that needs more than one run to fully catch up.
+                  </p>
+                </>
+              )}
+
+              {job.has_ohlc_update_fields && (
+                <>
+                  <div className="job-field-row">
+                    <label className="job-field">
+                      Start date (UTC)
+                      <input
+                        type="date"
+                        value={ohlcUpdateStartDate}
+                        onChange={(e) => setOhlcUpdateStartDate(e.target.value)}
+                      />
+                    </label>
+                    <label className="job-field">
+                      End date (UTC)
+                      <input
+                        type="date"
+                        value={ohlcUpdateEndDate}
+                        onChange={(e) => setOhlcUpdateEndDate(e.target.value)}
+                      />
+                    </label>
+                  </div>
+                  <p className="job-field-hint">
+                    Both required - unlike every other date field on this page, neither defaults to anything.
+                    Every run re-fetches and overwrites this exact range for the selected tickers (or every
+                    ticker, if none is selected above), regardless of what's already synced.
                   </p>
                 </>
               )}

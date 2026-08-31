@@ -29,6 +29,7 @@ const NAV_ITEMS: NavItem[] = [
       'Top Movers',
       'Trading Symbols',
       'Stale Tickers',
+      'Market Direction',
       'Next 10 Day Predictions',
       'Market Predictions',
       'Market Prediction Performance',
@@ -38,7 +39,7 @@ const NAV_ITEMS: NavItem[] = [
   },
   {
     view: 'Settings',
-    children: ['Ticker Types'],
+    children: ['Ticker Types', 'SQL Console'],
   },
 ]
 

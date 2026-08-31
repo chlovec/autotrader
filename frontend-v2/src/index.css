@@ -447,6 +447,34 @@ body {
   flex-shrink: 0;
 }
 
+.job-drag-handle {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  cursor: grab;
+}
+
+.job-drag-handle:active {
+  cursor: grabbing;
+}
+
+.job-drag-handle .icon {
+  width: 16px;
+  height: 16px;
+}
+
+/* Dims the card being dragged (rather than hiding it - the browser already renders
+   its own drag ghost) and shows a themed outline on whichever card the pointer is
+   currently over, so a drop target reads clearly mid-drag. */
+.job-card-dragging {
+  opacity: 0.5;
+}
+
+.job-card-drag-over {
+  outline: 2px solid var(--series-1);
+  outline-offset: 2px;
+}
+
 .job-collapse-button {
   width: 28px;
   height: 28px;
@@ -1124,6 +1152,26 @@ body {
 }
 
 .market-predictions-performance-fields .report-order-by-field {
+  grid-column: 1 / -1;
+}
+
+/* Market Direction's filter row - same "2 per row" grid as
+   .market-predictions-performance-fields above, scoped to this page. */
+.market-direction-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: end;
+}
+
+.market-direction-fields .report-ticker-type-field,
+.market-direction-fields .report-page-size-field,
+.market-direction-fields .report-order-by-field {
+  width: 100%;
+  max-width: none;
+  min-width: 0;
+}
+
+.market-direction-fields .report-order-by-field {
   grid-column: 1 / -1;
 }
 
@@ -2012,4 +2060,25 @@ body {
   .backtest-chart-legend {
     margin-left: 0;
   }
+}
+
+/* SQL Console */
+
+.sql-console-input {
+  width: 100%;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--page);
+  color: var(--text-primary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.sql-console-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin: 12px 0 20px;
 }

@@ -1116,6 +1116,14 @@ class JobConfig(Base):
     date after today is rejected, not clamped), and a None ohlc_bars_limit to 8000
     (capped at 10000 regardless of what's stored here).
 
+    ohlc_update_start_date/ohlc_update_end_date only apply to the ohlc-data-update job
+    (registry.JobDefinition.has_ohlc_update_fields). Unlike ohlc_bars_start_date/
+    ohlc_bars_end_date above, both are required at run time rather than resolved to a
+    default - jobs/engine.py's run_job raises if either is left None, since this job's
+    whole point is a deliberate overwrite of a caller-chosen range (see
+    jobs/sync_bars.py's sync_bars_manual) and silently falling back to some default
+    range would defeat that.
+
     lstm_train_start_date/lstm_train_end_date/lstm_epochs/lstm_lookback_days/
     lstm_learning_rate/lstm_batch_size only apply to the train-lstm-holdout and
     train-lstm-walkforward jobs (registry.JobDefinition.has_lstm_training_fields), same
@@ -1173,6 +1181,8 @@ class JobConfig(Base):
     ohlc_bars_start_date: Mapped[dt.date | None] = mapped_column(Date)
     ohlc_bars_end_date: Mapped[dt.date | None] = mapped_column(Date)
     ohlc_bars_limit: Mapped[int | None] = mapped_column(Integer)
+    ohlc_update_start_date: Mapped[dt.date | None] = mapped_column(Date)
+    ohlc_update_end_date: Mapped[dt.date | None] = mapped_column(Date)
     lstm_train_start_date: Mapped[dt.date | None] = mapped_column(Date)
     lstm_train_end_date: Mapped[dt.date | None] = mapped_column(Date)
     lstm_epochs: Mapped[int | None] = mapped_column(Integer)
@@ -1185,6 +1195,11 @@ class JobConfig(Base):
     # Hides the job's card from the Jobs page's default list (see app/main.py's
     # list_jobs) without affecting its schedule - a hidden job still runs normally.
     hidden: Mapped[bool] = mapped_column(default=False)
+    # Position of this job's card on the Jobs page, set by dragging a card there (see
+    # app/main.py's reorder_jobs) - lower sorts first. None for a job never manually
+    # reordered, in which case list_jobs falls back to JOB_DEFINITIONS' insertion order
+    # for it, same "unset -> default" pattern as the other nullable columns here.
+    sort_order: Mapped[int | None] = mapped_column(Integer)
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False), default=dt.datetime.utcnow)
     run_requested_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=False))
 

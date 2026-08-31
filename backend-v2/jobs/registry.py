@@ -33,6 +33,14 @@ PREDICTION_ACCURACY_JOB = "compute-prediction-accuracy"
 RESEARCH_PICKS_JOB = "research-picks"
 ETF_CONSTITUENTS_JOB = "sync-etf-constituents"
 OHLC_BARS_JOB = "sync-ohlc-bars"
+# Distinct from OHLC_BARS_JOB (incremental, tickers.last_ohlc_sync_date-driven) and
+# BARS_JOB (incremental, ohlc_bars.MAX(timestamp)-driven) - this one always re-fetches
+# and overwrites its whole caller-given [start_date, end_date] for the selected
+# tickers, regardless of what's already synced (see jobs/sync_bars.py's
+# sync_bars_manual, which this job runs directly). Exists for deliberate backfills/
+# corrections over a known range - e.g. re-pulling a range after a bad sync - where
+# the incremental jobs' "skip what's already there" logic is exactly what's unwanted.
+OHLC_UPDATE_JOB = "ohlc-data-update"
 # Two separate training jobs - one per jobs/lstm_common.py validation flavor - rather
 # than one job with a mode switch, specifically so their JobRun.started_at/finished_at
 # wall-clock time can be compared directly on the Jobs page (see jobs/train_lstm_holdout.py
@@ -103,6 +111,7 @@ DEFAULT_SCHEDULES: dict[str, tuple[str, int]] = {
     RESEARCH_PICKS_JOB: ("days", 1),
     ETF_CONSTITUENTS_JOB: ("days", 1),
     OHLC_BARS_JOB: ("days", 1),
+    OHLC_UPDATE_JOB: ("days", 1),
     TRAIN_LSTM_HOLDOUT_JOB: ("days", 1),
     TRAIN_LSTM_WALKFORWARD_JOB: ("days", 1),
     PREDICT_LSTM_HOLDOUT_JOB: ("days", 1),
@@ -183,6 +192,14 @@ class JobDefinition:
     # (jobs/sync_ohlc_bars.py's _select_tickers_to_sync) is the only ticker selection
     # mechanism it has.
     has_ohlc_bars_fields: bool = False
+    # Whether this job offers the "Start date"/"End date" pair (see
+    # jobs/sync_bars.py's sync_bars_manual) - only the ohlc-data-update job takes this.
+    # Independent of the other flags, same layering as has_backtest_fields; also paired
+    # with has_ticker_selector on that job, to scope which tickers get overwritten.
+    # Unlike has_backtest_fields/has_ohlc_bars_fields' date pairs, both fields here are
+    # required at run time rather than resolved to a default - see db/models.py's
+    # JobConfig.ohlc_update_start_date docstring for why.
+    has_ohlc_update_fields: bool = False
     # Whether this job offers the "Start date"/"End date"/"Epochs"/"Lookback days"/
     # "Learning rate"/"Batch size" group (see jobs/lstm_common.py) - shared by both
     # train-lstm-holdout and train-lstm-walkforward, since both train the same
@@ -535,6 +552,29 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
         # Batch-limited backfill run with no natural daily cadence of its own (a limit
         # smaller than the backlog needs several runs to catch up) - manual by default,
         # same reasoning as ticker-types/snapshots/movers.
+        default_run_type="manual",
+    ),
+    OHLC_UPDATE_JOB: JobDefinition(
+        name=OHLC_UPDATE_JOB,
+        label="OHLC data update",
+        description=(
+            "Syncs GET /v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{from}/{to} "
+            "into ohlc_bars for every selected ticker over the exact Start date/End "
+            "date range given, overwriting any bar already stored for a day in that "
+            "range and adding one where none existed - regardless of what's already "
+            "synced. Unlike sync-ohlc-bars/sync-bars-nightly, this job does no "
+            "incremental check against tickers.last_ohlc_sync_date or ohlc_bars' own "
+            "most recent bar - every run re-fetches the whole given range from "
+            "scratch. Meant for deliberate backfills/corrections over a known range "
+            "(e.g. re-pulling a range after a bad sync), not routine syncing."
+        ),
+        has_bars_fields=False,
+        has_ticker_selector=True,
+        has_ohlc_update_fields=True,
+        # Deliberate, caller-scoped overwrite with no natural daily cadence of its own
+        # (running it automatically every day would defeat the point of it being a
+        # targeted correction) - manual by default, same reasoning as
+        # ticker-types/snapshots/movers.
         default_run_type="manual",
     ),
     TRAIN_LSTM_HOLDOUT_JOB: JobDefinition(
