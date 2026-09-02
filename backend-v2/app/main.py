@@ -63,6 +63,7 @@ from jobs.registry import (
     ETF_CONSTITUENTS_JOB,
     INDICATOR_NAMES,
     JOB_DEFINITIONS,
+    JobDefinition,
     LSTM_INFERENCE_TRAINING_METHODS,
     MOVERS_JOB,
     NEWS_JOB,
@@ -312,11 +313,12 @@ _LSTM_MODEL_VERSION_TRAINING_METHODS: dict[str, str] = {
 _RESET_SYNC_STATE_KEYS: dict[str, str] = {TICKERS_JOB: "tickers", NEWS_JOB: "news"}
 
 
-class JobConfigIn(BaseModel):
-    run_type: Literal["manual", "auto"]
-    schedule_interval_unit: Literal["minutes", "hours", "days"]
-    schedule_interval_value: int
-    start_time: str = DEFAULT_START_TIME
+class _JobFieldsIn(BaseModel):
+    """Every per-job run parameter a job can take, shared by JobConfigIn (a full saved
+    config, PUT /jobs/{name}/config) and JobRunOverridesIn (a one-time override for a
+    single manual run, POST /jobs/{name}/run) - see _validate_and_normalize_job_fields,
+    which both endpoints call to validate/parse/gate these identically."""
+
     ticker_types: str | None = None
     tickers: str | None = None
     multiplier: int | None = None
@@ -345,6 +347,21 @@ class JobConfigIn(BaseModel):
     lstm_walkforward_num_folds: int | None = None
     lstm_model_version_id: int | None = None
     prediction_accuracy_pass_threshold_std: float | None = None
+
+
+class JobConfigIn(_JobFieldsIn):
+    run_type: Literal["manual", "auto"]
+    schedule_interval_unit: Literal["minutes", "hours", "days"]
+    schedule_interval_value: int
+    start_time: str = DEFAULT_START_TIME
+
+
+class JobRunOverridesIn(_JobFieldsIn):
+    """Optional POST /jobs/{name}/run request body - the dashboard's Jobs page sends
+    whatever a job's card currently shows (saved or not - see frontend-v2's
+    JobCard.tsx/RunJobModal.tsx) as a one-time override for just that run, so a manual
+    run never silently falls back to a stale saved JobConfig field. No run_type/
+    schedule_* fields here - those only make sense for a saved, recurring config."""
 
 
 class JobReorderIn(BaseModel):
@@ -2904,15 +2921,16 @@ def get_job(job_name: str) -> dict:
         return _job_to_dict(session, job_name)
 
 
-@app.put("/jobs/{job_name}/config")
-def update_job_config(job_name: str, body: JobConfigIn) -> dict:
-    _require_job(job_name)
-    if body.schedule_interval_value < 1:
-        raise HTTPException(status_code=400, detail="schedule_interval_value must be at least 1")
+def _validate_and_normalize_job_fields(definition: JobDefinition, body: _JobFieldsIn) -> dict[str, Any]:
+    """Validates/parses every per-job field (shared by JobConfigIn's full-config save
+    and JobRunOverridesIn's one-time run override - see their docstrings), then gates
+    each one by whether `definition` actually uses it, same has_* flags JobCard.tsx's
+    render order uses to decide which fields to show. Always returns every key (26 of
+    them - one per _JobFieldsIn field other than ticker_types/tickers), None for
+    whichever ones don't apply to this job, so a caller can assign every returned key
+    onto a JobConfig/dict unconditionally rather than re-deriving the gating itself."""
     if body.ticker_types and body.tickers:
         raise HTTPException(status_code=400, detail="specify ticker_types or tickers, not both")
-    if body.start_time not in START_TIME_OPTIONS:
-        raise HTTPException(status_code=400, detail="start_time must be a quarter-hour UTC time, e.g. '00:15'")
     if body.snapshot_types and (
         invalid := set(split_csv(body.snapshot_types) or []) - set(SNAPSHOT_TYPE_OPTIONS)
     ):
@@ -3040,86 +3058,72 @@ def update_job_config(job_name: str, body: JobConfigIn) -> dict:
     if body.prediction_accuracy_pass_threshold_std is not None and body.prediction_accuracy_pass_threshold_std <= 0:
         raise HTTPException(status_code=400, detail="prediction_accuracy_pass_threshold_std must be greater than 0")
 
+    # ticker_types applies to jobs with has_ticker_type_filter (a single type filter -
+    # see sync_tickers's ticker_type param) or has_ticker_selector (a multi-select
+    # filter - see sync_bars/sync_snapshots's _resolve_tickers). Dropped for a job like
+    # ticker-types sync that takes no run parameters at all, even if the caller sent one.
+    fields: dict[str, Any] = {
+        "ticker_types": (
+            body.ticker_types if (definition.has_ticker_type_filter or definition.has_ticker_selector) else None
+        ),
+        # tickers is only meaningful alongside the multi-select ticker_types above.
+        "tickers": body.tickers if definition.has_ticker_selector else None,
+        "multiplier": body.multiplier if definition.has_bars_fields else None,
+        "timespan": body.timespan if definition.has_bars_fields else None,
+        "backfill_days": body.backfill_days if definition.has_bars_fields else None,
+        "bars_end_date_offset_days": body.bars_end_date_offset_days if definition.has_bars_fields else None,
+        "snapshot_types": body.snapshot_types if definition.has_snapshot_type_filter else None,
+        "average_volume_start_date": average_volume_start_date if definition.has_average_volume_fields else None,
+        "average_volume_days_interval": (
+            body.average_volume_days_interval if definition.has_average_volume_fields else None
+        ),
+        "backtest_start_date": backtest_start_date if definition.has_backtest_fields else None,
+        "backtest_end_date": backtest_end_date if definition.has_backtest_fields else None,
+        "prediction_start_date": prediction_start_date if definition.has_prediction_start_date_field else None,
+        "predicted_date_offset_days": (
+            body.predicted_date_offset_days if definition.has_predicted_date_offset_field else None
+        ),
+        "mcmc_num_simulations": body.mcmc_num_simulations if definition.has_monte_carlo_fields else None,
+        "ohlc_bars_start_date": ohlc_bars_start_date if definition.has_ohlc_bars_fields else None,
+        "ohlc_bars_end_date": ohlc_bars_end_date if definition.has_ohlc_bars_fields else None,
+        "ohlc_bars_limit": body.ohlc_bars_limit if definition.has_ohlc_bars_fields else None,
+        "ohlc_update_start_date": ohlc_update_start_date if definition.has_ohlc_update_fields else None,
+        "ohlc_update_end_date": ohlc_update_end_date if definition.has_ohlc_update_fields else None,
+        "lstm_train_start_date": lstm_train_start_date if definition.has_lstm_training_fields else None,
+        "lstm_train_end_date": lstm_train_end_date if definition.has_lstm_training_fields else None,
+        "lstm_epochs": body.lstm_epochs if definition.has_lstm_training_fields else None,
+        "lstm_lookback_days": body.lstm_lookback_days if definition.has_lstm_training_fields else None,
+        "lstm_learning_rate": body.lstm_learning_rate if definition.has_lstm_training_fields else None,
+        "lstm_batch_size": body.lstm_batch_size if definition.has_lstm_training_fields else None,
+        "lstm_walkforward_num_folds": (
+            body.lstm_walkforward_num_folds if definition.has_lstm_walkforward_fields else None
+        ),
+        "lstm_model_version_id": body.lstm_model_version_id if definition.has_lstm_inference_fields else None,
+        "prediction_accuracy_pass_threshold_std": (
+            body.prediction_accuracy_pass_threshold_std if definition.has_prediction_accuracy_fields else None
+        ),
+    }
+    return fields
+
+
+@app.put("/jobs/{job_name}/config")
+def update_job_config(job_name: str, body: JobConfigIn) -> dict:
+    _require_job(job_name)
+    if body.schedule_interval_value < 1:
+        raise HTTPException(status_code=400, detail="schedule_interval_value must be at least 1")
+    if body.start_time not in START_TIME_OPTIONS:
+        raise HTTPException(status_code=400, detail="start_time must be a quarter-hour UTC time, e.g. '00:15'")
+    definition = JOB_DEFINITIONS[job_name]
+    fields = _validate_and_normalize_job_fields(definition, body)
+
     with SessionLocal() as session:
-        definition = JOB_DEFINITIONS[job_name]
         config = get_or_create_config(session, job_name)
         config.run_type = body.run_type
         config.schedule_interval_unit = body.schedule_interval_unit
         config.schedule_interval_value = body.schedule_interval_value
         config.start_time = body.start_time
-        # ticker_types applies to jobs with has_ticker_type_filter (a single type
-        # filter - see sync_tickers's ticker_type param) or has_ticker_selector (a
-        # multi-select filter - see sync_bars/sync_snapshots's _resolve_tickers).
-        # Dropped for a job like ticker-types sync that takes no run parameters at
-        # all, even if the caller sent one.
-        config.ticker_types = (
-            body.ticker_types if (definition.has_ticker_type_filter or definition.has_ticker_selector) else None
-        )
-        # tickers is only meaningful alongside the multi-select ticker_types above.
-        config.tickers = body.tickers if definition.has_ticker_selector else None
-        if definition.has_bars_fields:
-            config.multiplier = body.multiplier
-            config.timespan = body.timespan
-            config.backfill_days = body.backfill_days
-            config.bars_end_date_offset_days = body.bars_end_date_offset_days
-        config.snapshot_types = body.snapshot_types if definition.has_snapshot_type_filter else None
-        if definition.has_average_volume_fields:
-            config.average_volume_start_date = average_volume_start_date
-            config.average_volume_days_interval = body.average_volume_days_interval
-        else:
-            config.average_volume_start_date = None
-            config.average_volume_days_interval = None
-        if definition.has_backtest_fields:
-            config.backtest_start_date = backtest_start_date
-            config.backtest_end_date = backtest_end_date
-        else:
-            config.backtest_start_date = None
-            config.backtest_end_date = None
-        if definition.has_prediction_start_date_field:
-            config.prediction_start_date = prediction_start_date
-        else:
-            config.prediction_start_date = None
-        config.predicted_date_offset_days = (
-            body.predicted_date_offset_days if definition.has_predicted_date_offset_field else None
-        )
-        config.mcmc_num_simulations = body.mcmc_num_simulations if definition.has_monte_carlo_fields else None
-        if definition.has_ohlc_bars_fields:
-            config.ohlc_bars_start_date = ohlc_bars_start_date
-            config.ohlc_bars_end_date = ohlc_bars_end_date
-            config.ohlc_bars_limit = body.ohlc_bars_limit
-        else:
-            config.ohlc_bars_start_date = None
-            config.ohlc_bars_end_date = None
-            config.ohlc_bars_limit = None
-        if definition.has_ohlc_update_fields:
-            config.ohlc_update_start_date = ohlc_update_start_date
-            config.ohlc_update_end_date = ohlc_update_end_date
-        else:
-            config.ohlc_update_start_date = None
-            config.ohlc_update_end_date = None
-        if definition.has_lstm_training_fields:
-            config.lstm_train_start_date = lstm_train_start_date
-            config.lstm_train_end_date = lstm_train_end_date
-            config.lstm_epochs = body.lstm_epochs
-            config.lstm_lookback_days = body.lstm_lookback_days
-            config.lstm_learning_rate = body.lstm_learning_rate
-            config.lstm_batch_size = body.lstm_batch_size
-        else:
-            config.lstm_train_start_date = None
-            config.lstm_train_end_date = None
-            config.lstm_epochs = None
-            config.lstm_lookback_days = None
-            config.lstm_learning_rate = None
-            config.lstm_batch_size = None
-        config.lstm_walkforward_num_folds = (
-            body.lstm_walkforward_num_folds if definition.has_lstm_walkforward_fields else None
-        )
-        config.lstm_model_version_id = (
-            body.lstm_model_version_id if definition.has_lstm_inference_fields else None
-        )
-        config.prediction_accuracy_pass_threshold_std = (
-            body.prediction_accuracy_pass_threshold_std if definition.has_prediction_accuracy_fields else None
-        )
+        for key, value in fields.items():
+            setattr(config, key, value)
         config.updated_at = dt.datetime.utcnow()
         session.commit()
 
@@ -3133,24 +3137,36 @@ def update_job_config(job_name: str, body: JobConfigIn) -> dict:
 
 
 @app.post("/jobs/{job_name}/run")
-def trigger_job(job_name: str) -> dict:
+def trigger_job(job_name: str, body: JobRunOverridesIn | None = None) -> dict:
     """Doesn't run anything itself - job execution lives in job_runner.py's separate
     process. Setting run_requested_at here is the request; job_runner.py's
     poll_run_requests (jobs/engine.py) picks it up, typically within a couple of
     seconds, clears it, and starts the run.
+
+    `body`, when given, is a one-time override for just this run (see
+    JobRunOverridesIn/JobConfig.run_overrides) - the dashboard sends whatever the
+    job's card currently shows, saved or not, so a manual run never silently falls
+    back to a stale saved JobConfig field. JSON-encoded (dates via str(), same as
+    _job_to_dict elsewhere) into JobConfig.run_overrides alongside run_requested_at;
+    jobs/engine.py's run_job applies it to this run only and clears it right after.
 
     The UPDATE ... WHERE run_requested_at IS NULL is atomic at the DB row level, so two
     near-simultaneous clicks (e.g. two dashboard tabs) can't both queue a request - only
     one succeeds (rowcount 1), the other sees rowcount 0 and gets the same 409 a
     genuinely-already-running job would give."""
     _require_job(job_name)
+    definition = JOB_DEFINITIONS[job_name]
+    overrides_json = None
+    if body is not None:
+        fields = _validate_and_normalize_job_fields(definition, body)
+        overrides_json = json.dumps(fields, default=str)
     with SessionLocal() as session:
         if job_is_active(session, job_name):
             raise HTTPException(status_code=409, detail=f"{job_name} is already running")
         result = session.execute(
             update(JobConfig)
             .where(JobConfig.job_name == job_name, JobConfig.run_requested_at.is_(None))
-            .values(run_requested_at=dt.datetime.utcnow())
+            .values(run_requested_at=dt.datetime.utcnow(), run_overrides=overrides_json)
         )
         session.commit()
         if result.rowcount == 0:

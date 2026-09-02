@@ -1047,6 +1047,15 @@ function addNumericFilter(qs: URLSearchParams, prefix: string, filter?: NumericF
   qs.set(`${prefix}_value`, String(filter.value))
 }
 
+// A one-time override for a single manual run (POST /jobs/{name}/run's optional
+// body - see app/main.py's JobRunOverridesIn/trigger_job) - everything JobConfigInput
+// carries except the schedule fields, which only make sense for a saved, recurring
+// config, not a single run.
+export type JobRunOverrides = Omit<
+  JobConfigInput,
+  'run_type' | 'schedule_interval_unit' | 'schedule_interval_value' | 'start_time'
+>
+
 export type TriggerJobResult = { status: 'started' } | { status: 'already-running' }
 
 // Mirrors app/main.py's run_adhoc_query response - "rows" for SELECT/anything else
@@ -1062,10 +1071,20 @@ export const api = {
   job: (name: string) => getJSON<Job>(`/jobs/${name}`),
   jobRuns: (name: string, limit = 10) => getJSON<JobRun[]>(`/jobs/${name}/runs?limit=${limit}`),
   updateJobConfig: (name: string, config: JobConfigInput) => putJSON<Job>(`/jobs/${name}/config`, config),
-  triggerJob: async (name: string): Promise<TriggerJobResult> => {
-    const res = await fetch(`${API_BASE}/jobs/${name}/run`, { method: 'POST' })
+  // `overrides`, when given, is applied to just this run - see JobRunOverrides. Sent
+  // whenever the caller has a job's current (possibly unsaved) field values on hand
+  // (see RunJobModal.tsx) so a manual run never silently falls back to whatever's
+  // still saved in this job's config.
+  triggerJob: async (name: string, overrides?: JobRunOverrides): Promise<TriggerJobResult> => {
+    const res = await fetch(`${API_BASE}/jobs/${name}/run`, {
+      method: 'POST',
+      ...(overrides ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(overrides) } : {}),
+    })
     if (res.status === 409) return { status: 'already-running' }
-    if (!res.ok) throw new Error(`trigger ${name} failed: ${res.status}`)
+    if (!res.ok) {
+      const detail = await res.json().catch(() => null)
+      throw new Error(detail?.detail ?? `trigger ${name} failed: ${res.status}`)
+    }
     return res.json()
   },
   pauseJob: (name: string) => postJSON<{ status: string }>(`/jobs/${name}/pause`),

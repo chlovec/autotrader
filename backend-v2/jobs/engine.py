@@ -14,11 +14,13 @@ dashboard operated by a human" reasoning extends across the process boundary.
 
 import asyncio
 import datetime as dt
+import json
 import logging
 import threading
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.orm import Session
 
 from data.client import DataClient
 from db.models import JobConfig, JobRun
@@ -49,6 +51,7 @@ from jobs.registry import (
     BARS_JOB,
     ETF_CONSTITUENTS_JOB,
     INDICATOR_NAMES,
+    JOB_CONFIG_DATE_FIELDS,
     JOB_DEFINITIONS,
     LSTM_INFERENCE_TRAINING_METHODS,
     MOVERS_JOB,
@@ -162,6 +165,30 @@ def reconcile_orphaned_runs() -> int:
         return len(orphaned)
 
 
+def apply_run_overrides(session: Session, job_name: str, config: JobConfig) -> None:
+    """One-time override for just this run - see db/models.py's JobConfig.
+    run_overrides and app/main.py's trigger_job, which JSON-encoded it (dates via
+    str()) alongside run_requested_at. No-op if there's nothing pending.
+
+    Clears run_overrides via a plain SQL UPDATE (not an ORM attribute set on `config`)
+    before applying it, so it can never be re-read by a later run even if something in
+    the caller's dispatch raises afterward; then applies the parsed values onto
+    `config`'s in-memory attributes and expunges it from `session` so those changes are
+    never flushed back to the row - callers can keep reading plain `config.<field>`
+    unmodified and pick up this run's override values without persisting them as this
+    job's new saved defaults."""
+    if config.run_overrides is None:
+        return
+    overrides = json.loads(config.run_overrides)
+    session.execute(update(JobConfig).where(JobConfig.job_name == job_name).values(run_overrides=None))
+    session.commit()
+    for key, value in overrides.items():
+        if key in JOB_CONFIG_DATE_FIELDS and value is not None:
+            value = dt.date.fromisoformat(value)
+        setattr(config, key, value)
+    session.expunge(config)
+
+
 async def run_job(job_name: str, trigger: str) -> None:
     """Assumes the caller already holds _job_locks[job_name]; releases it when done.
     `trigger` is "manual" or "auto" - see db/models.py's JobRun.
@@ -182,6 +209,7 @@ async def run_job(job_name: str, trigger: str) -> None:
     _job_controls[job_name] = control
     try:
         config = get_or_create_config(session, job_name)
+        apply_run_overrides(session, job_name, config)
         if job_name == SNAPSHOTS_JOB:
             # No shared DataClient here - sync_snapshots fans out across a thread pool
             # where each worker opens its own DataClient bound to its own event loop

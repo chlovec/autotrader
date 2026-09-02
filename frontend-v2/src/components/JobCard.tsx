@@ -4,6 +4,7 @@ import {
   START_TIME_OPTIONS,
   type Job,
   type JobRun,
+  type JobRunOverrides,
   type RunType,
   type ScheduleIntervalUnit,
   type TickerTypeOption,
@@ -49,6 +50,107 @@ function parseCsv(value: string | null): string[] {
 
 function toCsv(values: string[]): string | null {
   return values.join(',') || null
+}
+
+// Every has_*-gated field JobCard's form can hold, keyed the same as the local
+// useState variables below - shared shape for buildJobFieldsPayload's two callers
+// (handleSave's full config save and RunJobModal's one-time run override).
+type JobFieldsState = {
+  tickerTypes: string[]
+  tickers: string[]
+  multiplier: number
+  timespan: string
+  backfillDays: number
+  barsEndDateOffsetDays: number
+  snapshotTypes: string[]
+  averageVolumeStartDate: string
+  averageVolumeDaysInterval: number
+  backtestStartDate: string
+  backtestEndDate: string
+  predictionStartDate: string
+  predictedDateOffsetDays: number
+  mcmcNumSimulations: number
+  ohlcBarsStartDate: string
+  ohlcBarsEndDate: string
+  ohlcBarsLimit: number
+  ohlcUpdateStartDate: string
+  ohlcUpdateEndDate: string
+  lstmTrainStartDate: string
+  lstmTrainEndDate: string
+  lstmEpochs: number
+  lstmLookbackDays: number
+  lstmLearningRate: number
+  lstmBatchSize: number
+  lstmWalkforwardNumFolds: number
+  // Matches useState(job.lstm_model_version_id ?? '')'s inferred type below - '' is
+  // widened to plain string by useState's generic inference, not kept as the literal.
+  lstmModelVersionId: number | string
+  predictionAccuracyPassThresholdStd: number
+}
+
+// Gates each field by job.has_* the same way JobCard's render order decides which
+// fields to show - used both for a full config save (handleSave, spread alongside
+// run_type/schedule_*) and for a single manual run's override (RunJobModal, sent as
+// the whole request body - see api.ts's JobRunOverrides).
+function buildJobFieldsPayload(job: Job, fields: JobFieldsState): JobRunOverrides {
+  return {
+    ...(job.has_ticker_type_filter || job.has_ticker_selector ? { ticker_types: toCsv(fields.tickerTypes) } : {}),
+    ...(job.has_ticker_selector ? { tickers: toCsv(fields.tickers) } : {}),
+    ...(job.has_bars_fields
+      ? {
+          multiplier: fields.multiplier,
+          timespan: fields.timespan,
+          backfill_days: fields.backfillDays,
+          bars_end_date_offset_days: fields.barsEndDateOffsetDays,
+        }
+      : {}),
+    ...(job.has_snapshot_type_filter ? { snapshot_types: toCsv(fields.snapshotTypes) } : {}),
+    ...(job.has_average_volume_fields
+      ? {
+          average_volume_start_date: fields.averageVolumeStartDate || null,
+          average_volume_days_interval: fields.averageVolumeDaysInterval,
+        }
+      : {}),
+    ...(job.has_backtest_fields
+      ? {
+          backtest_start_date: fields.backtestStartDate || null,
+          backtest_end_date: fields.backtestEndDate || null,
+        }
+      : {}),
+    ...(job.has_prediction_start_date_field ? { prediction_start_date: fields.predictionStartDate || null } : {}),
+    ...(job.has_predicted_date_offset_field ? { predicted_date_offset_days: fields.predictedDateOffsetDays } : {}),
+    ...(job.has_monte_carlo_fields ? { mcmc_num_simulations: fields.mcmcNumSimulations } : {}),
+    ...(job.has_ohlc_bars_fields
+      ? {
+          ohlc_bars_start_date: fields.ohlcBarsStartDate || null,
+          ohlc_bars_end_date: fields.ohlcBarsEndDate || null,
+          ohlc_bars_limit: fields.ohlcBarsLimit,
+        }
+      : {}),
+    ...(job.has_ohlc_update_fields
+      ? {
+          ohlc_update_start_date: fields.ohlcUpdateStartDate || null,
+          ohlc_update_end_date: fields.ohlcUpdateEndDate || null,
+        }
+      : {}),
+    ...(job.has_lstm_training_fields
+      ? {
+          lstm_train_start_date: fields.lstmTrainStartDate || null,
+          lstm_train_end_date: fields.lstmTrainEndDate || null,
+          lstm_epochs: fields.lstmEpochs,
+          lstm_lookback_days: fields.lstmLookbackDays,
+          lstm_learning_rate: fields.lstmLearningRate,
+          lstm_batch_size: fields.lstmBatchSize,
+        }
+      : {}),
+    ...(job.has_lstm_walkforward_fields ? { lstm_walkforward_num_folds: fields.lstmWalkforwardNumFolds } : {}),
+    ...(job.has_lstm_inference_fields
+      ? { lstm_model_version_id: fields.lstmModelVersionId === '' ? null : Number(fields.lstmModelVersionId) }
+      : {}),
+    ...(job.has_prediction_accuracy_fields
+      ? { prediction_accuracy_pass_threshold_std: fields.predictionAccuracyPassThresholdStd }
+      : {}),
+  }
 }
 
 function formatTimestamp(value: string): string {
@@ -184,6 +286,40 @@ export function JobCard({
     setHistory(null)
   }, [job.last_run?.id])
 
+  // Recomputed fresh on every render from the fields above - always reflects whatever
+  // the form currently shows, saved or not. Shared by handleSave (spread alongside
+  // run_type/schedule_* below) and RunJobModal's one-time run override.
+  const jobFieldsPayload = buildJobFieldsPayload(job, {
+    tickerTypes,
+    tickers,
+    multiplier,
+    timespan,
+    backfillDays,
+    barsEndDateOffsetDays,
+    snapshotTypes,
+    averageVolumeStartDate,
+    averageVolumeDaysInterval,
+    backtestStartDate,
+    backtestEndDate,
+    predictionStartDate,
+    predictedDateOffsetDays,
+    mcmcNumSimulations,
+    ohlcBarsStartDate,
+    ohlcBarsEndDate,
+    ohlcBarsLimit,
+    ohlcUpdateStartDate,
+    ohlcUpdateEndDate,
+    lstmTrainStartDate,
+    lstmTrainEndDate,
+    lstmEpochs,
+    lstmLookbackDays,
+    lstmLearningRate,
+    lstmBatchSize,
+    lstmWalkforwardNumFolds,
+    lstmModelVersionId,
+    predictionAccuracyPassThresholdStd,
+  })
+
   const handleSave = async (event: FormEvent) => {
     event.preventDefault()
     setSaving(true)
@@ -194,62 +330,7 @@ export function JobCard({
         schedule_interval_unit: scheduleIntervalUnit,
         schedule_interval_value: scheduleIntervalValue,
         start_time: startTime,
-        ...(job.has_ticker_type_filter || job.has_ticker_selector ? { ticker_types: toCsv(tickerTypes) } : {}),
-        ...(job.has_ticker_selector ? { tickers: toCsv(tickers) } : {}),
-        ...(job.has_bars_fields
-          ? {
-              multiplier,
-              timespan,
-              backfill_days: backfillDays,
-              bars_end_date_offset_days: barsEndDateOffsetDays,
-            }
-          : {}),
-        ...(job.has_snapshot_type_filter ? { snapshot_types: toCsv(snapshotTypes) } : {}),
-        ...(job.has_average_volume_fields
-          ? {
-              average_volume_start_date: averageVolumeStartDate || null,
-              average_volume_days_interval: averageVolumeDaysInterval,
-            }
-          : {}),
-        ...(job.has_backtest_fields
-          ? {
-              backtest_start_date: backtestStartDate || null,
-              backtest_end_date: backtestEndDate || null,
-            }
-          : {}),
-        ...(job.has_prediction_start_date_field ? { prediction_start_date: predictionStartDate || null } : {}),
-        ...(job.has_predicted_date_offset_field ? { predicted_date_offset_days: predictedDateOffsetDays } : {}),
-        ...(job.has_monte_carlo_fields ? { mcmc_num_simulations: mcmcNumSimulations } : {}),
-        ...(job.has_ohlc_bars_fields
-          ? {
-              ohlc_bars_start_date: ohlcBarsStartDate || null,
-              ohlc_bars_end_date: ohlcBarsEndDate || null,
-              ohlc_bars_limit: ohlcBarsLimit,
-            }
-          : {}),
-        ...(job.has_ohlc_update_fields
-          ? {
-              ohlc_update_start_date: ohlcUpdateStartDate || null,
-              ohlc_update_end_date: ohlcUpdateEndDate || null,
-            }
-          : {}),
-        ...(job.has_lstm_training_fields
-          ? {
-              lstm_train_start_date: lstmTrainStartDate || null,
-              lstm_train_end_date: lstmTrainEndDate || null,
-              lstm_epochs: lstmEpochs,
-              lstm_lookback_days: lstmLookbackDays,
-              lstm_learning_rate: lstmLearningRate,
-              lstm_batch_size: lstmBatchSize,
-            }
-          : {}),
-        ...(job.has_lstm_walkforward_fields ? { lstm_walkforward_num_folds: lstmWalkforwardNumFolds } : {}),
-        ...(job.has_lstm_inference_fields
-          ? { lstm_model_version_id: lstmModelVersionId === '' ? null : Number(lstmModelVersionId) }
-          : {}),
-        ...(job.has_prediction_accuracy_fields
-          ? { prediction_accuracy_pass_threshold_std: predictionAccuracyPassThresholdStd }
-          : {}),
+        ...jobFieldsPayload,
       })
       onSaved(updated)
     } catch (err) {
@@ -1048,7 +1129,9 @@ export function JobCard({
         </>
       )}
 
-      {runModalOpen && <RunJobModal job={job} onClose={() => setRunModalOpen(false)} onRun={onRun} />}
+      {runModalOpen && (
+        <RunJobModal job={job} overrides={jobFieldsPayload} onClose={() => setRunModalOpen(false)} onRun={onRun} />
+      )}
       {cancelModalOpen && (
         <CancelJobModal job={job} onClose={() => setCancelModalOpen(false)} onCancelled={onRun} />
       )}

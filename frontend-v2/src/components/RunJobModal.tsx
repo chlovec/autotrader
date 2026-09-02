@@ -1,15 +1,19 @@
 import { useState } from 'react'
-import { api, type Job } from '../api'
+import { api, type Job, type JobRunOverrides } from '../api'
 
 type RunJobModalProps = {
   job: Job
+  // Whatever JobCard's fields currently show, saved or not - sent as a one-time
+  // override for just this run (see api.ts's JobRunOverrides) so a manual run never
+  // silently falls back to a stale saved JobConfig field.
+  overrides: JobRunOverrides
   onClose: () => void
   onRun: () => void
 }
 
 // Confirmation dialog popped up by JobCard's play button. Confirming calls
 // api.triggerJob, which fires the job in the backend outside of its normal schedule.
-export function RunJobModal({ job, onClose, onRun }: RunJobModalProps) {
+export function RunJobModal({ job, overrides, onClose, onRun }: RunJobModalProps) {
   const [running, setRunning] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -17,7 +21,7 @@ export function RunJobModal({ job, onClose, onRun }: RunJobModalProps) {
     setRunning(true)
     setError(null)
     try {
-      const result = await api.triggerJob(job.name)
+      const result = await api.triggerJob(job.name, overrides)
       if (result.status === 'already-running') {
         setError(`${job.label} is already running.`)
         setRunning(false)

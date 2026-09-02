@@ -1155,7 +1155,15 @@ class JobConfig(Base):
     now: POST /jobs/{name}/run sets it, job_runner.py's poll_run_requests clears it
     once it picks the request up and starts the run. The two processes coordinate
     purely through this DB row rather than a direct call/socket - see jobs/engine.py's
-    module docstring for why polling is enough here."""
+    module docstring for why polling is enough here.
+
+    run_overrides is a one-time, run-scoped companion to run_requested_at: a
+    JSON-encoded object of parameter overrides for just the next manual run, set
+    alongside run_requested_at by POST /jobs/{name}/run's optional request body (the
+    dashboard's Jobs page sends whatever a job's card currently shows, saved or not -
+    see JobCard.tsx). Unlike every field above, it is never a lasting setting - see
+    jobs/engine.py's run_job, which applies it to that one run only and clears it back
+    to NULL immediately after reading it, never persisting it into the fields above."""
 
     __tablename__ = "job_configs"
 
@@ -1202,6 +1210,7 @@ class JobConfig(Base):
     sort_order: Mapped[int | None] = mapped_column(Integer)
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False), default=dt.datetime.utcnow)
     run_requested_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=False))
+    run_overrides: Mapped[str | None] = mapped_column(String)
 
 
 class JobRun(Base):

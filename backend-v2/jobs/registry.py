@@ -80,6 +80,26 @@ INDICATOR_NAMES: dict[str, str] = {
 # has_ticker_type_filter/has_ticker_selector filter against elsewhere in this file.
 SNAPSHOT_TYPE_OPTIONS: list[str] = ["stocks", "options", "indices", "fx", "crypto"]
 
+# JobConfig column names that hold a date (as opposed to a plain string/int/float) -
+# app/main.py's trigger_job JSON-encodes a run's one-time field overrides (dates
+# included, via str()) into JobConfig.run_overrides, and jobs/engine.py's run_job
+# needs this list to know which decoded strings to parse back into dt.date before
+# applying them, since JSON itself carries no date type.
+JOB_CONFIG_DATE_FIELDS: frozenset[str] = frozenset(
+    {
+        "average_volume_start_date",
+        "backtest_start_date",
+        "backtest_end_date",
+        "prediction_start_date",
+        "ohlc_bars_start_date",
+        "ohlc_bars_end_date",
+        "ohlc_update_start_date",
+        "ohlc_update_end_date",
+        "lstm_train_start_date",
+        "lstm_train_end_date",
+    }
+)
+
 # Quarter-hour UTC time-of-day options for JobConfig.start_time - the dashboard's "Start
 # time" select for an auto job (app/main.py's _interval_trigger anchors the recurring
 # IntervalTrigger's phase to this) offers exactly these 96 slots, "00:00".."23:45".

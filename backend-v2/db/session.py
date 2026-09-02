@@ -73,6 +73,7 @@ def init_db() -> None:
     _add_lstm_inferences_exit_price_confidence_column()
     _add_job_configs_prediction_accuracy_pass_threshold_std_column()
     _add_job_configs_ohlc_update_columns()
+    _add_job_configs_run_overrides_column()
 
 
 def _add_column_if_missing(table: str, column: str, ddl_type: str) -> None:
@@ -344,6 +345,12 @@ def _add_job_configs_ohlc_update_columns() -> None:
     means the ohlc-data-update job hasn't been configured yet."""
     _add_job_configs_column("ohlc_update_start_date", "DATE")
     _add_job_configs_column("ohlc_update_end_date", "DATE")
+
+
+def _add_job_configs_run_overrides_column() -> None:
+    """See db/models.py's JobConfig.run_overrides - added after job_configs itself,
+    same "left NULL on existing rows" reasoning as _add_job_configs_ohlc_update_columns."""
+    _add_job_configs_column("run_overrides", "VARCHAR")
 
 
 def _add_lstm_inferences_exit_price_confidence_column() -> None:
