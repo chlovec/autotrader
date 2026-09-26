@@ -185,6 +185,7 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         "has_lstm_walkforward_fields": definition.has_lstm_walkforward_fields,
         "has_lstm_inference_fields": definition.has_lstm_inference_fields,
         "has_prediction_accuracy_fields": definition.has_prediction_accuracy_fields,
+        "has_win_rate_fields": definition.has_win_rate_fields,
         "snapshot_type_options": SNAPSHOT_TYPE_OPTIONS,
         "run_type": config.run_type,
         "schedule_interval_unit": config.schedule_interval_unit,
@@ -218,6 +219,7 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         "ohlc_update_end_date": (
             config.ohlc_update_end_date.isoformat() if config.ohlc_update_end_date else None
         ),
+        "ohlc_update_batch_size": config.ohlc_update_batch_size,
         "lstm_train_start_date": (
             config.lstm_train_start_date.isoformat() if config.lstm_train_start_date else None
         ),
@@ -229,6 +231,7 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         "lstm_walkforward_num_folds": config.lstm_walkforward_num_folds,
         "lstm_model_version_id": config.lstm_model_version_id,
         "prediction_accuracy_pass_threshold_std": config.prediction_accuracy_pass_threshold_std,
+        "win_rate_mcmc_range_confidence_level": config.win_rate_mcmc_range_confidence_level,
         "hidden": config.hidden,
         "sort_order": config.sort_order,
         "running": config.run_requested_at is not None or run is not None,
@@ -338,6 +341,7 @@ class _JobFieldsIn(BaseModel):
     ohlc_bars_limit: int | None = None
     ohlc_update_start_date: str | None = None
     ohlc_update_end_date: str | None = None
+    ohlc_update_batch_size: int | None = None
     lstm_train_start_date: str | None = None
     lstm_train_end_date: str | None = None
     lstm_epochs: int | None = None
@@ -347,6 +351,7 @@ class _JobFieldsIn(BaseModel):
     lstm_walkforward_num_folds: int | None = None
     lstm_model_version_id: int | None = None
     prediction_accuracy_pass_threshold_std: float | None = None
+    win_rate_mcmc_range_confidence_level: float | None = None
 
 
 class JobConfigIn(_JobFieldsIn):
@@ -2311,6 +2316,9 @@ SELECT
 	f.mcmc_win_count,
 	f.mcmc_win_rate,
 	f.mcmc_predictions_count,
+	f.mcmc_range_win_count,
+	f.mcmc_range_win_rate,
+	f.mcmc_range_confidence_level,
 	f.markov_win_count,
 	f.markov_win_rate,
 	f.markov_predictions_count
@@ -2390,6 +2398,9 @@ MARKET_PREDICTIONS_PERFORMANCE_ORDERABLE_FIELDS = frozenset(
         "mcmc_win_count",
         "mcmc_win_rate",
         "mcmc_predictions_count",
+        "mcmc_range_win_count",
+        "mcmc_range_win_rate",
+        "mcmc_range_confidence_level",
         "markov_win_count",
         "markov_win_rate",
         "markov_predictions_count",
@@ -2431,6 +2442,8 @@ def market_predictions_performance_report(
     markov_win_rate_value: float | None = None,
     mcmc_win_rate_op: str = "",
     mcmc_win_rate_value: float | None = None,
+    mcmc_range_win_rate_op: str = "",
+    mcmc_range_win_rate_value: float | None = None,
 ) -> dict[str, Any]:
     """Backs the Analytics > Market Prediction Performance page's report grid: runs
     MARKET_PREDICTIONS_PERFORMANCE_SQL (temp_queries/market_prediction_performance.sql,
@@ -2456,8 +2469,9 @@ def market_predictions_performance_report(
     just serialized differently to match what the raw SQL parses.
 
     `market_cap_op`/`market_cap_value`, `markov_exit_price_confidence_op`/`_value`,
-    `mcmc_exit_price_confidence_op`/`_value`, `markov_win_rate_op`/`_value`, and
-    `mcmc_win_rate_op`/`_value` are the same shape as trading_symbols_report's - each
+    `mcmc_exit_price_confidence_op`/`_value`, `markov_win_rate_op`/`_value`,
+    `mcmc_win_rate_op`/`_value`, and `mcmc_range_win_rate_op`/`_value` are the same
+    shape as trading_symbols_report's - each
     pair both or neither, op restricted to NUMERIC_FILTER_OPS. Unlike start_date/
     end_date/types/tickers, these aren't baked into MARKET_PREDICTIONS_PERFORMANCE_SQL
     itself (that query stays exactly what was authored and validated in the .sql file);
@@ -2507,12 +2521,14 @@ def market_predictions_performance_report(
     )
     _validate_numeric_filter_pair(markov_win_rate_op, markov_win_rate_value, "markov_win_rate")
     _validate_numeric_filter_pair(mcmc_win_rate_op, mcmc_win_rate_value, "mcmc_win_rate")
+    _validate_numeric_filter_pair(mcmc_range_win_rate_op, mcmc_range_win_rate_value, "mcmc_range_win_rate")
     numeric_filters = (
         (market_cap_op, "market_cap", "market_cap_value"),
         (markov_exit_price_confidence_op, "markov_exit_price_confidence", "markov_exit_price_confidence_value"),
         (mcmc_exit_price_confidence_op, "mcmc_exit_price_confidence", "mcmc_exit_price_confidence_value"),
         (markov_win_rate_op, "markov_win_rate", "markov_win_rate_value"),
         (mcmc_win_rate_op, "mcmc_win_rate", "mcmc_win_rate_value"),
+        (mcmc_range_win_rate_op, "mcmc_range_win_rate", "mcmc_range_win_rate_value"),
     )
     filter_conditions = [f"{column} {op} :{param}" for op, column, param in numeric_filters if op]
     filter_clause = f"WHERE {' AND '.join(filter_conditions)}" if filter_conditions else ""
@@ -2527,6 +2543,7 @@ def market_predictions_performance_report(
         "mcmc_exit_price_confidence_value": mcmc_exit_price_confidence_value,
         "markov_win_rate_value": markov_win_rate_value,
         "mcmc_win_rate_value": mcmc_win_rate_value,
+        "mcmc_range_win_rate_value": mcmc_range_win_rate_value,
     }
     with SessionLocal() as session:
         total = session.execute(
@@ -2627,6 +2644,16 @@ def market_direction_report(
     tickers: str = "",
     market_cap_op: str = "",
     market_cap_value: float | None = None,
+    pcnt_strong_down_op: str = "",
+    pcnt_strong_down_value: float | None = None,
+    pcnt_down_op: str = "",
+    pcnt_down_value: float | None = None,
+    pcnt_neutral_op: str = "",
+    pcnt_neutral_value: float | None = None,
+    pcnt_up_op: str = "",
+    pcnt_up_value: float | None = None,
+    pcnt_strong_up_op: str = "",
+    pcnt_strong_up_value: float | None = None,
     page: int = 1,
     page_size: int = MARKET_DIRECTION_DEFAULT_PAGE_SIZE,
     order_by: str = "",
@@ -2673,6 +2700,10 @@ def market_direction_report(
     identical in effect. A ticker with no ticker_details row (NULL market_cap) never
     matches any comparison, same as SQL NULL semantics everywhere else in this file.
 
+    `pcnt_strong_down_op`/`_value`, `pcnt_down_op`/`_value`, `pcnt_neutral_op`/`_value`,
+    `pcnt_up_op`/`_value` and `pcnt_strong_up_op`/`_value` (percentages, 0-100) are the
+    same shape and are ANDed with market_cap's, also on the outer query.
+
     Paginated/ordered around the query rather than baked into it, same as
     market_predictions_performance_report: `order_by` (see
     MARKET_DIRECTION_ORDERABLE_FIELDS) and LIMIT/OFFSET wrap it in an outer `SELECT *
@@ -2692,7 +2723,16 @@ def market_direction_report(
         raise HTTPException(422, "end_date must be an ISO date, e.g. '2026-08-12'") from exc
     if parsed_start > parsed_end:
         raise HTTPException(422, "start_date must not be after end_date")
-    _validate_numeric_filter_pair(market_cap_op, market_cap_value, "market_cap")
+    numeric_filters = [
+        (market_cap_op, "market_cap", market_cap_value),
+        (pcnt_strong_down_op, "pcnt_strong_down", pcnt_strong_down_value),
+        (pcnt_down_op, "pcnt_down", pcnt_down_value),
+        (pcnt_neutral_op, "pcnt_neutral", pcnt_neutral_value),
+        (pcnt_up_op, "pcnt_up", pcnt_up_value),
+        (pcnt_strong_up_op, "pcnt_strong_up", pcnt_strong_up_value),
+    ]
+    for op, column, value in numeric_filters:
+        _validate_numeric_filter_pair(op, value, column)
 
     types = split_csv(ticker_types)
     selected_tickers = split_csv(tickers)
@@ -2702,16 +2742,18 @@ def market_direction_report(
     if "ticker" not in {field for field, _ in order_fields}:
         order_fields = [*order_fields, ("ticker", "asc")]
     order_clause = ", ".join(f"{field} {direction.upper()}" for field, direction in order_fields)
-    # market_cap_op is validated above against NUMERIC_FILTER_OPS, a fixed allowlist of
-    # comparison symbols - safe to interpolate directly, same reasoning as order_clause.
-    market_cap_where = f" WHERE market_cap {market_cap_op} :market_cap_value" if market_cap_op else ""
+    # Each op is validated above against NUMERIC_FILTER_OPS, a fixed allowlist of
+    # comparison symbols, and column names are fixed literals - safe to interpolate
+    # directly, same reasoning as order_clause.
+    where_clauses = [f"{column} {op} :{column}_value" for op, column, _ in numeric_filters if op]
+    market_cap_where = f" WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
 
     params = {
         "start_date": parsed_start,
         "end_date": parsed_end,
         "types": json.dumps(types) if types else None,
         "tickers": json.dumps(selected_tickers) if selected_tickers else None,
-        "market_cap_value": market_cap_value,
+        **{f"{column}_value": value for _, column, value in numeric_filters},
     }
     with SessionLocal() as session:
         total = session.execute(
@@ -2925,7 +2967,7 @@ def _validate_and_normalize_job_fields(definition: JobDefinition, body: _JobFiel
     """Validates/parses every per-job field (shared by JobConfigIn's full-config save
     and JobRunOverridesIn's one-time run override - see their docstrings), then gates
     each one by whether `definition` actually uses it, same has_* flags JobCard.tsx's
-    render order uses to decide which fields to show. Always returns every key (26 of
+    render order uses to decide which fields to show. Always returns every key (27 of
     them - one per _JobFieldsIn field other than ticker_types/tickers), None for
     whichever ones don't apply to this job, so a caller can assign every returned key
     onto a JobConfig/dict unconditionally rather than re-deriving the gating itself."""
@@ -3023,6 +3065,8 @@ def _validate_and_normalize_job_fields(definition: JobDefinition, body: _JobFiel
         and ohlc_update_start_date > ohlc_update_end_date
     ):
         raise HTTPException(status_code=400, detail="ohlc_update_start_date must not be after ohlc_update_end_date")
+    if body.ohlc_update_batch_size is not None and body.ohlc_update_batch_size < 1:
+        raise HTTPException(status_code=400, detail="ohlc_update_batch_size must be at least 1")
     lstm_train_start_date: dt.date | None = None
     if body.lstm_train_start_date is not None:
         try:
@@ -3057,6 +3101,12 @@ def _validate_and_normalize_job_fields(definition: JobDefinition, body: _JobFiel
         raise HTTPException(status_code=400, detail="lstm_walkforward_num_folds must be at least 1")
     if body.prediction_accuracy_pass_threshold_std is not None and body.prediction_accuracy_pass_threshold_std <= 0:
         raise HTTPException(status_code=400, detail="prediction_accuracy_pass_threshold_std must be greater than 0")
+    if body.win_rate_mcmc_range_confidence_level is not None and not (
+        0 < body.win_rate_mcmc_range_confidence_level < 1
+    ):
+        raise HTTPException(
+            status_code=400, detail="win_rate_mcmc_range_confidence_level must be strictly between 0 and 1"
+        )
 
     # ticker_types applies to jobs with has_ticker_type_filter (a single type filter -
     # see sync_tickers's ticker_type param) or has_ticker_selector (a multi-select
@@ -3089,6 +3139,7 @@ def _validate_and_normalize_job_fields(definition: JobDefinition, body: _JobFiel
         "ohlc_bars_limit": body.ohlc_bars_limit if definition.has_ohlc_bars_fields else None,
         "ohlc_update_start_date": ohlc_update_start_date if definition.has_ohlc_update_fields else None,
         "ohlc_update_end_date": ohlc_update_end_date if definition.has_ohlc_update_fields else None,
+        "ohlc_update_batch_size": body.ohlc_update_batch_size if definition.has_ohlc_update_fields else None,
         "lstm_train_start_date": lstm_train_start_date if definition.has_lstm_training_fields else None,
         "lstm_train_end_date": lstm_train_end_date if definition.has_lstm_training_fields else None,
         "lstm_epochs": body.lstm_epochs if definition.has_lstm_training_fields else None,
@@ -3101,6 +3152,9 @@ def _validate_and_normalize_job_fields(definition: JobDefinition, body: _JobFiel
         "lstm_model_version_id": body.lstm_model_version_id if definition.has_lstm_inference_fields else None,
         "prediction_accuracy_pass_threshold_std": (
             body.prediction_accuracy_pass_threshold_std if definition.has_prediction_accuracy_fields else None
+        ),
+        "win_rate_mcmc_range_confidence_level": (
+            body.win_rate_mcmc_range_confidence_level if definition.has_win_rate_fields else None
         ),
     }
     return fields

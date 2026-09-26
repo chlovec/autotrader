@@ -1,7 +1,14 @@
 """Aggregates each ticker's Markov-chain and Monte Carlo market-state predictions
 (market_predictions/market_predictions_mcmc) against what actually happened
-(ohlc_bars.pcnt_increase on the predicted date), and upserts one row per ticker into
-the win_rates table - see db/models.py's WinRate.
+(ohlc_bars.pcnt_increase/close on the predicted date), and upserts one row per ticker
+into the win_rates table - see db/models.py's WinRate.
+
+Scores two independent notions of a Monte Carlo "win" over the same evaluable
+(ticker, predicted_date) pairs: direction agreement (same as the Markov chain's own
+win, see _is_win below) and, separately, whether the actual close fell within the
+simulated exit-price distribution's own confidence interval (mean +/- Z * std - see
+_mcmc_range_win below) - see db/models.py's WinRate.mcmc_range_win_rate for why
+they're kept independent rather than folded into one number.
 
 Purely local aggregation over already-computed predictions and already-synced bars -
 no massive.com call involved, same reasoning as jobs/average_volume.py.
@@ -9,6 +16,7 @@ no massive.com call involved, same reasoning as jobs/average_volume.py.
 
 import datetime as dt
 import logging
+import statistics
 
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -21,6 +29,12 @@ logger = logging.getLogger("backend_v2.jobs.win_rates")
 
 DEFAULT_MULTIPLIER = 1
 DEFAULT_TIMESPAN = "day"
+
+# Two-sided confidence level for the MCMC range win check below (see
+# db/models.py's WinRate.mcmc_range_win_rate) - overridable via JobConfig.
+# win_rate_mcmc_range_confidence_level, same "left None, resolved by the job module"
+# convention every other optional JobConfig field follows.
+DEFAULT_MCMC_RANGE_CONFIDENCE_LEVEL = 0.95
 
 # Commits every this-many tickers instead of once at the very end - same reasoning as
 # jobs/average_volume.py's COMMIT_BATCH_SIZE.
@@ -46,6 +60,7 @@ def compute_win_rates(
     tickers: list[str] | None = None,
     multiplier: int = DEFAULT_MULTIPLIER,
     timespan: str = DEFAULT_TIMESPAN,
+    mcmc_range_confidence_level: float = DEFAULT_MCMC_RANGE_CONFIDENCE_LEVEL,
     control: JobControl | None = None,
 ) -> int:
     """For each (ticker, predicted_date) in market_predictions whose actual outcome is
@@ -59,6 +74,18 @@ def compute_win_rates(
     (there's no expected_return to agree in sign with anything), same as the raw SQL
     this mirrors (see db/models.py's WinRate docstring).
 
+    Over that same evaluable set, also scores a second, independent Monte Carlo "win":
+    whether the actual close (ohlc_bars.close, not pcnt_increase) on predicted_date
+    fell within [exit_price_mean - Z*exit_price_std, exit_price_mean + Z*exit_price_std] -
+    the simulated exit-price distribution's own confidence interval at
+    mcmc_range_confidence_level (e.g. 0.95 for a 95% interval; must be strictly
+    between 0 and 1), Z being that level's two-sided normal quantile
+    (statistics.NormalDist().inv_cdf(0.5 + mcmc_range_confidence_level / 2)). A
+    market_predictions row with no matching Monte Carlo row can't be range-scored at
+    all (there's no distribution to check against) - same "counts toward
+    mcmc_predictions_count as a loss" treatment as the direction-based mcmc win above,
+    sharing that same count rather than a second one of its own.
+
     A prediction with no known actual outcome yet (predicted_date hasn't synced in
     ohlc_bars) contributes to neither the win count nor the predictions count - it's
     simply not yet evaluable, not a loss.
@@ -69,8 +96,12 @@ def compute_win_rates(
     Runs off the event loop (see app/main.py's _run_job) as a single grouped query, so
     control.checkpoint_sync is checked once up front rather than per ticker, same
     granularity as compute_average_volume."""
+    if not 0 < mcmc_range_confidence_level < 1:
+        raise ValueError("mcmc_range_confidence_level must be strictly between 0 and 1")
     if control is not None:
         control.checkpoint_sync()
+
+    range_z = statistics.NormalDist().inv_cdf(0.5 + mcmc_range_confidence_level / 2)
 
     actual_positive = OhlcBar.pcnt_increase >= 0
     actual_negative = OhlcBar.pcnt_increase <= 0
@@ -87,6 +118,13 @@ def compute_win_rates(
         )
 
     has_actual = case((OhlcBar.pcnt_increase.is_not(None), 1), else_=0)
+    # NULL-safe the same way _is_win is: if exit_price_mean/exit_price_std/OhlcBar.close
+    # is NULL (no MCMC match, or no actual outcome yet), .between() itself evaluates to
+    # NULL, which case() below treats as "not a win" via ordinary SQL three-valued logic.
+    is_range_win = OhlcBar.close.between(
+        MarketPredictionMonteCarlo.exit_price_mean - range_z * MarketPredictionMonteCarlo.exit_price_std,
+        MarketPredictionMonteCarlo.exit_price_mean + range_z * MarketPredictionMonteCarlo.exit_price_std,
+    )
     query = (
         select(
             MarketPrediction.ticker,
@@ -94,6 +132,7 @@ def compute_win_rates(
             func.sum(has_actual),
             func.sum(case((_is_win(MarketPredictionMonteCarlo.expected_return), 1), else_=0)),
             func.sum(has_actual),
+            func.sum(case((is_range_win, 1), else_=0)),
         )
         .select_from(MarketPrediction)
         .outerjoin(
@@ -119,7 +158,14 @@ def compute_win_rates(
 
     last_updated = dt.datetime.utcnow()
     stored = 0
-    for ticker, markov_win_count, markov_predictions_count, mcmc_win_count, mcmc_predictions_count in rows:
+    for (
+        ticker,
+        markov_win_count,
+        markov_predictions_count,
+        mcmc_win_count,
+        mcmc_predictions_count,
+        mcmc_range_win_count,
+    ) in rows:
         values = {
             "ticker": ticker,
             "last_updated": last_updated,
@@ -129,6 +175,11 @@ def compute_win_rates(
             "mcmc_win_count": mcmc_win_count,
             "mcmc_predictions_count": mcmc_predictions_count,
             "mcmc_win_rate": (mcmc_win_count / mcmc_predictions_count if mcmc_predictions_count else None),
+            "mcmc_range_win_count": mcmc_range_win_count,
+            "mcmc_range_win_rate": (
+                mcmc_range_win_count / mcmc_predictions_count if mcmc_predictions_count else None
+            ),
+            "mcmc_range_confidence_level": mcmc_range_confidence_level,
         }
         stmt = sqlite_insert(WinRate).values(**values)
         stmt = stmt.on_conflict_do_update(index_elements=[WinRate.ticker], set_=values)

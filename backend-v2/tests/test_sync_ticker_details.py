@@ -34,20 +34,35 @@ def _client_with_handler(handler) -> DataClient:
     return client
 
 
-def _ticker_details_payload(ticker: str, market_cap: float) -> dict:
+def _ticker_details_payload(ticker: str, market_cap: float, active: bool = True) -> dict:
     return {
         "status": "OK",
         "results": {
             "ticker": ticker,
+            "active": active,
+            "delisted_utc": None if active else "2023-06-14T00:00:00Z",
             "market_cap": market_cap,
             "share_class_shares_outstanding": 1_000_000.0,
             "weighted_shares_outstanding": 990_000.0,
             "sic_code": "7372",
             "sic_description": "SERVICES-PREPACKAGED SOFTWARE",
             "homepage_url": "https://example.com",
+            "phone_number": "1234567890",
+            "description": "A software company.",
+            "ticker_root": ticker,
             "total_employees": 500,
             "list_date": "2010-01-15",
             "round_lot": 100,
+            "address": {
+                "address1": "1 Example Way",
+                "city": "Springfield",
+                "state": "CA",
+                "postal_code": "94000",
+            },
+            "branding": {
+                "logo_url": "https://example.com/logo.png",
+                "icon_url": "https://example.com/icon.png",
+            },
         },
     }
 
@@ -74,15 +89,26 @@ def test_fetches_and_upserts_explicit_tickers():
         assert fetched == 2
         rows = {row.ticker: row for row in session.query(TickerDetail).all()}
         assert set(rows) == {"AAA", "BBB"}
+        assert rows["AAA"].active is True
+        assert rows["AAA"].delisted_utc is None
         assert rows["AAA"].market_cap == 1_000_000_000.0
         assert rows["AAA"].share_class_shares_outstanding == 1_000_000.0
         assert rows["AAA"].weighted_shares_outstanding == 990_000.0
         assert rows["AAA"].sic_code == "7372"
         assert rows["AAA"].sic_description == "SERVICES-PREPACKAGED SOFTWARE"
         assert rows["AAA"].homepage_url == "https://example.com"
+        assert rows["AAA"].phone_number == "1234567890"
+        assert rows["AAA"].description == "A software company."
+        assert rows["AAA"].ticker_root == "AAA"
         assert rows["AAA"].total_employees == 500
         assert rows["AAA"].list_date.isoformat() == "2010-01-15"
         assert rows["AAA"].round_lot == 100
+        assert rows["AAA"].address_line1 == "1 Example Way"
+        assert rows["AAA"].address_city == "Springfield"
+        assert rows["AAA"].address_state == "CA"
+        assert rows["AAA"].address_postal_code == "94000"
+        assert rows["AAA"].branding_logo_url == "https://example.com/logo.png"
+        assert rows["AAA"].branding_icon_url == "https://example.com/icon.png"
         assert rows["AAA"].fetched_at is not None
     finally:
         session.close()
@@ -91,6 +117,48 @@ def test_fetches_and_upserts_explicit_tickers():
         "/v3/reference/tickers/AAA",
         "/v3/reference/tickers/BBB",
     ]
+
+
+def test_stores_delisted_status_from_the_endpoint():
+    """The whole point of persisting active/delisted_utc: this per-ticker endpoint
+    reports a ticker's real status independent of Ticker.active, which comes from the
+    list endpoint and can go stale for a delisted ticker (see db/models.py's
+    TickerDetail docstring)."""
+    session = SessionLocal()
+    session.add(Ticker(ticker="DEAD"))
+    session.commit()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_ticker_details_payload("DEAD", market_cap=0.0, active=False))
+
+    try:
+        sync_ticker_details(session, tickers=["DEAD"], client_factory=lambda: _client_with_handler(handler))
+
+        row = session.get(TickerDetail, "DEAD")
+        assert row.active is False
+        assert row.delisted_utc == dt.datetime(2023, 6, 14)
+    finally:
+        session.close()
+
+
+def test_missing_address_and_branding_leaves_those_fields_null():
+    session = SessionLocal()
+    session.add(Ticker(ticker="AAA"))
+    session.commit()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": "OK", "results": {"ticker": "AAA"}})
+
+    try:
+        sync_ticker_details(session, tickers=["AAA"], client_factory=lambda: _client_with_handler(handler))
+
+        row = session.get(TickerDetail, "AAA")
+        assert row.active is None
+        assert row.delisted_utc is None
+        assert row.address_line1 is None
+        assert row.branding_logo_url is None
+    finally:
+        session.close()
 
 
 def test_ticker_types_resolve_from_tickers_table():

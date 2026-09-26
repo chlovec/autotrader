@@ -187,20 +187,49 @@ class TickerDetail(Base):
     Kept as its own table rather than added onto Ticker, same reasoning as
     CurrentSnapshot: a separate per-ticker fetch with its own cadence, upserted
     wholesale on every run (there's no history kept) rather than accumulated - see
-    jobs/sync_ticker_details.py."""
+    jobs/sync_ticker_details.py.
+
+    active/delisted_utc are this endpoint's own report of the ticker's status -
+    deliberately stored here rather than trusted from Ticker.active, since that
+    column comes from the *list* endpoint, which (unless explicitly queried per
+    active value) only ever returns active=true tickers: a ticker delisted after its
+    last active-filtered sync is never re-fetched by jobs/sync_tickers.py again, so
+    Ticker.active can go stale forever for exactly the tickers this matters most for.
+    This endpoint is queried per-ticker, not filtered by a list-level active param, so
+    it reports the real current status regardless. delisted_utc is null for a still-
+    active ticker.
+
+    phone_number/description/ticker_root/address_*/branding_* are every other field
+    this endpoint returns that Ticker doesn't already carry (name/market/locale/
+    primary_exchange/type/currency_name/cik/composite_figi/share_class_figi are
+    Ticker's own columns, sourced from the list endpoint - not duplicated here).
+    address_*/branding_* are flattened from the response's nested `address`/
+    `branding` objects rather than kept as JSON, consistent with every other column
+    here being a plain scalar."""
 
     __tablename__ = "ticker_details"
 
     ticker: Mapped[str] = mapped_column(ForeignKey("tickers.ticker"), primary_key=True)
+    active: Mapped[bool | None] = mapped_column()
+    delisted_utc: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=False))
     market_cap: Mapped[float | None] = mapped_column(Float)
     share_class_shares_outstanding: Mapped[float | None] = mapped_column(Float)
     weighted_shares_outstanding: Mapped[float | None] = mapped_column(Float)
     sic_code: Mapped[str | None] = mapped_column(String)
     sic_description: Mapped[str | None] = mapped_column(String)
     homepage_url: Mapped[str | None] = mapped_column(String)
+    phone_number: Mapped[str | None] = mapped_column(String)
+    description: Mapped[str | None] = mapped_column(String)
+    ticker_root: Mapped[str | None] = mapped_column(String)
     total_employees: Mapped[int | None] = mapped_column(Integer)
     list_date: Mapped[dt.date | None] = mapped_column(Date)
     round_lot: Mapped[int | None] = mapped_column(Integer)
+    address_line1: Mapped[str | None] = mapped_column(String)
+    address_city: Mapped[str | None] = mapped_column(String)
+    address_state: Mapped[str | None] = mapped_column(String)
+    address_postal_code: Mapped[str | None] = mapped_column(String)
+    branding_logo_url: Mapped[str | None] = mapped_column(String)
+    branding_icon_url: Mapped[str | None] = mapped_column(String)
     fetched_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
 
 
@@ -832,6 +861,24 @@ class WinRate(Base):
     matching market_predictions_mcmc row still counts toward mcmc_predictions_count (as
     a loss), mirroring jobs/win_rates.py's SQL exactly rather than excluding it.
 
+    mcmc_range_win_count/mcmc_range_win_rate are a second, independent notion of a
+    Monte Carlo "win", over the same evaluable (ticker, predicted_date) pairs as
+    mcmc_win_count above (so they share its denominator, mcmc_predictions_count,
+    rather than needing their own count column) - not direction agreement, but
+    whether the actual close on predicted_date fell within the simulated exit-price
+    distribution's own confidence interval: [exit_price_mean - Z*exit_price_std,
+    exit_price_mean + Z*exit_price_std], Z derived from mcmc_range_confidence_level
+    (see JobConfig.win_rate_mcmc_range_confidence_level) via
+    statistics.NormalDist().inv_cdf. A tighter, better-calibrated simulation is
+    rewarded here in a way the direction-only mcmc_win_rate can't capture - and
+    conversely, this can be a "win" while the direction-only one is a loss, or vice
+    versa (a wide-enough interval can contain the actual price even when its own
+    mean predicted the wrong direction). mcmc_range_confidence_level records
+    whichever level actually produced this row's counts, since it's a configurable,
+    run-to-run value rather than a fixed constant - NULL only for a row from before
+    this became configurable, never touched by a later run at a different level
+    without a full re-run.
+
     Upserted - a re-run overwrites the prior row for a ticker rather than accumulating
     history, same semantics as AverageVolume."""
 
@@ -842,6 +889,9 @@ class WinRate(Base):
     mcmc_win_count: Mapped[int] = mapped_column(Integer)
     mcmc_predictions_count: Mapped[int] = mapped_column(Integer)
     mcmc_win_rate: Mapped[float | None] = mapped_column(Float)
+    mcmc_range_win_count: Mapped[int | None] = mapped_column(Integer)
+    mcmc_range_win_rate: Mapped[float | None] = mapped_column(Float)
+    mcmc_range_confidence_level: Mapped[float | None] = mapped_column(Float)
     markov_win_count: Mapped[int] = mapped_column(Integer)
     markov_predictions_count: Mapped[int] = mapped_column(Integer)
     markov_win_rate: Mapped[float | None] = mapped_column(Float)
@@ -1002,6 +1052,25 @@ class ResearchPick(Base):
     computed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
 
 
+class BuySellPattern(Base):
+    """One row per (name, ticker, trade_date, buy_sell) - a manually-recorded buy/sell
+    observation for a ticker on a given date. `name` identifies whose pattern this is
+    (e.g. an insider, a strategy, or an operator label) - callers are responsible for
+    setting `created_at`/`updated_at` themselves (this codebase sets such timestamps
+    explicitly in application code - see JobConfig.updated_at - rather than relying on
+    an ORM-level default/onupdate)."""
+
+    __tablename__ = "buy_sell_patterns"
+
+    name: Mapped[str] = mapped_column(String, primary_key=True)
+    ticker: Mapped[str] = mapped_column(ForeignKey("tickers.ticker"), primary_key=True)
+    trade_date: Mapped[dt.date] = mapped_column(Date, primary_key=True)
+    buy_sell: Mapped[str] = mapped_column(String, primary_key=True)
+    price: Mapped[float] = mapped_column(Float)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
+
+
 class News(Base):
     """One row per article returned by GET /v2/reference/news, keyed by massive.com's
     own article `id` rather than by ticker - a single article often covers more than
@@ -1085,22 +1154,27 @@ class JobConfig(Base):
     reasoning as average_volume_start_date - jobs/backtest_market_state.py resolves a
     None end date to "yesterday" and a None start date to 90 days before that.
 
-    prediction_start_date only applies to the predict-10-day-market-state job
-    (registry.JobDefinition.has_prediction_start_date_field), same "left None, resolved
-    at run time" reasoning as average_volume_start_date -
-    jobs/predict_market_state_10_day.py resolves a None start date to tomorrow (UTC).
+    prediction_start_date/predicted_date_offset_days together resolve every predict-*
+    job's target prediction date (predict-market-state's merged Markov+Monte Carlo
+    phases, predict-10-day-market-state, and both LSTM inference jobs - every job
+    with registry.JobDefinition.has_prediction_start_date_field and/or
+    has_predicted_date_offset_field set) via jobs/engine.py's _resolve_prediction_date,
+    which every one of those job branches calls rather than resolving a date itself:
 
-    predicted_date_offset_days only applies to the predict-market-state job
-    (registry.JobDefinition.has_predicted_date_offset_field) - unlike
-    prediction_start_date above, it's an integer *offset* in days from today (UTC)
-    rather than a literal date (e.g. +1 for tomorrow, 0 for today, -1 for yesterday),
-    resolved to a concrete date once per run by jobs/engine.py's run_job. Left None,
-    same "resolved at run time" reasoning as average_volume_start_date, defaulting to
-    jobs/predict_market_state.py's DEFAULT_PREDICTED_DATE_OFFSET_DAYS (+1, tomorrow).
-    That resolved date feeds both phases of the predict-market-state job's run - the
-    Markov chain prediction (jobs/predict_market_state.py) and, immediately after it,
-    the Monte Carlo simulation over that same chain (jobs/predict_market_state_mcmc.py) -
-    so a single run's two stored predictions always target the same session.
+    - predicted_date_offset_days is what a scheduled/automatic run always uses,
+      regardless of what prediction_start_date holds - an integer *offset* in days
+      from today (UTC), e.g. +1 for tomorrow (the default when left None - see
+      jobs/predict_market_state.py's DEFAULT_PREDICTED_DATE_OFFSET_DAYS), 0 for today,
+      -1 for yesterday.
+    - prediction_start_date is a literal calendar date instead, used only for a
+      manual run (JobCard's play button) and only if one is actually set - normally
+      sent as a one-time run_overrides value (see run_overrides below) from JobCard's
+      date-picker field rather than saved, though saving it is harmless: a scheduled
+      run never reads this field at all, so a saved value can't leak into one.
+
+    Both are left None by default, same "resolved at run time" reasoning as
+    average_volume_start_date - a manual run with neither set falls back to the same
+    offset-based resolution a scheduled run would use.
 
     mcmc_num_simulations only applies to the predict-market-state job's Monte Carlo
     phase (registry.JobDefinition.has_monte_carlo_fields), same "left None, resolved at
@@ -1117,12 +1191,29 @@ class JobConfig(Base):
     (capped at 10000 regardless of what's stored here).
 
     ohlc_update_start_date/ohlc_update_end_date only apply to the ohlc-data-update job
-    (registry.JobDefinition.has_ohlc_update_fields). Unlike ohlc_bars_start_date/
-    ohlc_bars_end_date above, both are required at run time rather than resolved to a
-    default - jobs/engine.py's run_job raises if either is left None, since this job's
-    whole point is a deliberate overwrite of a caller-chosen range (see
-    jobs/sync_bars.py's sync_bars_manual) and silently falling back to some default
-    range would defeat that.
+    (registry.JobDefinition.has_ohlc_update_fields), same "left None, resolved at run
+    time" reasoning as average_volume_start_date - jobs/ohlc_update.py's
+    resolve_date_range resolves a None end date to today (UTC) and a None start date to
+    730 days (2 years) before the end date.
+
+    ohlc_update_batch_size only applies to the ohlc-data-update job - the maximum
+    number of tickers one auto run syncs. Same "left None, resolved at run time"
+    reasoning as above: jobs/ohlc_update.py resolves None to BATCH_SIZE (5000).
+
+    ohlc_update_cursor/ohlc_update_completed_at/ohlc_update_retry_round/
+    ohlc_update_retry_tickers/ohlc_update_failed_tickers/ohlc_update_next_run_at are the
+    ohlc-data-update job's own auto-run progress state (see jobs/ohlc_update.py), never
+    user-editable. An auto run syncs the next batch of tickers after ohlc_update_cursor
+    (the last ticker of the previous batch, alphabetically; None at the start of a pass)
+    and advances it. Tickers whose fetch fails are collected in ohlc_update_failed_tickers
+    (a JSON list). When a pass reaches the end of its selection, those failures - if any
+    - become the next retry round: ohlc_update_retry_round counts up to 3,
+    ohlc_update_retry_tickers (a JSON list) is what that round syncs, and
+    ohlc_update_next_run_at holds off runs for 2x/4x/8x the schedule interval before
+    rounds 1/2/3. When a pass ends with nothing failed (or the last retry round ends),
+    ohlc_update_completed_at is stamped and auto runs are skipped until the next day at
+    start_time (UTC), at which point all of this is cleared and a new cycle starts from
+    the top.
 
     lstm_train_start_date/lstm_train_end_date/lstm_epochs/lstm_lookback_days/
     lstm_learning_rate/lstm_batch_size only apply to the train-lstm-holdout and
@@ -1149,6 +1240,14 @@ class JobConfig(Base):
     None, resolved at run time" reasoning as average_volume_start_date -
     jobs/prediction_accuracy.py resolves a None value to
     DEFAULT_PASS_THRESHOLD_STD (1.0).
+
+    win_rate_mcmc_range_confidence_level only applies to the compute-win-rates job
+    (registry.JobDefinition.has_win_rate_fields), same "left None, resolved at run
+    time" reasoning as average_volume_start_date - jobs/win_rates.py resolves a None
+    value to DEFAULT_MCMC_RANGE_CONFIDENCE_LEVEL (0.95, i.e. 95%). A two-sided
+    confidence level (0-1 exclusive, e.g. 0.95 or 0.975), converted to a Z-score via
+    statistics.NormalDist().inv_cdf at run time - see WinRate.mcmc_range_win_rate
+    below for what it's used for.
 
     run_requested_at is how app/main.py (the API process) asks job_runner.py (the
     separate process that actually executes jobs - see jobs/engine.py) to run this job
@@ -1191,6 +1290,13 @@ class JobConfig(Base):
     ohlc_bars_limit: Mapped[int | None] = mapped_column(Integer)
     ohlc_update_start_date: Mapped[dt.date | None] = mapped_column(Date)
     ohlc_update_end_date: Mapped[dt.date | None] = mapped_column(Date)
+    ohlc_update_batch_size: Mapped[int | None] = mapped_column(Integer)
+    ohlc_update_cursor: Mapped[str | None] = mapped_column(String)
+    ohlc_update_completed_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=False))
+    ohlc_update_retry_round: Mapped[int | None] = mapped_column(Integer)
+    ohlc_update_retry_tickers: Mapped[str | None] = mapped_column(String)
+    ohlc_update_failed_tickers: Mapped[str | None] = mapped_column(String)
+    ohlc_update_next_run_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=False))
     lstm_train_start_date: Mapped[dt.date | None] = mapped_column(Date)
     lstm_train_end_date: Mapped[dt.date | None] = mapped_column(Date)
     lstm_epochs: Mapped[int | None] = mapped_column(Integer)
@@ -1200,6 +1306,7 @@ class JobConfig(Base):
     lstm_walkforward_num_folds: Mapped[int | None] = mapped_column(Integer)
     lstm_model_version_id: Mapped[int | None] = mapped_column(Integer)
     prediction_accuracy_pass_threshold_std: Mapped[float | None] = mapped_column(Float)
+    win_rate_mcmc_range_confidence_level: Mapped[float | None] = mapped_column(Float)
     # Hides the job's card from the Jobs page's default list (see app/main.py's
     # list_jobs) without affecting its schedule - a hidden job still runs normally.
     hidden: Mapped[bool] = mapped_column(default=False)

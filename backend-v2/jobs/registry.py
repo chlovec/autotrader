@@ -182,19 +182,24 @@ class JobDefinition:
     # the other flags, same layering as has_average_volume_fields: the backtest job
     # also sets has_ticker_selector to scope which tickers get backtested.
     has_backtest_fields: bool = False
-    # Whether this job offers a single "Start date" field (see
-    # jobs/predict_market_state_10_day.py) - only the 10-day-prediction job takes this.
-    # Unlike has_backtest_fields, just one date (the prediction's own start date, not a
-    # range) - independent of the other flags, same layering as has_average_volume_fields.
+    # Whether this job offers a single "Prediction date" field - a literal calendar
+    # date, unlike has_predicted_date_offset_field's offset-in-days - every predict-*
+    # job takes this, used only for a manual run (see that flag's docstring above).
+    # Unlike has_backtest_fields, just one date, not a range - independent of the
+    # other flags, same layering as has_average_volume_fields.
     has_prediction_start_date_field: bool = False
-    # Whether this job offers a "Predicted date" field expressed as an offset in days
-    # from today (e.g. +1 for tomorrow, 0 for today, -1 for yesterday) rather than a
-    # literal date - only the predict-market-state job takes this. jobs/engine.py's
-    # run_job resolves the offset to a concrete date once per run and feeds that same
-    # date to both phases of that job (see has_monte_carlo_fields below), so the
-    # Markov chain and Monte Carlo predictions it stores always target the same
-    # session. Never coexists with has_prediction_start_date_field above - each
-    # caller-chosen-date job takes exactly one of the two field shapes.
+    # Whether this job offers a "Predicted date offset" field expressed as an offset
+    # in days from today (e.g. +1 for tomorrow, 0 for today, -1 for yesterday) rather
+    # than a literal date - every predict-* job takes this (predict-market-state,
+    # predict-10-day-market-state, both LSTM inference jobs). jobs/engine.py's
+    # _resolve_prediction_date resolves it to a concrete date for a scheduled/
+    # automatic run (or a manual run with no date picked); the two phases of
+    # predict-market-state (see has_monte_carlo_fields below) always share that one
+    # resolved date. Always paired with has_prediction_start_date_field above on
+    # every job that sets it - that field is the literal-date alternative a manual
+    # run uses in preference to this offset when one is picked (see
+    # db/models.py's JobConfig.prediction_start_date/predicted_date_offset_days
+    # docstring).
     has_predicted_date_offset_field: bool = False
     # Whether this job offers a "Simulated paths" field (see
     # jobs/predict_market_state_mcmc.py) - only the predict-market-state job takes
@@ -215,10 +220,9 @@ class JobDefinition:
     # Whether this job offers the "Start date"/"End date" pair (see
     # jobs/sync_bars.py's sync_bars_manual) - only the ohlc-data-update job takes this.
     # Independent of the other flags, same layering as has_backtest_fields; also paired
-    # with has_ticker_selector on that job, to scope which tickers get overwritten.
-    # Unlike has_backtest_fields/has_ohlc_bars_fields' date pairs, both fields here are
-    # required at run time rather than resolved to a default - see db/models.py's
-    # JobConfig.ohlc_update_start_date docstring for why.
+    # with has_ticker_selector on that job, to scope which tickers get overwritten. Both
+    # fields are optional and resolved at run time - see jobs/ohlc_update.py's
+    # resolve_date_range.
     has_ohlc_update_fields: bool = False
     # Whether this job offers the "Start date"/"End date"/"Epochs"/"Lookback days"/
     # "Learning rate"/"Batch size" group (see jobs/lstm_common.py) - shared by both
@@ -247,6 +251,12 @@ class JobDefinition:
     # also paired with has_ticker_selector, so a run can be scoped to a handful of
     # tickers.
     has_prediction_accuracy_fields: bool = False
+    # Whether this job offers the single "MCMC range win confidence level" field (see
+    # jobs/win_rates.py's compute_win_rates) - only the compute-win-rates job takes
+    # this. Independent of the other flags, same layering as
+    # has_prediction_accuracy_fields; also paired with has_ticker_selector, so a run
+    # can be scoped to a handful of tickers.
+    has_win_rate_fields: bool = False
     # Seeded into JobConfig.run_type the first time this job's config row is created
     # (see app/main.py's _get_or_create_config). "auto" unless overridden below.
     default_run_type: str = "auto"
@@ -274,9 +284,12 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
         label="Predict market state",
         description=(
             "Fits a first-order Markov chain per selected ticker on its history of "
-            "discretized daily ohlc_bars returns for a chosen predicted date (default: "
-            "tomorrow, UTC, expressed as an offset in days from today - see the "
-            "Predicted date field), storing each ticker's predicted state "
+            "discretized daily ohlc_bars returns for a chosen predicted date - a "
+            "scheduled/automatic run always resolves it from the Predicted date offset "
+            "field (default: tomorrow, UTC, expressed as an offset in days from "
+            "today); running this job manually instead uses whatever literal date is "
+            "in the Prediction date field, if any, in preference to the offset - "
+            "storing each ticker's predicted state "
             "(strong_down/down/flat/up/strong_up), a confidence score, and a projected "
             "entry/exit price in the market_predictions table - then immediately runs "
             "a Monte Carlo simulation over that same fitted chain for the same "
@@ -296,6 +309,7 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
         has_bars_fields=False,
         has_ticker_selector=True,
         has_predicted_date_offset_field=True,
+        has_prediction_start_date_field=True,
         has_monte_carlo_fields=True,
         # Run-on-demand statistic over already-synced bars, no natural daily cadence of
         # its own - manual by default, same reasoning as average-volume.
@@ -441,8 +455,11 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
         label="Predict next 10 trading days",
         description=(
             "Walks the predict-market-state job's fitted per-ticker Markov chain "
-            "forward 10 trading days from a chosen start date (default: tomorrow, "
-            "UTC), storing each ticker's full 10-day projection - predicted state, "
+            "forward 10 trading days from a chosen start date - a scheduled/automatic "
+            "run always resolves it from the Predicted date offset field (default: "
+            "tomorrow, UTC); running this job manually instead uses whatever literal "
+            "date is in the Prediction date field, if any, in preference to the "
+            "offset - storing each ticker's full 10-day projection - predicted state, "
             "confidence, and projected entry/exit price per day - in the "
             "market_predictions_10_day table. Purely local - no massive.com call, "
             "reads bars already synced by the bars job, and only bars from before the "
@@ -450,6 +467,7 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
         ),
         has_bars_fields=False,
         has_ticker_selector=True,
+        has_predicted_date_offset_field=True,
         has_prediction_start_date_field=True,
         # Run-on-demand statistic over already-synced bars, no natural daily cadence of
         # its own - manual by default, same reasoning as predict-market-state.
@@ -463,11 +481,17 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
             "market-state predictions against what actually happened "
             "(ohlc_bars.pcnt_increase on the predicted date), storing per-ticker win "
             "counts, evaluated-prediction counts, and win rates for each model in the "
-            "win_rates table. Purely local - no massive.com call, reads predictions "
-            "and bars already computed/synced by other jobs."
+            "win_rates table. Also scores a second, stricter notion of a Monte Carlo "
+            "win: whether the actual close on the predicted date fell within the "
+            "simulated exit-price distribution's own confidence interval (mean +/- Z "
+            "* std, Z from the MCMC range win confidence level field, default 95%) - "
+            "a range-coverage check, independent of the direction-only win above. "
+            "Purely local - no massive.com call, reads predictions and bars already "
+            "computed/synced by other jobs."
         ),
         has_bars_fields=False,
         has_ticker_selector=True,
+        has_win_rate_fields=True,
         # Run-on-demand aggregation over already-computed predictions, no natural
         # daily cadence of its own - manual by default, same reasoning as
         # average-volume/predict-market-state.
@@ -579,22 +603,27 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
         label="OHLC data update",
         description=(
             "Syncs GET /v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{from}/{to} "
-            "into ohlc_bars for every selected ticker over the exact Start date/End "
-            "date range given, overwriting any bar already stored for a day in that "
-            "range and adding one where none existed - regardless of what's already "
-            "synced. Unlike sync-ohlc-bars/sync-bars-nightly, this job does no "
-            "incremental check against tickers.last_ohlc_sync_date or ohlc_bars' own "
-            "most recent bar - every run re-fetches the whole given range from "
-            "scratch. Meant for deliberate backfills/corrections over a known range "
-            "(e.g. re-pulling a range after a bad sync), not routine syncing."
+            "into ohlc_bars over the Start date/End date range, overwriting any bar "
+            "already stored for a day in that range and adding one where none existed - "
+            "regardless of what's already synced. A blank End date means today and a "
+            "blank Start date means 2 years before the End date. Unlike "
+            "sync-ohlc-bars/sync-bars-nightly, this job does no incremental check "
+            "against tickers.last_ohlc_sync_date or ohlc_bars' own most recent bar. "
+            "When set to auto, each run syncs the next batch of tickers (up to Max "
+            "tickers per run, default 5000) - the selected Tickers or Ticker types, or "
+            "every ticker in the tickers table if neither is set, in alphabetical order. "
+            "Once all of them have been updated, any tickers that failed are retried in "
+            "batches of the same size, waiting 2x, 4x, then 8x the schedule interval "
+            "before each of up to 3 retries. After that the job pauses until the next "
+            "day at its start time, then starts over. A manual run syncs every selected "
+            "ticker at once."
         ),
         has_bars_fields=False,
         has_ticker_selector=True,
         has_ohlc_update_fields=True,
-        # Deliberate, caller-scoped overwrite with no natural daily cadence of its own
-        # (running it automatically every day would defeat the point of it being a
-        # targeted correction) - manual by default, same reasoning as
-        # ticker-types/snapshots/movers.
+        # Overwrites a range rather than syncing incrementally, so it isn't something to
+        # switch on by default - manual until someone opts into the auto batch cycle
+        # (see jobs/ohlc_update.py), same reasoning as ticker-types/snapshots/movers.
         default_run_type="manual",
     ),
     TRAIN_LSTM_HOLDOUT_JOB: JobDefinition(
@@ -653,8 +682,11 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
             "Runs the most recently trained train-lstm-holdout model (or a specific "
             "holdout-trained lstm_model_versions row, via the optional Model version "
             "field) over the selected tickers' ohlc_bars history for a chosen predicted "
-            "date (default: tomorrow, UTC - see the Predicted date field), storing each "
-            "ticker's predicted state, full softmax state probabilities, and expected "
+            "date - a scheduled/automatic run always resolves it from the Predicted "
+            "date offset field (default: tomorrow, UTC); running this job manually "
+            "instead uses whatever literal date is in the Prediction date field, if "
+            "any, in preference to the offset - storing each ticker's predicted "
+            "state, full softmax state probabilities, and expected "
             "return in the lstm_inferences table. Always uses a 'holdout'-flavor model - "
             "see predict-market-state-lstm-walkforward for the walk-forward-trained "
             "counterpart, kept as a fully independent job (own schedule, own run "
@@ -667,6 +699,7 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
         has_bars_fields=False,
         has_ticker_selector=True,
         has_predicted_date_offset_field=True,
+        has_prediction_start_date_field=True,
         has_lstm_inference_fields=True,
         # Run-on-demand inference over an already-trained model, no natural daily
         # cadence of its own - manual by default, same reasoning as predict-market-state.
@@ -686,6 +719,7 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
         has_bars_fields=False,
         has_ticker_selector=True,
         has_predicted_date_offset_field=True,
+        has_prediction_start_date_field=True,
         has_lstm_inference_fields=True,
         default_run_type="manual",
     ),

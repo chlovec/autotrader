@@ -52,6 +52,9 @@ SELECT
 	f.mcmc_win_count,
 	f.mcmc_win_rate,
 	f.mcmc_predictions_count,
+	f.mcmc_range_win_count,
+	f.mcmc_range_win_rate,
+	f.mcmc_range_confidence_level,
 	f.markov_win_count,
 	f.markov_win_rate,
 	f.markov_predictions_count

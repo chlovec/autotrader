@@ -32,6 +32,8 @@ type SavedParams = {
   markovWinRateValue: string
   mcmcWinRateOp: NumericFilterOp | ''
   mcmcWinRateValue: string
+  mcmcRangeWinRateOp: NumericFilterOp | ''
+  mcmcRangeWinRateValue: string
 }
 
 // Same reasoning as TradingSymbolsPage's TICKER_TYPE_OPTIONS_LIMIT.
@@ -80,6 +82,9 @@ const ORDER_BY_FIELDS: { key: string; label: string }[] = [
   { key: 'mcmc_win_count', label: 'MCMC Win Count' },
   { key: 'mcmc_win_rate', label: 'MCMC Win Rate' },
   { key: 'mcmc_predictions_count', label: 'MCMC Predictions Count' },
+  { key: 'mcmc_range_win_count', label: 'MCMC Range Win Count' },
+  { key: 'mcmc_range_win_rate', label: 'MCMC Range Win Rate' },
+  { key: 'mcmc_range_confidence_level', label: 'MCMC Range Confidence Level' },
   { key: 'markov_win_count', label: 'Markov Win Count' },
   { key: 'markov_win_rate', label: 'Markov Win Rate' },
   { key: 'markov_predictions_count', label: 'Markov Predictions Count' },
@@ -127,6 +132,9 @@ const COLUMNS: ReportColumn<MarketPredictionPerformanceRow>[] = [
   { key: 'mcmc_win_count', label: 'MCMC Win Count' },
   { key: 'mcmc_win_rate', label: 'MCMC Win Rate' },
   { key: 'mcmc_predictions_count', label: 'MCMC Predictions Count' },
+  { key: 'mcmc_range_win_count', label: 'MCMC Range Win Count' },
+  { key: 'mcmc_range_win_rate', label: 'MCMC Range Win Rate' },
+  { key: 'mcmc_range_confidence_level', label: 'MCMC Range Confidence Level' },
   { key: 'markov_win_count', label: 'Markov Win Count' },
   { key: 'markov_win_rate', label: 'Markov Win Rate' },
   { key: 'markov_predictions_count', label: 'Markov Predictions Count' },
@@ -135,6 +143,8 @@ const COLUMNS: ReportColumn<MarketPredictionPerformanceRow>[] = [
 const PERCENT_FIELDS = new Set<keyof MarketPredictionPerformanceRow>([
   'markov_win_rate',
   'mcmc_win_rate',
+  'mcmc_range_win_rate',
+  'mcmc_range_confidence_level',
   'actual_gain',
 ])
 
@@ -188,6 +198,12 @@ export function MarketPredictionsPerformancePage() {
     () => loadSavedParams()?.mcmcWinRateOp ?? '',
   )
   const [mcmcWinRateValue, setMcmcWinRateValue] = useState(() => loadSavedParams()?.mcmcWinRateValue ?? '')
+  const [mcmcRangeWinRateOp, setMcmcRangeWinRateOp] = useState<NumericFilterOp | ''>(
+    () => loadSavedParams()?.mcmcRangeWinRateOp ?? '',
+  )
+  const [mcmcRangeWinRateValue, setMcmcRangeWinRateValue] = useState(
+    () => loadSavedParams()?.mcmcRangeWinRateValue ?? '',
+  )
   // Not persisted - purely a display preference for the current visit, same reasoning
   // as JobCard's per-card collapsed state.
   const [filtersCollapsed, setFiltersCollapsed] = useState(false)
@@ -228,6 +244,10 @@ export function MarketPredictionsPerformancePage() {
     mcmcWinRateOp && mcmcWinRateValue.trim() !== '' && Number.isFinite(Number(mcmcWinRateValue))
       ? { op: mcmcWinRateOp, value: Number(mcmcWinRateValue) }
       : undefined
+  const mcmcRangeWinRateFilter =
+    mcmcRangeWinRateOp && mcmcRangeWinRateValue.trim() !== '' && Number.isFinite(Number(mcmcRangeWinRateValue))
+      ? { op: mcmcRangeWinRateOp, value: Number(mcmcRangeWinRateValue) }
+      : undefined
 
   const fetchPage = async (targetPage: number, requestedPageSize: number) => {
     setLoading(true)
@@ -246,6 +266,7 @@ export function MarketPredictionsPerformancePage() {
         mcmcExitPriceConfidenceFilter,
         markovWinRateFilter,
         mcmcWinRateFilter,
+        mcmcRangeWinRateFilter,
       )
       setRows(result.rows)
       setTotal(result.total)
@@ -281,6 +302,8 @@ export function MarketPredictionsPerformancePage() {
     markovWinRateValue,
     mcmcWinRateOp,
     mcmcWinRateValue,
+    mcmcRangeWinRateOp,
+    mcmcRangeWinRateValue,
   })
 
   const [paramsJustSaved, setParamsJustSaved] = useState(false)
@@ -336,6 +359,8 @@ export function MarketPredictionsPerformancePage() {
     setMarkovWinRateValue(params.markovWinRateValue)
     setMcmcWinRateOp(params.mcmcWinRateOp)
     setMcmcWinRateValue(params.mcmcWinRateValue)
+    setMcmcRangeWinRateOp(params.mcmcRangeWinRateOp)
+    setMcmcRangeWinRateValue(params.mcmcRangeWinRateValue)
   }
 
   // Populates the controls (and the grid's view) from a saved profile - never runs the
@@ -551,6 +576,28 @@ export function MarketPredictionsPerformancePage() {
                   placeholder="Value"
                   value={mcmcWinRateValue}
                   onChange={(event) => setMcmcWinRateValue(event.target.value)}
+                />
+              </div>
+            </div>
+            <div className="job-field report-numeric-filter-field">
+              <span className="job-field-label">MCMC range win rate</span>
+              <div className="report-numeric-filter-inputs">
+                <select
+                  value={mcmcRangeWinRateOp}
+                  onChange={(event) => setMcmcRangeWinRateOp(event.target.value as NumericFilterOp | '')}
+                >
+                  <option value="">Any</option>
+                  {NUMERIC_FILTER_OPS.map((op) => (
+                    <option key={op} value={op}>
+                      {op}
+                    </option>
+                  ))}
+                </select>
+                <input
+                  type="number"
+                  placeholder="Value"
+                  value={mcmcRangeWinRateValue}
+                  onChange={(event) => setMcmcRangeWinRateValue(event.target.value)}
                 />
               </div>
             </div>

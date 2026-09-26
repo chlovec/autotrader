@@ -3,6 +3,8 @@ import {
   api,
   MARKET_DIRECTION_MAX_PAGE_SIZE,
   type MarketDirectionOrderField,
+  type MarketDirectionPcntField,
+  type MarketDirectionPcntFilters,
   type MarketDirectionRow,
   type TickerTypeOption,
 } from '../api'
@@ -23,6 +25,26 @@ type SavedParams = {
   orderBy: MarketDirectionOrderField[]
   marketCapOp: NumericFilterOp | ''
   marketCapValue: string
+  pcntFilters: PcntFilterInputs
+}
+
+type PcntFilterInput = { op: NumericFilterOp | ''; value: string }
+type PcntFilterInputs = Record<MarketDirectionPcntField, PcntFilterInput>
+
+const PCNT_FILTER_FIELDS: { key: MarketDirectionPcntField; label: string }[] = [
+  { key: 'pcnt_strong_down', label: '% Strong Down' },
+  { key: 'pcnt_down', label: '% Down' },
+  { key: 'pcnt_neutral', label: '% Neutral' },
+  { key: 'pcnt_up', label: '% Up' },
+  { key: 'pcnt_strong_up', label: '% Strong Up' },
+]
+
+const EMPTY_PCNT_FILTERS: PcntFilterInputs = {
+  pcnt_strong_down: { op: '', value: '' },
+  pcnt_down: { op: '', value: '' },
+  pcnt_neutral: { op: '', value: '' },
+  pcnt_up: { op: '', value: '' },
+  pcnt_strong_up: { op: '', value: '' },
 }
 
 // Same reasoning as TradingSymbolsPage's TICKER_TYPE_OPTIONS_LIMIT.
@@ -104,6 +126,12 @@ export function MarketDirectionPage() {
   // shape/reasoning as MarketPredictionsPerformancePage's marketCapOp/marketCapValue.
   const [marketCapOp, setMarketCapOp] = useState<NumericFilterOp | ''>(() => loadSavedParams()?.marketCapOp ?? '')
   const [marketCapValue, setMarketCapValue] = useState(() => loadSavedParams()?.marketCapValue ?? '')
+  const [pcntFilterInputs, setPcntFilterInputs] = useState<PcntFilterInputs>(() => ({
+    ...EMPTY_PCNT_FILTERS,
+    ...loadSavedParams()?.pcntFilters,
+  }))
+  const setPcntFilterInput = (field: MarketDirectionPcntField, patch: Partial<PcntFilterInput>) =>
+    setPcntFilterInputs((current) => ({ ...current, [field]: { ...current[field], ...patch } }))
   const [pageSizeInput, setPageSizeInput] = useState(() => loadSavedParams()?.pageSize ?? DEFAULT_PAGE_SIZE)
   const [page, setPage] = useState(1)
   const [pageInput, setPageInput] = useState(1)
@@ -128,6 +156,13 @@ export function MarketDirectionPage() {
       ? { op: marketCapOp, value: Number(marketCapValue) }
       : undefined
 
+  // Same "only sent once op and a parseable value are both present" rule as marketCapFilter.
+  const pcntFilters: MarketDirectionPcntFilters = {}
+  for (const { key } of PCNT_FILTER_FIELDS) {
+    const { op, value } = pcntFilterInputs[key]
+    if (op && value.trim() !== '' && Number.isFinite(Number(value))) pcntFilters[key] = { op, value: Number(value) }
+  }
+
   const fetchPage = async (targetPage: number, requestedPageSize: number) => {
     setLoading(true)
     setError(null)
@@ -141,6 +176,7 @@ export function MarketDirectionPage() {
         requestedPageSize,
         orderBy,
         marketCapFilter,
+        pcntFilters,
       )
       setRows(result.rows)
       setTotal(result.total)
@@ -168,6 +204,7 @@ export function MarketDirectionPage() {
       orderBy,
       marketCapOp,
       marketCapValue,
+      pcntFilters: pcntFilterInputs,
     })
     setParamsJustSaved(true)
     window.setTimeout(() => setParamsJustSaved(false), 1500)
@@ -260,6 +297,32 @@ export function MarketDirectionPage() {
               />
             </div>
           </div>
+          {PCNT_FILTER_FIELDS.map(({ key, label }) => (
+            <div key={key} className="job-field report-numeric-filter-field">
+              <span className="job-field-label">{label}</span>
+              <div className="report-numeric-filter-inputs">
+                <select
+                  value={pcntFilterInputs[key].op}
+                  onChange={(event) => setPcntFilterInput(key, { op: event.target.value as NumericFilterOp | '' })}
+                >
+                  <option value="">Any</option>
+                  {NUMERIC_FILTER_OPS.map((op) => (
+                    <option key={op} value={op}>
+                      {op}
+                    </option>
+                  ))}
+                </select>
+                <input
+                  type="number"
+                  min={0}
+                  max={100}
+                  placeholder="0-100"
+                  value={pcntFilterInputs[key].value}
+                  onChange={(event) => setPcntFilterInput(key, { value: event.target.value })}
+                />
+              </div>
+            </div>
+          ))}
           <div className="job-field report-page-size-field">
             <span className="job-field-label">Page size</span>
             <input

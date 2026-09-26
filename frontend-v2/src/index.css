@@ -2064,6 +2064,13 @@ body {
 
 /* SQL Console */
 
+/* .report-profiles-bar (saved queries) normally sits inside a .report-controls
+   column, which supplies the gap below it - the SQL console has no such wrapper, so
+   it needs its own bottom margin here to keep it clear of the textarea below. */
+.sql-console-page .report-profiles-bar {
+  margin-bottom: 16px;
+}
+
 .sql-console-input {
   width: 100%;
   padding: 12px;

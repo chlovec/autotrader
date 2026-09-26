@@ -51,7 +51,8 @@ export interface Job {
   has_ohlc_bars_fields: boolean
   // Whether this job offers the Start date/End date pair (see ohlc_update_start_date/
   // ohlc_update_end_date below) - only the ohlc-data-update job sets this. Unlike
-  // has_ohlc_bars_fields' pair, both fields here are required, not defaulted.
+  // has_ohlc_bars_fields' pair, a blank end date defaults to today and a blank start
+  // date to 2 years before the end date.
   has_ohlc_update_fields: boolean
   // Whether this job offers the Start date/End date/Epochs/Lookback days/Learning
   // rate/Batch size group (see lstm_train_start_date etc. below) - the
@@ -68,6 +69,9 @@ export interface Job {
   // prediction_accuracy_pass_threshold_std below) - only compute-prediction-accuracy
   // sets this.
   has_prediction_accuracy_fields: boolean
+  // Whether this job offers the single "MCMC range win confidence level" field (see
+  // win_rate_mcmc_range_confidence_level below) - only compute-win-rates sets this.
+  has_win_rate_fields: boolean
   // Always the full massive.com asset-class list (jobs/registry.py's
   // SNAPSHOT_TYPE_OPTIONS), regardless of has_snapshot_type_filter - fetched from the
   // backend rather than hardcoded here so the two never drift.
@@ -124,14 +128,17 @@ export interface Job {
   // Max tickers selected per run, or null to default to 8000 at run time - capped at
   // 10000 regardless of what's stored. Only meaningful alongside has_ohlc_bars_fields.
   ohlc_bars_limit: number | null
-  // ISO dates ("YYYY-MM-DD") - unlike every other date field on this type, these are
-  // never defaulted at run time: a run with either left null fails outright (see
-  // backend-v2 db/models.py's JobConfig.ohlc_update_start_date docstring for why).
-  // Only meaningful alongside has_ohlc_update_fields (the ohlc-data-update job), which
-  // always overwrites this exact range for the selected tickers regardless of what's
-  // already synced - see backend-v2 jobs/sync_bars.py's sync_bars_manual.
+  // ISO dates ("YYYY-MM-DD"), or null to default at run time (end date: today; start
+  // date: 2 years before the end date - see backend-v2 jobs/ohlc_update.py's
+  // resolve_date_range). Only meaningful alongside has_ohlc_update_fields (the
+  // ohlc-data-update job), which always overwrites this range for the selected tickers
+  // regardless of what's already synced - see backend-v2 jobs/sync_bars.py's
+  // sync_bars_manual.
   ohlc_update_start_date: string | null
   ohlc_update_end_date: string | null
+  // Max tickers one auto run syncs, or null to default to 5000 at run time. Only
+  // meaningful alongside has_ohlc_update_fields.
+  ohlc_update_batch_size: number | null
   // ISO dates ("YYYY-MM-DD"), or null to default to a trailing 730-day window ending
   // yesterday (UTC) at run time - see backend-v2 jobs/lstm_common.py. Only meaningful
   // alongside has_lstm_training_fields (the two LSTM training jobs).
@@ -158,6 +165,14 @@ export interface Job {
   // jobs/prediction_accuracy.py's compute_prediction_accuracy. Only meaningful
   // alongside has_prediction_accuracy_fields (compute-prediction-accuracy).
   prediction_accuracy_pass_threshold_std: number | null
+  // Two-sided confidence level (0-1 exclusive, e.g. 0.95 for 95%) for the win_rates
+  // job's MCMC range win check - whether the actual close fell within the simulated
+  // exit-price distribution's own confidence interval, independent of the
+  // direction-only mcmc win rate - or null to default to 0.95 at run time. See
+  // backend-v2 jobs/win_rates.py's compute_win_rates and db/models.py's
+  // WinRate.mcmc_range_win_rate. Only meaningful alongside has_win_rate_fields
+  // (compute-win-rates).
+  win_rate_mcmc_range_confidence_level: number | null
   // Persisted (JobConfig.hidden), not display-only - keeps a job off the Jobs page's
   // default list across reloads until explicitly unhidden. Independent of running/
   // paused: a hidden job still runs on its schedule, it's just tucked away here.
@@ -200,6 +215,7 @@ export interface JobConfigInput {
   ohlc_bars_limit?: number | null
   ohlc_update_start_date?: string | null
   ohlc_update_end_date?: string | null
+  ohlc_update_batch_size?: number | null
   lstm_train_start_date?: string | null
   lstm_train_end_date?: string | null
   lstm_epochs?: number | null
@@ -209,6 +225,7 @@ export interface JobConfigInput {
   lstm_walkforward_num_folds?: number | null
   lstm_model_version_id?: number | null
   prediction_accuracy_pass_threshold_std?: number | null
+  win_rate_mcmc_range_confidence_level?: number | null
 }
 
 export interface TickerOption {
@@ -688,6 +705,13 @@ export interface MarketPredictionPerformanceRow {
   mcmc_win_count: number | null
   mcmc_win_rate: number | null
   mcmc_predictions_count: number | null
+  // A second, independent Monte Carlo "win": whether the actual close fell within
+  // the simulated exit-price distribution's own confidence interval
+  // (mcmc_range_confidence_level, e.g. 0.95 for 95%), rather than mcmc_win_rate's
+  // direction-only check - see backend-v2 db/models.py's WinRate.mcmc_range_win_rate.
+  mcmc_range_win_count: number | null
+  mcmc_range_win_rate: number | null
+  mcmc_range_confidence_level: number | null
   markov_win_count: number | null
   markov_win_rate: number | null
   markov_predictions_count: number | null
@@ -784,6 +808,16 @@ export interface MarketDirectionRow {
 
 // Backend caps page_size at 1000 (see app/main.py's MARKET_DIRECTION_MAX_PAGE_SIZE).
 export const MARKET_DIRECTION_MAX_PAGE_SIZE = 1000
+
+// Optional numeric filters on the five pcnt_* columns (percentages, 0-100), keyed by
+// column name - each is sent as <field>_op/<field>_value, ANDed with market_cap's.
+export type MarketDirectionPcntField =
+  | 'pcnt_strong_down'
+  | 'pcnt_down'
+  | 'pcnt_neutral'
+  | 'pcnt_up'
+  | 'pcnt_strong_up'
+export type MarketDirectionPcntFilters = Partial<Record<MarketDirectionPcntField, NumericFilter | undefined>>
 
 export interface MarketDirectionReport {
   rows: MarketDirectionRow[]
@@ -1225,9 +1259,10 @@ export const api = {
   // startDate/endDate are ISO dates ("YYYY-MM-DD"); each independently defaults to
   // today (UTC) server-side when omitted - see app/main.py's
   // market_predictions_performance_report. market_cap/markovExitPriceConfidence/
-  // mcmcExitPriceConfidence/markovWinRate/mcmcWinRate are the only numeric/state
-  // filters this report exposes beyond what temp_queries/market_prediction_performance.sql
-  // itself filters on - same op/value shape as tradingSymbolsReport's marketCapFilter.
+  // mcmcExitPriceConfidence/markovWinRate/mcmcWinRate/mcmcRangeWinRate are the only
+  // numeric/state filters this report exposes beyond what
+  // temp_queries/market_prediction_performance.sql itself filters on - same op/value
+  // shape as tradingSymbolsReport's marketCapFilter.
   marketPredictionsPerformanceReport: (
     startDate?: string,
     endDate?: string,
@@ -1241,6 +1276,7 @@ export const api = {
     mcmcExitPriceConfidenceFilter?: NumericFilter,
     markovWinRateFilter?: NumericFilter,
     mcmcWinRateFilter?: NumericFilter,
+    mcmcRangeWinRateFilter?: NumericFilter,
   ) => {
     const orderByParam = orderBy.map(({ field, dir }) => `${field}:${dir}`).join(',')
     const qs = new URLSearchParams()
@@ -1256,6 +1292,7 @@ export const api = {
     addNumericFilter(qs, 'mcmc_exit_price_confidence', mcmcExitPriceConfidenceFilter)
     addNumericFilter(qs, 'markov_win_rate', markovWinRateFilter)
     addNumericFilter(qs, 'mcmc_win_rate', mcmcWinRateFilter)
+    addNumericFilter(qs, 'mcmc_range_win_rate', mcmcRangeWinRateFilter)
     return getJSON<MarketPredictionsPerformanceReport>(`/reports/market-predictions-performance?${qs.toString()}`)
   },
   // startDate/endDate are ISO dates ("YYYY-MM-DD"); each independently defaults to
@@ -1269,6 +1306,7 @@ export const api = {
     pageSize = MARKET_DIRECTION_MAX_PAGE_SIZE,
     orderBy: MarketDirectionOrderField[] = [],
     marketCapFilter?: NumericFilter,
+    pcntFilters: MarketDirectionPcntFilters = {},
   ) => {
     const orderByParam = orderBy.map(({ field, dir }) => `${field}:${dir}`).join(',')
     const qs = new URLSearchParams()
@@ -1280,6 +1318,7 @@ export const api = {
     qs.set('page_size', String(pageSize))
     qs.set('order_by', orderByParam)
     addNumericFilter(qs, 'market_cap', marketCapFilter)
+    for (const [field, filter] of Object.entries(pcntFilters)) addNumericFilter(qs, field, filter)
     return getJSON<MarketDirectionReport>(`/reports/market-direction?${qs.toString()}`)
   },
   // startDate/endDate are ISO dates ("YYYY-MM-DD"); each independently defaults to

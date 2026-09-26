@@ -2,13 +2,18 @@
 
 The *singular* ticker-details endpoint, distinct from the paged list endpoint
 jobs/sync_tickers.py already syncs - this is the only endpoint that carries
-market_cap/shares-outstanding, at the cost of one request per ticker rather than one
-request per thousand-ticker page. Same shape as jobs/sync_snapshots.py: no bulk
-endpoint to page through, so a run fans out across a ThreadPoolExecutor instead of the
-sequential loop sync_bars.py uses. Each worker thread opens its own DataClient (bound to
-its own asyncio event loop, via asyncio.run) and its own DB session, so no state - HTTP
-connection or otherwise - is shared across threads; one ticker's failure is isolated and
-logged rather than aborting the rest.
+market_cap/shares-outstanding (and active/delisted_utc - see db/models.py's
+TickerDetail docstring for why those are trusted from here rather than from
+Ticker.active), at the cost of one request per ticker rather than one request per
+thousand-ticker page. Stores every field this endpoint returns other than the ones
+Ticker's own list-endpoint sync already owns (name/market/locale/primary_exchange/
+type/currency_name/cik/composite_figi/share_class_figi). Same shape as
+jobs/sync_snapshots.py: no bulk endpoint to page through, so a run fans out across a
+ThreadPoolExecutor instead of the sequential loop sync_bars.py uses. Each worker
+thread opens its own DataClient (bound to its own asyncio event loop, via
+asyncio.run) and its own DB session, so no state - HTTP connection or otherwise - is
+shared across threads; one ticker's failure is isolated and logged rather than
+aborting the rest.
 """
 
 import asyncio
@@ -52,18 +57,43 @@ def _parse_list_date(value: Any) -> dt.date | None:
     return dt.date.fromisoformat(value)
 
 
+def _parse_delisted_utc(value: Any) -> dt.datetime | None:
+    """massive.com reports delisted_utc as an ISO-8601 string (e.g.
+    "2021-04-26T13:16:44Z") when present at all - same shape/parsing as
+    jobs/sync_news.py's published_utc, and null (the common case: most tickers are
+    still active) rather than present-but-empty when there's nothing to report."""
+    if not value:
+        return None
+    return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(dt.timezone.utc).replace(tzinfo=None)
+
+
 def _upsert_ticker_detail(session: Session, ticker: str, result: dict[str, Any]) -> None:
+    # Nested objects in the raw response - missing entirely (not just null) for a
+    # ticker with no address/branding on file, hence the `or {}` before .get().
+    address = result.get("address") or {}
+    branding = result.get("branding") or {}
     values: dict[str, Any] = {
         "ticker": ticker,
+        "active": result.get("active"),
+        "delisted_utc": _parse_delisted_utc(result.get("delisted_utc")),
         "market_cap": result.get("market_cap"),
         "share_class_shares_outstanding": result.get("share_class_shares_outstanding"),
         "weighted_shares_outstanding": result.get("weighted_shares_outstanding"),
         "sic_code": result.get("sic_code"),
         "sic_description": result.get("sic_description"),
         "homepage_url": result.get("homepage_url"),
+        "phone_number": result.get("phone_number"),
+        "description": result.get("description"),
+        "ticker_root": result.get("ticker_root"),
         "total_employees": result.get("total_employees"),
         "list_date": _parse_list_date(result.get("list_date")),
         "round_lot": result.get("round_lot"),
+        "address_line1": address.get("address1"),
+        "address_city": address.get("city"),
+        "address_state": address.get("state"),
+        "address_postal_code": address.get("postal_code"),
+        "branding_logo_url": branding.get("logo_url"),
+        "branding_icon_url": branding.get("icon_url"),
         "fetched_at": dt.datetime.now(dt.timezone.utc).replace(tzinfo=None),
     }
     stmt = sqlite_insert(TickerDetail).values(**values)

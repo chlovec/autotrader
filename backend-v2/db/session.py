@@ -73,7 +73,11 @@ def init_db() -> None:
     _add_lstm_inferences_exit_price_confidence_column()
     _add_job_configs_prediction_accuracy_pass_threshold_std_column()
     _add_job_configs_ohlc_update_columns()
+    _add_job_configs_ohlc_update_progress_columns()
     _add_job_configs_run_overrides_column()
+    _add_job_configs_win_rate_mcmc_range_confidence_level_column()
+    _add_win_rates_mcmc_range_columns()
+    _add_ticker_details_columns()
 
 
 def _add_column_if_missing(table: str, column: str, ddl_type: str) -> None:
@@ -340,11 +344,25 @@ def _add_job_configs_prediction_accuracy_pass_threshold_std_column() -> None:
 def _add_job_configs_ohlc_update_columns() -> None:
     """See db/models.py's JobConfig.ohlc_update_start_date/ohlc_update_end_date - added
     after job_configs itself, same "left NULL on existing rows" reasoning as
-    _add_job_configs_ohlc_bars_columns. Unlike that pair, these two are never defaulted
-    at run time (jobs/engine.py's run_job requires both to be set), so a NULL here just
-    means the ohlc-data-update job hasn't been configured yet."""
+    _add_job_configs_ohlc_bars_columns - a NULL here is resolved to a default at run
+    time (see jobs/ohlc_update.py's resolve_date_range)."""
     _add_job_configs_column("ohlc_update_start_date", "DATE")
     _add_job_configs_column("ohlc_update_end_date", "DATE")
+
+
+def _add_job_configs_ohlc_update_progress_columns() -> None:
+    """See db/models.py's JobConfig.ohlc_update_batch_size and ohlc_update_cursor/
+    ohlc_update_completed_at/ohlc_update_retry_round/ohlc_update_retry_tickers/
+    ohlc_update_failed_tickers/ohlc_update_next_run_at - added after the columns above,
+    left NULL on existing rows, which is exactly the "default batch size, no cycle in
+    progress, start from the first ticker" state."""
+    _add_job_configs_column("ohlc_update_batch_size", "INTEGER")
+    _add_job_configs_column("ohlc_update_cursor", "VARCHAR")
+    _add_job_configs_column("ohlc_update_completed_at", "DATETIME")
+    _add_job_configs_column("ohlc_update_retry_round", "INTEGER")
+    _add_job_configs_column("ohlc_update_retry_tickers", "VARCHAR")
+    _add_job_configs_column("ohlc_update_failed_tickers", "VARCHAR")
+    _add_job_configs_column("ohlc_update_next_run_at", "DATETIME")
 
 
 def _add_job_configs_run_overrides_column() -> None:
@@ -359,6 +377,46 @@ def _add_lstm_inferences_exit_price_confidence_column() -> None:
     Existing rows get NULL until their next predict-lstm-market-state-holdout/-walkforward
     run recomputes them."""
     _add_column_if_missing("lstm_inferences", "exit_price_confidence", "FLOAT")
+
+
+def _add_job_configs_win_rate_mcmc_range_confidence_level_column() -> None:
+    """See db/models.py's JobConfig.win_rate_mcmc_range_confidence_level - added after
+    job_configs itself, same "left NULL on existing rows, resolved at run time"
+    reasoning as _add_job_configs_prediction_accuracy_pass_threshold_std_column."""
+    _add_job_configs_column("win_rate_mcmc_range_confidence_level", "FLOAT")
+
+
+def _add_win_rates_mcmc_range_columns() -> None:
+    """See db/models.py's WinRate.mcmc_range_win_count/mcmc_range_win_rate/
+    mcmc_range_confidence_level - added after win_rates itself (a table with live
+    production data going back to before these columns existed), same reasoning as
+    _add_lstm_inferences_exit_price_confidence_column. Existing rows get NULL until
+    their next compute-win-rates run recomputes them."""
+    _add_column_if_missing("win_rates", "mcmc_range_win_count", "INTEGER")
+    _add_column_if_missing("win_rates", "mcmc_range_win_rate", "FLOAT")
+    _add_column_if_missing("win_rates", "mcmc_range_confidence_level", "FLOAT")
+
+
+def _add_ticker_details_columns() -> None:
+    """See db/models.py's TickerDetail docstring - active/delisted_utc/phone_number/
+    description/ticker_root/address_*/branding_* all added after ticker_details
+    itself (a table with live production data going back to before these columns
+    existed), same reasoning as _add_lstm_inferences_exit_price_confidence_column.
+    Existing rows get NULL until their next sync-ticker-details run repopulates them -
+    in particular, active/delisted_utc stay NULL (not "confirmed active") for any
+    ticker not yet re-synced since this migration, so a NULL here means "unknown",
+    not "active"."""
+    _add_column_if_missing("ticker_details", "active", "BOOLEAN")
+    _add_column_if_missing("ticker_details", "delisted_utc", "DATETIME")
+    _add_column_if_missing("ticker_details", "phone_number", "VARCHAR")
+    _add_column_if_missing("ticker_details", "description", "VARCHAR")
+    _add_column_if_missing("ticker_details", "ticker_root", "VARCHAR")
+    _add_column_if_missing("ticker_details", "address_line1", "VARCHAR")
+    _add_column_if_missing("ticker_details", "address_city", "VARCHAR")
+    _add_column_if_missing("ticker_details", "address_state", "VARCHAR")
+    _add_column_if_missing("ticker_details", "address_postal_code", "VARCHAR")
+    _add_column_if_missing("ticker_details", "branding_logo_url", "VARCHAR")
+    _add_column_if_missing("ticker_details", "branding_icon_url", "VARCHAR")
 
 
 def get_session() -> Session:

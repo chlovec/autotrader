@@ -71,6 +71,10 @@ from jobs.registry import (
     UNIFIED_SNAPSHOT_JOB,
     WIN_RATE_JOB,
 )
+from jobs.ohlc_update import is_paused as ohlc_update_is_paused
+from jobs.ohlc_update import resolve_date_range as resolve_ohlc_update_date_range
+from jobs.ohlc_update import resume_at as ohlc_update_resume_at
+from jobs.ohlc_update import sync_ohlc_update_batch
 from jobs.research_picks import compute_research_picks
 from jobs.sync_bars import (
     DEFAULT_BACKFILL_DAYS,
@@ -93,7 +97,7 @@ from jobs.sync_top_movers import sync_top_movers
 from jobs.sync_unified_snapshot import sync_unified_snapshot
 from jobs.train_lstm_holdout import train_lstm_holdout
 from jobs.train_lstm_walkforward import train_lstm_walkforward
-from jobs.win_rates import compute_win_rates
+from jobs.win_rates import DEFAULT_MCMC_RANGE_CONFIDENCE_LEVEL, compute_win_rates
 
 logger = logging.getLogger("backend_v2.jobs.engine")
 
@@ -163,6 +167,28 @@ def reconcile_orphaned_runs() -> int:
             run.finished_at = dt.datetime.utcnow()
         session.commit()
         return len(orphaned)
+
+
+def _resolve_prediction_date(config: JobConfig, trigger: str) -> dt.date:
+    """Shared by every predict-* job branch below (predict-market-state's merged
+    Markov+Monte Carlo phases, predict-10-day-market-state, and the LSTM inference
+    jobs): a manual run (trigger == "manual") uses config.prediction_start_date
+    verbatim when one is set - the literal calendar date an operator picked in
+    JobCard's date field, sent as a one-time run override the same way every other
+    field there is (see apply_run_overrides) unless it was also saved. Every other
+    case - every auto/scheduled run, always, and a manual run where no date was
+    picked - falls back to today + predicted_date_offset_days, exactly like before
+    this became per-run-overridable. Auto runs never consult prediction_start_date at
+    all, so a value left saved in it (e.g. from a prior manual run) can never leak
+    into a scheduled run's target date."""
+    if trigger == "manual" and config.prediction_start_date is not None:
+        return config.prediction_start_date
+    offset_days = (
+        config.predicted_date_offset_days
+        if config.predicted_date_offset_days is not None
+        else DEFAULT_PREDICTED_DATE_OFFSET_DAYS
+    )
+    return dt.datetime.now(dt.timezone.utc).date() + dt.timedelta(days=offset_days)
 
 
 def apply_run_overrides(session: Session, job_name: str, config: JobConfig) -> None:
@@ -255,15 +281,9 @@ async def run_job(job_name: str, trigger: str) -> None:
             # then a Monte Carlo simulation over that same fitted chain - both purely
             # local, off the event loop via asyncio.to_thread, same reasoning as the
             # average-volume branch above. Both phases share one predicted date,
-            # resolved here (as an offset in days from today - see JobConfig.
-            # predicted_date_offset_days's docstring) rather than twice, so they can
-            # never target different sessions.
-            offset_days = (
-                config.predicted_date_offset_days
-                if config.predicted_date_offset_days is not None
-                else DEFAULT_PREDICTED_DATE_OFFSET_DAYS
-            )
-            prediction_date = dt.datetime.now(dt.timezone.utc).date() + dt.timedelta(days=offset_days)
+            # resolved here once (see _resolve_prediction_date) rather than twice, so
+            # they can never target different sessions.
+            prediction_date = _resolve_prediction_date(config, trigger)
             ticker_types = split_csv(config.ticker_types)
             tickers = split_csv(config.tickers)
             markov_count = await asyncio.to_thread(
@@ -291,11 +311,15 @@ async def run_job(job_name: str, trigger: str) -> None:
             )
         elif job_name == PREDICT_10_DAY_MARKET_STATE_JOB:
             # Same reasoning as the predict-market-state branch above - purely local,
-            # off the event loop via asyncio.to_thread.
+            # off the event loop via asyncio.to_thread, and the same
+            # _resolve_prediction_date resolution (a picked date for a manual run,
+            # otherwise today + predicted_date_offset_days) rather than using
+            # config.prediction_start_date unconditionally, which would let a manual
+            # run's picked date silently leak into the next scheduled run too.
             count = await asyncio.to_thread(
                 compute_10_day_market_state_predictions,
                 session,
-                config.prediction_start_date,
+                _resolve_prediction_date(config, trigger),
                 split_csv(config.ticker_types),
                 split_csv(config.tickers),
                 DEFAULT_MIN_HISTORY_DAYS,
@@ -310,6 +334,9 @@ async def run_job(job_name: str, trigger: str) -> None:
                 session,
                 split_csv(config.ticker_types),
                 split_csv(config.tickers),
+                mcmc_range_confidence_level=(
+                    config.win_rate_mcmc_range_confidence_level or DEFAULT_MCMC_RANGE_CONFIDENCE_LEVEL
+                ),
                 control=control,
             )
             summary = f"{count} ticker(s) win rate computed"
@@ -392,13 +419,10 @@ async def run_job(job_name: str, trigger: str) -> None:
             # job name (see jobs/registry.py's LSTM_INFERENCE_TRAINING_METHODS) - same
             # "job name picks the parameter" dispatch as the INDICATOR_NAMES branch
             # below, so predict-lstm-market-state-holdout/-walkforward always resolve
-            # their own flavor's model rather than "whichever is newest."
-            offset_days = (
-                config.predicted_date_offset_days
-                if config.predicted_date_offset_days is not None
-                else DEFAULT_PREDICTED_DATE_OFFSET_DAYS
-            )
-            prediction_date = dt.datetime.now(dt.timezone.utc).date() + dt.timedelta(days=offset_days)
+            # their own flavor's model rather than "whichever is newest." Prediction
+            # date resolution is the same as predict-market-state's - see
+            # _resolve_prediction_date.
+            prediction_date = _resolve_prediction_date(config, trigger)
             count = await asyncio.to_thread(
                 compute_lstm_market_state_predictions,
                 session,
@@ -480,27 +504,44 @@ async def run_job(job_name: str, trigger: str) -> None:
             )
             summary = f"{len(results)} ticker(s) synced, {sum(results.values())} bar(s) fetched"
         elif job_name == OHLC_UPDATE_JOB:
-            # Always overwrites the exact given range, no incremental check - see
-            # jobs/sync_bars.py's sync_bars_manual (this job runs it directly) and
-            # db/models.py's JobConfig.ohlc_update_start_date docstring for why both
-            # dates are required here rather than defaulted like OHLC_BARS_JOB's are.
-            if config.ohlc_update_start_date is None or config.ohlc_update_end_date is None:
-                raise ValueError(
-                    "ohlc-data-update requires both Start date and End date to be set on this job's config"
+            # Same no-shared-DataClient, thread-pool-fan-out reasoning as the BARS_JOB
+            # branch above - both paths run jobs/sync_bars.py's sync_bars_manual, which
+            # always overwrites the exact given range, no incremental check.
+            if trigger == "auto":
+                # Scheduled run: next batch of tickers only, then remember where we
+                # stopped - see jobs/ohlc_update.py.
+                batch = await asyncio.to_thread(
+                    sync_ohlc_update_batch,
+                    session,
+                    config,
+                    split_csv(config.ticker_types),
+                    split_csv(config.tickers),
+                    control=control,
+                    run_id=run_id,
                 )
-            if config.ohlc_update_start_date > config.ohlc_update_end_date:
-                raise ValueError("ohlc-data-update's Start date must not be after End date")
-            results = await asyncio.to_thread(
-                sync_bars_manual,
-                session,
-                config.ohlc_update_start_date,
-                config.ohlc_update_end_date,
-                split_csv(config.ticker_types),
-                split_csv(config.tickers),
-                control=control,
-                run_id=run_id,
-            )
-            summary = f"{len(results)} ticker(s) synced, {sum(results.values())} bar(s) fetched"
+                results = batch.results
+                summary = f"{len(results)} ticker(s) synced, {sum(results.values())} bar(s) fetched"
+                if batch.failed:
+                    summary += f", {len(batch.failed)} ticker(s) failed"
+                if batch.note:
+                    summary += f" - {batch.note}"
+            else:
+                # Manual run: every selected ticker over the resolved range, no batching
+                # and no cursor.
+                start_date, end_date = resolve_ohlc_update_date_range(
+                    config.ohlc_update_start_date, config.ohlc_update_end_date
+                )
+                results = await asyncio.to_thread(
+                    sync_bars_manual,
+                    session,
+                    start_date,
+                    end_date,
+                    split_csv(config.ticker_types),
+                    split_csv(config.tickers),
+                    control=control,
+                    run_id=run_id,
+                )
+                summary = f"{len(results)} ticker(s) synced, {sum(results.values())} bar(s) fetched"
         else:
             async with DataClient() as client:
                 if job_name == TICKERS_JOB:
@@ -554,9 +595,20 @@ async def run_job(job_name: str, trigger: str) -> None:
 
 async def scheduled_job(job_name: str) -> None:
     with SessionLocal() as session:
-        run_type = get_or_create_config(session, job_name).run_type
+        config = get_or_create_config(session, job_name)
+        run_type = config.run_type
+        # ohlc-data-update sits out the rest of the day once every ticker has been
+        # updated, and waits out each failed-ticker retry delay - see
+        # jobs/ohlc_update.py. Checked here rather than in run_job so a paused job
+        # doesn't record an empty JobRun every interval.
+        paused_until = None
+        if job_name == OHLC_UPDATE_JOB and ohlc_update_is_paused(config):
+            paused_until = ohlc_update_resume_at(config)
     if run_type != "auto":
         logger.info("%s is manual-only, skipping scheduled run", job_name)
+        return
+    if paused_until is not None:
+        logger.info("%s paused until %s UTC, skipping scheduled run", job_name, paused_until)
         return
     if not _job_locks[job_name].acquire(blocking=False):
         logger.info("%s already running, skipping scheduled trigger", job_name)

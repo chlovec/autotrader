@@ -5,7 +5,8 @@ import pytest
 
 from db.models import JobConfig, JobRun
 from db.session import SessionLocal, init_db
-from jobs.engine import apply_run_overrides, reconcile_orphaned_runs
+from jobs.engine import _resolve_prediction_date, apply_run_overrides, reconcile_orphaned_runs
+from jobs.predict_market_state import DEFAULT_PREDICTED_DATE_OFFSET_DAYS
 from jobs.registry import OHLC_UPDATE_JOB, PREDICT_MARKET_STATE_JOB
 
 
@@ -143,3 +144,43 @@ def test_apply_run_overrides_overrides_in_memory_without_persisting():
         assert persisted.run_overrides is None
     finally:
         session.close()
+
+
+def _minimal_config(**kwargs) -> JobConfig:
+    return JobConfig(
+        job_name=PREDICT_MARKET_STATE_JOB,
+        run_type="manual",
+        schedule_interval_unit="days",
+        schedule_interval_value=1,
+        **kwargs,
+    )
+
+
+def test_resolve_prediction_date_auto_trigger_always_uses_offset():
+    """A scheduled/automatic run must use predicted_date_offset_days even if a manual
+    run earlier left a literal prediction_start_date saved on this same config row -
+    the whole point of resolving by trigger rather than by "whichever field is set"."""
+    today = dt.datetime.now(dt.timezone.utc).date()
+    config = _minimal_config(predicted_date_offset_days=3, prediction_start_date=dt.date(2020, 1, 1))
+
+    assert _resolve_prediction_date(config, "auto") == today + dt.timedelta(days=3)
+
+
+def test_resolve_prediction_date_manual_trigger_uses_picked_date():
+    config = _minimal_config(prediction_start_date=dt.date(2026, 6, 15), predicted_date_offset_days=5)
+
+    assert _resolve_prediction_date(config, "manual") == dt.date(2026, 6, 15)
+
+
+def test_resolve_prediction_date_manual_trigger_without_picked_date_falls_back_to_offset():
+    today = dt.datetime.now(dt.timezone.utc).date()
+    config = _minimal_config(predicted_date_offset_days=2, prediction_start_date=None)
+
+    assert _resolve_prediction_date(config, "manual") == today + dt.timedelta(days=2)
+
+
+def test_resolve_prediction_date_defaults_to_tomorrow_when_nothing_set():
+    today = dt.datetime.now(dt.timezone.utc).date()
+    config = _minimal_config()
+
+    assert _resolve_prediction_date(config, "auto") == today + dt.timedelta(days=DEFAULT_PREDICTED_DATE_OFFSET_DAYS)

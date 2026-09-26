@@ -75,6 +75,7 @@ type JobFieldsState = {
   ohlcBarsLimit: number
   ohlcUpdateStartDate: string
   ohlcUpdateEndDate: string
+  ohlcUpdateBatchSize: number
   lstmTrainStartDate: string
   lstmTrainEndDate: string
   lstmEpochs: number
@@ -86,6 +87,7 @@ type JobFieldsState = {
   // widened to plain string by useState's generic inference, not kept as the literal.
   lstmModelVersionId: number | string
   predictionAccuracyPassThresholdStd: number
+  winRateMcmcRangeConfidenceLevel: number
 }
 
 // Gates each field by job.has_* the same way JobCard's render order decides which
@@ -131,6 +133,7 @@ function buildJobFieldsPayload(job: Job, fields: JobFieldsState): JobRunOverride
       ? {
           ohlc_update_start_date: fields.ohlcUpdateStartDate || null,
           ohlc_update_end_date: fields.ohlcUpdateEndDate || null,
+          ohlc_update_batch_size: fields.ohlcUpdateBatchSize,
         }
       : {}),
     ...(job.has_lstm_training_fields
@@ -149,6 +152,9 @@ function buildJobFieldsPayload(job: Job, fields: JobFieldsState): JobRunOverride
       : {}),
     ...(job.has_prediction_accuracy_fields
       ? { prediction_accuracy_pass_threshold_std: fields.predictionAccuracyPassThresholdStd }
+      : {}),
+    ...(job.has_win_rate_fields
+      ? { win_rate_mcmc_range_confidence_level: fields.winRateMcmcRangeConfidenceLevel }
       : {}),
   }
 }
@@ -251,6 +257,7 @@ export function JobCard({
   const [ohlcBarsLimit, setOhlcBarsLimit] = useState(job.ohlc_bars_limit ?? 8000)
   const [ohlcUpdateStartDate, setOhlcUpdateStartDate] = useState(job.ohlc_update_start_date ?? '')
   const [ohlcUpdateEndDate, setOhlcUpdateEndDate] = useState(job.ohlc_update_end_date ?? '')
+  const [ohlcUpdateBatchSize, setOhlcUpdateBatchSize] = useState(job.ohlc_update_batch_size ?? 5000)
   const [lstmTrainStartDate, setLstmTrainStartDate] = useState(job.lstm_train_start_date ?? '')
   const [lstmTrainEndDate, setLstmTrainEndDate] = useState(job.lstm_train_end_date ?? '')
   // Defaults match backend-v2 jobs/lstm_common.py's DEFAULT_EPOCHS/
@@ -266,6 +273,11 @@ export function JobCard({
   // DEFAULT_PASS_THRESHOLD_STD.
   const [predictionAccuracyPassThresholdStd, setPredictionAccuracyPassThresholdStd] = useState(
     job.prediction_accuracy_pass_threshold_std ?? 1.0,
+  )
+  // Default 0.95 matches backend-v2 jobs/win_rates.py's
+  // DEFAULT_MCMC_RANGE_CONFIDENCE_LEVEL.
+  const [winRateMcmcRangeConfidenceLevel, setWinRateMcmcRangeConfidenceLevel] = useState(
+    job.win_rate_mcmc_range_confidence_level ?? 0.95,
   )
 
   const [saving, setSaving] = useState(false)
@@ -309,6 +321,7 @@ export function JobCard({
     ohlcBarsLimit,
     ohlcUpdateStartDate,
     ohlcUpdateEndDate,
+    ohlcUpdateBatchSize,
     lstmTrainStartDate,
     lstmTrainEndDate,
     lstmEpochs,
@@ -318,6 +331,7 @@ export function JobCard({
     lstmWalkforwardNumFolds,
     lstmModelVersionId,
     predictionAccuracyPassThresholdStd,
+    winRateMcmcRangeConfidenceLevel,
   })
 
   const handleSave = async (event: FormEvent) => {
@@ -672,7 +686,8 @@ export function JobCard({
                 !job.has_lstm_training_fields &&
                 !job.has_lstm_walkforward_fields &&
                 !job.has_lstm_inference_fields &&
-                !job.has_prediction_accuracy_fields && (
+                !job.has_prediction_accuracy_fields &&
+                !job.has_win_rate_fields && (
                   <p className="job-field-hint">This job has no run parameters to configure.</p>
                 )}
 
@@ -831,22 +846,6 @@ export function JobCard({
                 </>
               )}
 
-              {job.has_prediction_start_date_field && (
-                <>
-                  <div className="job-field-row">
-                    <label className="job-field">
-                      Start date (UTC)
-                      <input
-                        type="date"
-                        value={predictionStartDate}
-                        onChange={(e) => setPredictionStartDate(e.target.value)}
-                      />
-                    </label>
-                  </div>
-                  <p className="job-field-hint">Leave blank to default to tomorrow (UTC) at run time.</p>
-                </>
-              )}
-
               {job.has_predicted_date_offset_field && (
                 <>
                   <div className="job-field-row">
@@ -861,9 +860,32 @@ export function JobCard({
                     </label>
                   </div>
                   <p className="job-field-hint">
-                    Predicted date = today + this many days - e.g. 1 for tomorrow (the default), 0 for today, -1 for
-                    yesterday. Shared by both phases of this job: the Markov chain prediction runs first, then a
-                    Monte Carlo simulation over that same chain for the same predicted date.
+                    Used for scheduled/automatic runs: predicted date = today + this many days - e.g. 1 for tomorrow
+                    (the default), 0 for today, -1 for yesterday.
+                    {job.name === 'predict-market-state' &&
+                      ' Shared by both phases of this job: the Markov chain prediction runs first, then a Monte Carlo simulation over that same chain for the same predicted date.'}
+                    {job.has_prediction_start_date_field &&
+                      ' Manually running this job below uses the Prediction date field instead, when set.'}
+                  </p>
+                </>
+              )}
+
+              {job.has_prediction_start_date_field && (
+                <>
+                  <div className="job-field-row">
+                    <label className="job-field">
+                      Prediction date (UTC)
+                      <input
+                        type="date"
+                        value={predictionStartDate}
+                        onChange={(e) => setPredictionStartDate(e.target.value)}
+                      />
+                    </label>
+                  </div>
+                  <p className="job-field-hint">
+                    {job.has_predicted_date_offset_field
+                      ? 'Used only when this job is run manually (the play button below) - takes priority over the offset above for that one run. Leave blank to use the offset instead.'
+                      : 'Leave blank to default to tomorrow (UTC) at run time.'}
                   </p>
                 </>
               )}
@@ -938,11 +960,24 @@ export function JobCard({
                         onChange={(e) => setOhlcUpdateEndDate(e.target.value)}
                       />
                     </label>
+                    <label className="job-field">
+                      Max tickers per run
+                      <input
+                        type="number"
+                        min={1}
+                        value={ohlcUpdateBatchSize}
+                        onChange={(e) => setOhlcUpdateBatchSize(Number(e.target.value))}
+                      />
+                    </label>
                   </div>
                   <p className="job-field-hint">
-                    Both required - unlike every other date field on this page, neither defaults to anything.
-                    Every run re-fetches and overwrites this exact range for the selected tickers (or every
-                    ticker, if none is selected above), regardless of what's already synced.
+                    Leave end date blank to default to today, and start date blank to default to 2 years before
+                    the end date. Every run re-fetches and overwrites this range regardless of what's already
+                    synced. When set to auto, each run syncs the next batch of selected tickers (or every ticker,
+                    alphabetically, if none is selected above), up to Max tickers per run. Tickers that fail are
+                    retried in the same-size batches once all have been updated, waiting 2x, 4x, then 8x the
+                    schedule interval before each of up to 3 retries; after that the job pauses until the next day
+                    at its start time. A manual run syncs every selected ticker at once.
                   </p>
                 </>
               )}
@@ -1079,6 +1114,30 @@ export function JobCard({
                     of that source's predicted exit price - the standard deviation used is the ticker's own
                     historical return volatility, not any model's own self-reported confidence. Use Tickers/Ticker
                     types above to scope which tickers get scored.
+                  </p>
+                </>
+              )}
+
+              {job.has_win_rate_fields && (
+                <>
+                  <div className="job-field-row">
+                    <label className="job-field">
+                      MCMC range win confidence level
+                      <input
+                        type="number"
+                        min={0}
+                        max={1}
+                        step={0.005}
+                        value={winRateMcmcRangeConfidenceLevel}
+                        onChange={(e) => setWinRateMcmcRangeConfidenceLevel(Number(e.target.value))}
+                      />
+                    </label>
+                  </div>
+                  <p className="job-field-hint">
+                    A fraction between 0 and 1 (e.g. 0.95 for a 95% interval, the default). A ticker's Monte Carlo
+                    "range win rate" counts an actual close as a win when it falls within the simulated exit-price
+                    distribution's own confidence interval at this level - independent of the direction-only MCMC
+                    win rate above.
                   </p>
                 </>
               )}
