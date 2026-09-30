@@ -61,6 +61,7 @@ from jobs.registry import (
     BARS_JOB,
     DEFAULT_START_TIME,
     ETF_CONSTITUENTS_JOB,
+    GROUPED_DAILY_JOB,
     INDICATOR_NAMES,
     JOB_DEFINITIONS,
     JobDefinition,
@@ -181,6 +182,7 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         "has_monte_carlo_fields": definition.has_monte_carlo_fields,
         "has_ohlc_bars_fields": definition.has_ohlc_bars_fields,
         "has_ohlc_update_fields": definition.has_ohlc_update_fields,
+        "has_grouped_daily_fields": definition.has_grouped_daily_fields,
         "has_lstm_training_fields": definition.has_lstm_training_fields,
         "has_lstm_walkforward_fields": definition.has_lstm_walkforward_fields,
         "has_lstm_inference_fields": definition.has_lstm_inference_fields,
@@ -259,6 +261,8 @@ _RESET_TABLES: dict[str, list[type[Base]]] = {
     # Also shares ohlc_bars (see jobs/sync_bars.py's sync_bars_manual, which this job
     # runs directly) - same reasoning as OHLC_BARS_JOB above.
     OHLC_UPDATE_JOB: [OhlcBar],
+    # Also writes ohlc_bars (see jobs/sync_grouped_daily.py) - same reasoning.
+    GROUPED_DAILY_JOB: [OhlcBar],
     TICKER_TYPES_JOB: [TickerType],
     SNAPSHOTS_JOB: [CurrentSnapshot],
     TICKER_DETAILS_JOB: [TickerDetail],
@@ -2882,6 +2886,7 @@ def _research_pick_to_dict(pick: ResearchPick, ticker: Ticker) -> dict[str, Any]
         "rsi_adjustment": pick.rsi_adjustment,
         "news_adjustment": pick.news_adjustment,
         "entry_price": pick.entry_price,
+        "entry_price_timestamp": pick.entry_price_timestamp.isoformat() if pick.entry_price_timestamp else None,
         "markov_predicted_state": pick.markov_predicted_state,
         "markov_expected_return": pick.markov_expected_return,
         "markov_state_confidence": pick.markov_state_confidence,
@@ -3112,6 +3117,7 @@ def _validate_and_normalize_job_fields(definition: JobDefinition, body: _JobFiel
     # see sync_tickers's ticker_type param) or has_ticker_selector (a multi-select
     # filter - see sync_bars/sync_snapshots's _resolve_tickers). Dropped for a job like
     # ticker-types sync that takes no run parameters at all, even if the caller sent one.
+    has_date_range = definition.has_ohlc_update_fields or definition.has_grouped_daily_fields
     fields: dict[str, Any] = {
         "ticker_types": (
             body.ticker_types if (definition.has_ticker_type_filter or definition.has_ticker_selector) else None
@@ -3137,8 +3143,10 @@ def _validate_and_normalize_job_fields(definition: JobDefinition, body: _JobFiel
         "ohlc_bars_start_date": ohlc_bars_start_date if definition.has_ohlc_bars_fields else None,
         "ohlc_bars_end_date": ohlc_bars_end_date if definition.has_ohlc_bars_fields else None,
         "ohlc_bars_limit": body.ohlc_bars_limit if definition.has_ohlc_bars_fields else None,
-        "ohlc_update_start_date": ohlc_update_start_date if definition.has_ohlc_update_fields else None,
-        "ohlc_update_end_date": ohlc_update_end_date if definition.has_ohlc_update_fields else None,
+        # has_grouped_daily_fields stores its Start/End date in these same columns, on
+        # its own JobConfig row.
+        "ohlc_update_start_date": ohlc_update_start_date if has_date_range else None,
+        "ohlc_update_end_date": ohlc_update_end_date if has_date_range else None,
         "ohlc_update_batch_size": body.ohlc_update_batch_size if definition.has_ohlc_update_fields else None,
         "lstm_train_start_date": lstm_train_start_date if definition.has_lstm_training_fields else None,
         "lstm_train_end_date": lstm_train_end_date if definition.has_lstm_training_fields else None,

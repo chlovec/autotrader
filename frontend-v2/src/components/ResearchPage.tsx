@@ -10,6 +10,7 @@ const COLUMNS: ReportColumn<ResearchPickRow>[] = [
   { key: 'name', label: 'Name' },
   { key: 'predicted_direction', label: 'Direction' },
   { key: 'entry_price', label: 'Entry Price' },
+  { key: 'entry_price_timestamp', label: 'Entry Price Date' },
   { key: 'markov_expected_return', label: 'Markov Expected Return' },
   { key: 'mcmc_expected_return', label: 'MCMC Expected Return' },
   { key: 'markov_state_confidence', label: 'Markov Confidence' },

@@ -54,6 +54,10 @@ export interface Job {
   // has_ohlc_bars_fields' pair, a blank end date defaults to today and a blank start
   // date to 2 years before the end date.
   has_ohlc_update_fields: boolean
+  // Whether this job offers just the Start date/End date pair, stored in the same
+  // ohlc_update_start_date/ohlc_update_end_date fields - only sync-grouped-daily sets
+  // this. A blank end date defaults to today and a blank start date to 7 days before it.
+  has_grouped_daily_fields: boolean
   // Whether this job offers the Start date/End date/Epochs/Lookback days/Learning
   // rate/Batch size group (see lstm_train_start_date etc. below) - the
   // train-lstm-holdout and train-lstm-walkforward jobs both set this.
@@ -746,6 +750,7 @@ export interface ResearchPickRow {
   rsi_adjustment: number
   news_adjustment: number
   entry_price: number | null
+  entry_price_timestamp: string | null
   markov_predicted_state: string
   markov_expected_return: number
   markov_state_confidence: number

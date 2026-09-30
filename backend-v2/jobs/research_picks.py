@@ -32,6 +32,7 @@ from db.models import (
     MarketPredictionBacktest,
     MarketPredictionMonteCarlo,
     News,
+    OhlcBar,
     ResearchPick,
     TechnicalIndicator,
     Ticker,
@@ -39,6 +40,7 @@ from db.models import (
     WinRate,
 )
 from jobs.control import JobControl
+from jobs.predict_market_state import DEFAULT_MULTIPLIER, DEFAULT_TIMESPAN
 
 logger = logging.getLogger("backend_v2.jobs.research_picks")
 
@@ -185,6 +187,28 @@ def _news_signals(session: Session, candidate_tickers: set[str]) -> dict[str, tu
     return {ticker: (count, leans.get(ticker, 0)) for ticker, count in counts.items()}
 
 
+def _entry_price_timestamps(
+    session: Session, candidate_tickers: set[str], predicted_date: dt.date
+) -> dict[str, dt.datetime]:
+    """ticker -> ohlc_bars.timestamp of the bar MarketPrediction.entry_price was taken
+    from. market_predictions doesn't store it, so this repeats
+    jobs/predict_market_state.py's selection: the latest daily bar with close > 0
+    dated strictly before predicted_date's midnight."""
+    cutoff = dt.datetime.combine(predicted_date, dt.time.min)
+    rows = session.execute(
+        select(OhlcBar.ticker, func.max(OhlcBar.timestamp))
+        .where(
+            OhlcBar.ticker.in_(candidate_tickers),
+            OhlcBar.multiplier == DEFAULT_MULTIPLIER,
+            OhlcBar.timespan == DEFAULT_TIMESPAN,
+            OhlcBar.close > 0,
+            OhlcBar.timestamp < cutoff,
+        )
+        .group_by(OhlcBar.ticker)
+    ).all()
+    return dict(rows)
+
+
 def _build_comment(
     direction: str,
     markov_er: float,
@@ -283,6 +307,7 @@ def compute_research_picks(session: Session, run_id: int, control: JobControl | 
     rsi_by_ticker = dict(rsi_rows)
 
     news_by_ticker = _news_signals(session, candidate_tickers)
+    entry_timestamps_by_ticker = _entry_price_timestamps(session, candidate_tickers, predicted_date)
 
     scored = []
     for ticker, markov, mcmc, ticker_detail, avg_vol in candidates:
@@ -391,6 +416,7 @@ def compute_research_picks(session: Session, run_id: int, control: JobControl | 
                 rsi_adjustment=entry["rsi_adj"],
                 news_adjustment=entry["news_adj"],
                 entry_price=entry["markov"].entry_price,
+                entry_price_timestamp=entry_timestamps_by_ticker.get(entry["ticker"]),
                 markov_predicted_state=entry["markov"].predicted_state,
                 markov_expected_return=entry["markov"].expected_return,
                 markov_state_confidence=entry["markov"].state_confidence,

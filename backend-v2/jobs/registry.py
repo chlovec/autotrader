@@ -41,6 +41,10 @@ OHLC_BARS_JOB = "sync-ohlc-bars"
 # corrections over a known range - e.g. re-pulling a range after a bad sync - where
 # the incremental jobs' "skip what's already there" logic is exactly what's unwanted.
 OHLC_UPDATE_JOB = "ohlc-data-update"
+# Same "overwrite a date range" job as OHLC_UPDATE_JOB, but over massive.com's grouped
+# daily endpoint - one request per day for the whole market instead of one per ticker
+# (see jobs/sync_grouped_daily.py).
+GROUPED_DAILY_JOB = "sync-grouped-daily"
 # Two separate training jobs - one per jobs/lstm_common.py validation flavor - rather
 # than one job with a mode switch, specifically so their JobRun.started_at/finished_at
 # wall-clock time can be compared directly on the Jobs page (see jobs/train_lstm_holdout.py
@@ -132,6 +136,7 @@ DEFAULT_SCHEDULES: dict[str, tuple[str, int]] = {
     ETF_CONSTITUENTS_JOB: ("days", 1),
     OHLC_BARS_JOB: ("days", 1),
     OHLC_UPDATE_JOB: ("days", 1),
+    GROUPED_DAILY_JOB: ("days", 1),
     TRAIN_LSTM_HOLDOUT_JOB: ("days", 1),
     TRAIN_LSTM_WALKFORWARD_JOB: ("days", 1),
     PREDICT_LSTM_HOLDOUT_JOB: ("days", 1),
@@ -224,6 +229,12 @@ class JobDefinition:
     # fields are optional and resolved at run time - see jobs/ohlc_update.py's
     # resolve_date_range.
     has_ohlc_update_fields: bool = False
+    # Whether this job offers just the "Start date"/"End date" pair (no "Max tickers
+    # per run") - only sync-grouped-daily takes this. Stored in the same
+    # ohlc_update_start_date/ohlc_update_end_date columns as has_ohlc_update_fields, on
+    # this job's own JobConfig row; resolved at run time by jobs/sync_grouped_daily.py's
+    # resolve_date_range.
+    has_grouped_daily_fields: bool = False
     # Whether this job offers the "Start date"/"End date"/"Epochs"/"Lookback days"/
     # "Learning rate"/"Batch size" group (see jobs/lstm_common.py) - shared by both
     # train-lstm-holdout and train-lstm-walkforward, since both train the same
@@ -624,6 +635,27 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
         # Overwrites a range rather than syncing incrementally, so it isn't something to
         # switch on by default - manual until someone opts into the auto batch cycle
         # (see jobs/ohlc_update.py), same reasoning as ticker-types/snapshots/movers.
+        default_run_type="manual",
+    ),
+    GROUPED_DAILY_JOB: JobDefinition(
+        name=GROUPED_DAILY_JOB,
+        label="Sync daily bars (grouped)",
+        description=(
+            "Syncs GET /v2/aggs/grouped/locale/us/market/stocks/{date} into ohlc_bars for "
+            "every weekday in the Start date/End date range - one request per day returns "
+            "every US stock ticker's daily bar, so a 1-week range is ~5 requests instead of "
+            "one per ticker like ohlc-data-update. Overwrites any daily bar already stored "
+            "for those days. Stores only the selected Tickers or Ticker types, or every "
+            "non-forex ticker in the tickers table if neither is set. A blank End date "
+            "means today and a blank Start date means 7 days before the End date. Days "
+            "that fail are retried once the rest are done, up to 3 times, waiting 1, 2, "
+            "then 4 minutes before each retry."
+        ),
+        has_bars_fields=False,
+        has_ticker_selector=True,
+        has_grouped_daily_fields=True,
+        # New and overwrites a range - manual until someone opts into running it daily,
+        # same reasoning as ohlc-data-update.
         default_run_type="manual",
     ),
     TRAIN_LSTM_HOLDOUT_JOB: JobDefinition(

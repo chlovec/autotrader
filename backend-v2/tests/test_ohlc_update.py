@@ -215,6 +215,26 @@ def test_ticker_types_limit_the_selection():
         session.close()
 
 
+def test_forex_tickers_are_excluded_from_the_tickers_table_selection():
+    session = SessionLocal()
+    session.add_all(
+        [
+            Ticker(ticker="AAA", type="CS", market="stocks"),
+            Ticker(ticker="BBB", type="CS", market=None),
+            Ticker(ticker="C:EURUSD", market="fx"),
+        ]
+    )
+    session.commit()
+    config = _config(session)
+    requested: list[str] = []
+
+    try:
+        _run(session, config, requested, batch_size=5000)
+        assert sorted(requested) == ["AAA", "BBB"]
+    finally:
+        session.close()
+
+
 def test_explicit_tickers_are_batched_alphabetically():
     session = SessionLocal()
     config = _config(session)

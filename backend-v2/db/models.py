@@ -38,6 +38,14 @@ class Ticker(Base):
     last_ohlc_sync_date: Mapped[dt.date | None] = mapped_column(Date)
 
 
+# Forex tickers (market "fx", the C:XXXYYY symbols) are rate-limited far harder by
+# massive.com than stocks - an ohlc-data-update run spent ~30 min stalled in 429
+# cooldowns on ~60 of them after syncing ~4,700 stocks in ~10 min. Every per-ticker
+# sync job's tickers-table selection filters them out with this; an explicit tickers
+# list is still used as given. IS DISTINCT FROM so a NULL market isn't dropped too.
+NOT_FOREX = Ticker.market.is_distinct_from("fx")
+
+
 class TickerType(Base):
     """One row per code/asset_class/locale combination returned by GET
     /v3/reference/tickers/types, describing what a Ticker.type value means (e.g. "CS" ->
@@ -1027,6 +1035,11 @@ class ResearchPick(Base):
     # db/session.py's _add_research_picks_entry_price_column) - existing rows stay
     # NULL until their next run.
     entry_price: Mapped[float | None] = mapped_column(Float)
+    # ohlc_bars.timestamp of the bar whose close entry_price is - the latest daily bar
+    # strictly before predicted_date, same selection jobs/predict_market_state.py makes
+    # (MarketPrediction itself doesn't persist it). Nullable for the same reason as
+    # entry_price - see db/session.py's _add_research_picks_entry_price_timestamp_column.
+    entry_price_timestamp: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=False))
     markov_predicted_state: Mapped[str] = mapped_column(String)
     markov_expected_return: Mapped[float] = mapped_column(Float)
     markov_state_confidence: Mapped[float] = mapped_column(Float)

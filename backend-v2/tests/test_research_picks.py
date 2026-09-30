@@ -10,6 +10,7 @@ from db.models import (
     MarketPredictionBacktest,
     MarketPredictionMonteCarlo,
     News,
+    OhlcBar,
     ResearchPick,
     TechnicalIndicator,
     Ticker,
@@ -27,6 +28,7 @@ def _clean_db():
     session.query(ResearchPick).delete()
     session.query(JobRun).delete()
     session.query(News).delete()
+    session.query(OhlcBar).delete()
     session.query(TechnicalIndicator).delete()
     session.query(MarketPredictionBacktest).delete()
     session.query(WinRate).delete()
@@ -334,5 +336,34 @@ def test_zero_predictions_returns_zero_without_raising():
         stored = compute_research_picks(session, run.id)
         assert stored == 0
         assert session.query(ResearchPick).count() == 0
+    finally:
+        session.close()
+
+
+def _daily_bar(ticker: str, timestamp: dt.datetime, close: float) -> OhlcBar:
+    return OhlcBar(ticker=ticker, multiplier=1, timespan="day", timestamp=timestamp, close=close)
+
+
+def test_entry_price_timestamp_is_latest_daily_bar_before_predicted_date():
+    session = SessionLocal()
+    try:
+        _qualifying_ticker(session, "AAA")
+        _qualifying_ticker(session, "BBB")
+        # AAA: latest valid bar before predicted_date is 2025-12-31. The $0 bar and the
+        # bar dated on predicted_date itself are both skipped, same as the predict job.
+        session.add(_daily_bar("AAA", dt.datetime(2025, 12, 30, 5), 98.0))
+        session.add(_daily_bar("AAA", dt.datetime(2025, 12, 31, 5), 100.0))
+        session.add(_daily_bar("AAA", dt.datetime(2026, 1, 1, 5), 0.0))
+        session.add(_daily_bar("AAA", dt.datetime(2026, 1, 2, 5), 101.0))
+        # BBB has no bars - entry_price_timestamp stays NULL rather than failing the run.
+        run = _job_run()
+        session.add(run)
+        session.commit()
+
+        compute_research_picks(session, run.id)
+
+        picks = {pick.ticker: pick for pick in session.query(ResearchPick).all()}
+        assert picks["AAA"].entry_price_timestamp == dt.datetime(2025, 12, 31, 5)
+        assert picks["BBB"].entry_price_timestamp is None
     finally:
         session.close()

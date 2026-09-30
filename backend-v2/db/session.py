@@ -69,6 +69,7 @@ def init_db() -> None:
     _add_tickers_last_ohlc_sync_date_column()
     _add_ticker_types_rank_status_columns()
     _add_research_picks_entry_price_column()
+    _add_research_picks_entry_price_timestamp_column()
     _migrate_lstm_inferences_training_method_pk()
     _add_lstm_inferences_exit_price_confidence_column()
     _add_job_configs_prediction_accuracy_pass_threshold_std_column()
@@ -288,6 +289,12 @@ def _add_research_picks_entry_price_column() -> None:
     _add_tickers_last_ohlc_sync_date_column); only jobs/research_picks.py's next run
     populates it."""
     _add_column_if_missing("research_picks", "entry_price", "FLOAT")
+
+
+def _add_research_picks_entry_price_timestamp_column() -> None:
+    """See db/models.py's ResearchPick.entry_price_timestamp - left NULL on existing
+    rows, same as _add_research_picks_entry_price_column."""
+    _add_column_if_missing("research_picks", "entry_price_timestamp", "DATETIME")
 
 
 def _migrate_lstm_inferences_training_method_pk() -> None:

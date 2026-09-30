@@ -136,6 +136,12 @@ function buildJobFieldsPayload(job: Job, fields: JobFieldsState): JobRunOverride
           ohlc_update_batch_size: fields.ohlcUpdateBatchSize,
         }
       : {}),
+    ...(job.has_grouped_daily_fields
+      ? {
+          ohlc_update_start_date: fields.ohlcUpdateStartDate || null,
+          ohlc_update_end_date: fields.ohlcUpdateEndDate || null,
+        }
+      : {}),
     ...(job.has_lstm_training_fields
       ? {
           lstm_train_start_date: fields.lstmTrainStartDate || null,
@@ -683,6 +689,7 @@ export function JobCard({
                 !job.has_monte_carlo_fields &&
                 !job.has_ohlc_bars_fields &&
                 !job.has_ohlc_update_fields &&
+                !job.has_grouped_daily_fields &&
                 !job.has_lstm_training_fields &&
                 !job.has_lstm_walkforward_fields &&
                 !job.has_lstm_inference_fields &&
@@ -978,6 +985,36 @@ export function JobCard({
                     retried in the same-size batches once all have been updated, waiting 2x, 4x, then 8x the
                     schedule interval before each of up to 3 retries; after that the job pauses until the next day
                     at its start time. A manual run syncs every selected ticker at once.
+                  </p>
+                </>
+              )}
+
+              {job.has_grouped_daily_fields && (
+                <>
+                  <div className="job-field-row">
+                    <label className="job-field">
+                      Start date (UTC)
+                      <input
+                        type="date"
+                        value={ohlcUpdateStartDate}
+                        onChange={(e) => setOhlcUpdateStartDate(e.target.value)}
+                      />
+                    </label>
+                    <label className="job-field">
+                      End date (UTC)
+                      <input
+                        type="date"
+                        value={ohlcUpdateEndDate}
+                        onChange={(e) => setOhlcUpdateEndDate(e.target.value)}
+                      />
+                    </label>
+                  </div>
+                  <p className="job-field-hint">
+                    Leave end date blank to default to today, and start date blank to default to 7 days before the
+                    end date. Makes one request per weekday in the range, each returning every stock's daily bar
+                    for that day, and overwrites any daily bar already stored for those days. Only the selected
+                    tickers are stored (every non-forex ticker if none is selected above). Days that fail are
+                    retried once the rest are done, up to 3 times, waiting 1, 2, then 4 minutes before each retry.
                   </p>
                 </>
               )}

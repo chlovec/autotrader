@@ -32,7 +32,7 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from data.client import DataClient
-from db.models import JobConfig, Ticker
+from db.models import NOT_FOREX, JobConfig, Ticker
 from jobs.control import JobControl
 from jobs.registry import OHLC_UPDATE_JOB
 from jobs.sync_bars import DEFAULT_MAX_WORKERS, sync_bars_manual
@@ -108,7 +108,7 @@ def _select_batch(
         if after is not None:
             candidates = [ticker for ticker in candidates if ticker > after]
         return candidates[:limit]
-    query = select(Ticker.ticker).order_by(Ticker.ticker).limit(limit)
+    query = select(Ticker.ticker).where(NOT_FOREX).order_by(Ticker.ticker).limit(limit)
     if ticker_types:
         query = query.where(Ticker.type.in_(ticker_types))
     if after is not None:

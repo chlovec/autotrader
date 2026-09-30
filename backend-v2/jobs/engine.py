@@ -50,6 +50,7 @@ from jobs.registry import (
     BACKTEST_MARKET_STATE_JOB,
     BARS_JOB,
     ETF_CONSTITUENTS_JOB,
+    GROUPED_DAILY_JOB,
     INDICATOR_NAMES,
     JOB_CONFIG_DATE_FIELDS,
     JOB_DEFINITIONS,
@@ -76,6 +77,8 @@ from jobs.ohlc_update import resolve_date_range as resolve_ohlc_update_date_rang
 from jobs.ohlc_update import resume_at as ohlc_update_resume_at
 from jobs.ohlc_update import sync_ohlc_update_batch
 from jobs.research_picks import compute_research_picks
+from jobs.sync_grouped_daily import resolve_date_range as resolve_grouped_daily_date_range
+from jobs.sync_grouped_daily import sync_grouped_daily
 from jobs.sync_bars import (
     DEFAULT_BACKFILL_DAYS,
     DEFAULT_END_DATE_OFFSET_DAYS,
@@ -542,6 +545,30 @@ async def run_job(job_name: str, trigger: str) -> None:
                     run_id=run_id,
                 )
                 summary = f"{len(results)} ticker(s) synced, {sum(results.values())} bar(s) fetched"
+        elif job_name == GROUPED_DAILY_JOB:
+            # One request per day for the whole market, so no per-ticker thread pool -
+            # see jobs/sync_grouped_daily.py.
+            start_date, end_date = resolve_grouped_daily_date_range(
+                config.ohlc_update_start_date, config.ohlc_update_end_date
+            )
+            grouped = await asyncio.to_thread(
+                sync_grouped_daily,
+                session,
+                start_date,
+                end_date,
+                split_csv(config.ticker_types),
+                split_csv(config.tickers),
+                control=control,
+                run_id=run_id,
+            )
+            summary = (
+                f"{len(grouped.results)} day(s) synced ({start_date} to {end_date}), "
+                f"{sum(grouped.results.values())} bar(s) stored"
+            )
+            if grouped.retry_rounds:
+                summary += f", {grouped.retry_rounds} retry round(s)"
+            if grouped.failed:
+                summary += f" - still failing: {', '.join(day.isoformat() for day in grouped.failed)}"
         else:
             async with DataClient() as client:
                 if job_name == TICKERS_JOB:

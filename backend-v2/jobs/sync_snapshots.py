@@ -24,7 +24,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from data.client import DataClient
-from db.models import CurrentSnapshot, Ticker
+from db.models import CurrentSnapshot, NOT_FOREX, Ticker
 from db.session import SessionLocal, init_db
 from jobs.control import JobCancelled, JobControl, report_job_progress
 
@@ -95,7 +95,7 @@ def _resolve_tickers(session: Session, ticker_types: list[str] | None, tickers: 
         raise ValueError("specify tickers or ticker_types, not both")
     if tickers:
         return list(tickers)
-    query = select(Ticker.ticker)
+    query = select(Ticker.ticker).where(NOT_FOREX)
     if ticker_types:
         query = query.where(Ticker.type.in_(ticker_types))
     return list(session.scalars(query))
