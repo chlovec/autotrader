@@ -9,6 +9,7 @@ import {
 import { NUMERIC_FILTER_OPS, type NumericFilterOp } from '../numericFilter'
 import { loadReportParams, saveReportParams } from '../reportParams'
 import { ReportGrid, type ReportColumn } from './ReportGrid'
+import { BuySellPatternModal } from './BuySellPatternModal'
 import { SearchableSelect, type SelectOption } from './SearchableSelect'
 import { TickerDetailsModal } from './TickerDetailsModal'
 
@@ -191,6 +192,7 @@ export function TradingSymbolsPage() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [detailsRow, setDetailsRow] = useState<TradingSymbolRow | null>(null)
+  const [patternRow, setPatternRow] = useState<TradingSymbolRow | null>(null)
 
   // Fetched once as a static list (rather than SearchableSelect's onSearch, which only
   // queries once the user types) so the dropdown opens showing every ticker type right
@@ -307,8 +309,8 @@ export function TradingSymbolsPage() {
     <div className="report-page">
       <h1 className="jobs-page-title">Trading Symbols</h1>
       <p className="jobs-page-subtitle">
-        Every synced ticker with its reference data, average volume, and latest snapshot. Optionally filter by
-        ticker type or specific tickers before running.
+        Every ticker in the latest market predictions with its reference data, average volume, and latest snapshot.
+        Optionally filter by ticker type or specific tickers before running.
       </p>
 
       <div className="report-controls">
@@ -522,7 +524,10 @@ export function TradingSymbolsPage() {
             formatCell={formatCell}
             emptyMessage="No symbols found."
             storageKey="trading-symbols"
-            rowContextMenu={[{ label: 'View Details', onSelect: setDetailsRow }]}
+            rowContextMenu={[
+              { label: 'View Details', onSelect: setDetailsRow },
+              { label: 'Buy Sell Pattern', onSelect: setPatternRow },
+            ]}
           />
           <div className="report-pager">
             <button
@@ -577,6 +582,14 @@ export function TradingSymbolsPage() {
           columns={COLUMNS}
           formatCell={formatCell}
           onClose={() => setDetailsRow(null)}
+        />
+      )}
+
+      {patternRow && (
+        <BuySellPatternModal
+          ticker={patternRow.ticker}
+          title={`${patternRow.ticker} - Buy Sell Pattern`}
+          onClose={() => setPatternRow(null)}
         />
       )}
     </div>

@@ -2,7 +2,7 @@
 
 import datetime as dt
 
-from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -76,13 +76,16 @@ class TickerGroup(Base):
     just a caller-chosen label rather than a foreign key into a separate group-catalog
     table, since a group here carries no metadata of its own beyond its name.
 
-    created_at records when the ticker was added to the group."""
+    created_at records when the ticker was added to the group. sort_order is the
+    ticker's operator-set position within its group (see app/main.py's
+    reorder_watchlist), ascending; NULL sorts after every ordered row, newest first."""
 
     __tablename__ = "ticker_groups"
 
     ticker: Mapped[str] = mapped_column(ForeignKey("tickers.ticker"), primary_key=True)
     group: Mapped[str] = mapped_column(String, primary_key=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
+    sort_order: Mapped[int | None] = mapped_column(Integer)
 
 
 class SyncState(Base):
@@ -126,6 +129,11 @@ class OhlcBar(Base):
     without colliding. Upserted by jobs/sync_bars.py."""
 
     __tablename__ = "ohlc_bars"
+    # The primary key leads with ticker, so it can't serve "latest bar of a given
+    # granularity across all tickers" (e.g. MAX(timestamp) WHERE multiplier = 1 AND
+    # timespan = 'day') without a full scan - this index can. See db/session.py's
+    # _add_ohlc_bars_span_timestamp_index for databases created before it existed.
+    __table_args__ = (Index("ix_ohlc_bars_span_ts", "multiplier", "timespan", "timestamp"),)
 
     ticker: Mapped[str] = mapped_column(ForeignKey("tickers.ticker"), primary_key=True)
     multiplier: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -1262,6 +1270,18 @@ class JobConfig(Base):
     statistics.NormalDist().inv_cdf at run time - see WinRate.mcmc_range_win_rate
     below for what it's used for.
 
+    buy_sell_pattern_start_date/buy_sell_pattern_end_date/buy_sell_pattern_name only
+    apply to the buy-sell-pattern job (registry.JobDefinition.has_buy_sell_pattern_fields).
+    Both dates are required at run time - there's no default range. The name labels the
+    run's rows in buy_sell_patterns and is only honoured on a manual run; an auto run,
+    or a manual run with it blank, uses "<start_date>_<end_date>" (see
+    jobs/buy_sell_pattern.py's resolve_pattern_name). buy_sell_pattern_replace is a
+    run-only flag carried in run_overrides when the dashboard's user has accepted
+    replacing an existing name's rows - it's never saved as a lasting setting, so an
+    auto run always sees None and fails on a name conflict instead of replacing.
+    buy_sell_pattern_batch_size is how many tickers the job loads, solves, and commits
+    per batch; NULL uses jobs/buy_sell_pattern.py's TICKER_BATCH_SIZE.
+
     run_requested_at is how app/main.py (the API process) asks job_runner.py (the
     separate process that actually executes jobs - see jobs/engine.py) to run this job
     now: POST /jobs/{name}/run sets it, job_runner.py's poll_run_requests clears it
@@ -1320,6 +1340,13 @@ class JobConfig(Base):
     lstm_model_version_id: Mapped[int | None] = mapped_column(Integer)
     prediction_accuracy_pass_threshold_std: Mapped[float | None] = mapped_column(Float)
     win_rate_mcmc_range_confidence_level: Mapped[float | None] = mapped_column(Float)
+    buy_sell_pattern_start_date: Mapped[dt.date | None] = mapped_column(Date)
+    buy_sell_pattern_end_date: Mapped[dt.date | None] = mapped_column(Date)
+    buy_sell_pattern_name: Mapped[str | None] = mapped_column(String)
+    buy_sell_pattern_batch_size: Mapped[int | None] = mapped_column(Integer)
+    # Only ever set through run_overrides, never by PUT /jobs/{name}/config - see the
+    # docstring above.
+    buy_sell_pattern_replace: Mapped[bool | None] = mapped_column(Boolean)
     # Hides the job's card from the Jobs page's default list (see app/main.py's
     # list_jobs) without affecting its schedule - a hidden job still runs normally.
     hidden: Mapped[bool] = mapped_column(default=False)

@@ -88,6 +88,10 @@ type JobFieldsState = {
   lstmModelVersionId: number | string
   predictionAccuracyPassThresholdStd: number
   winRateMcmcRangeConfidenceLevel: number
+  buySellPatternStartDate: string
+  buySellPatternEndDate: string
+  buySellPatternName: string
+  buySellPatternBatchSize: number
 }
 
 // Gates each field by job.has_* the same way JobCard's render order decides which
@@ -161,6 +165,14 @@ function buildJobFieldsPayload(job: Job, fields: JobFieldsState): JobRunOverride
       : {}),
     ...(job.has_win_rate_fields
       ? { win_rate_mcmc_range_confidence_level: fields.winRateMcmcRangeConfidenceLevel }
+      : {}),
+    ...(job.has_buy_sell_pattern_fields
+      ? {
+          buy_sell_pattern_start_date: fields.buySellPatternStartDate || null,
+          buy_sell_pattern_end_date: fields.buySellPatternEndDate || null,
+          buy_sell_pattern_name: fields.buySellPatternName.trim() || null,
+          buy_sell_pattern_batch_size: fields.buySellPatternBatchSize,
+        }
       : {}),
   }
 }
@@ -285,6 +297,11 @@ export function JobCard({
   const [winRateMcmcRangeConfidenceLevel, setWinRateMcmcRangeConfidenceLevel] = useState(
     job.win_rate_mcmc_range_confidence_level ?? 0.95,
   )
+  const [buySellPatternStartDate, setBuySellPatternStartDate] = useState(job.buy_sell_pattern_start_date ?? '')
+  const [buySellPatternEndDate, setBuySellPatternEndDate] = useState(job.buy_sell_pattern_end_date ?? '')
+  const [buySellPatternName, setBuySellPatternName] = useState(job.buy_sell_pattern_name ?? '')
+  // Default 500 matches backend-v2 jobs/buy_sell_pattern.py's TICKER_BATCH_SIZE.
+  const [buySellPatternBatchSize, setBuySellPatternBatchSize] = useState(job.buy_sell_pattern_batch_size ?? 500)
 
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
@@ -338,6 +355,10 @@ export function JobCard({
     lstmModelVersionId,
     predictionAccuracyPassThresholdStd,
     winRateMcmcRangeConfidenceLevel,
+    buySellPatternStartDate,
+    buySellPatternEndDate,
+    buySellPatternName,
+    buySellPatternBatchSize,
   })
 
   const handleSave = async (event: FormEvent) => {
@@ -694,7 +715,8 @@ export function JobCard({
                 !job.has_lstm_walkforward_fields &&
                 !job.has_lstm_inference_fields &&
                 !job.has_prediction_accuracy_fields &&
-                !job.has_win_rate_fields && (
+                !job.has_win_rate_fields &&
+                !job.has_buy_sell_pattern_fields && (
                   <p className="job-field-hint">This job has no run parameters to configure.</p>
                 )}
 
@@ -1175,6 +1197,63 @@ export function JobCard({
                     "range win rate" counts an actual close as a win when it falls within the simulated exit-price
                     distribution's own confidence interval at this level - independent of the direction-only MCMC
                     win rate above.
+                  </p>
+                </>
+              )}
+
+              {job.has_buy_sell_pattern_fields && (
+                <>
+                  <div className="job-field-row">
+                    <label className="job-field">
+                      Start date (UTC)
+                      <input
+                        type="date"
+                        value={buySellPatternStartDate}
+                        onChange={(e) => setBuySellPatternStartDate(e.target.value)}
+                      />
+                    </label>
+                    <label className="job-field">
+                      End date (UTC)
+                      <input
+                        type="date"
+                        value={buySellPatternEndDate}
+                        onChange={(e) => setBuySellPatternEndDate(e.target.value)}
+                      />
+                    </label>
+                  </div>
+                  <div className="job-field-row">
+                    <label className="job-field">
+                      Name
+                      <input
+                        type="text"
+                        value={buySellPatternName}
+                        placeholder={
+                          buySellPatternStartDate && buySellPatternEndDate
+                            ? `${buySellPatternStartDate}_${buySellPatternEndDate}`
+                            : 'start date_end date'
+                        }
+                        onChange={(e) => setBuySellPatternName(e.target.value)}
+                      />
+                    </label>
+                    <label className="job-field">
+                      Tickers per batch
+                      <input
+                        type="number"
+                        min={1}
+                        max={5000}
+                        value={buySellPatternBatchSize}
+                        onChange={(e) => setBuySellPatternBatchSize(Number(e.target.value))}
+                      />
+                    </label>
+                  </div>
+                  <p className="job-field-hint">
+                    Both dates are required. For each selected ticker (every ticker if none is selected above), finds
+                    the buy and sell days that maximize total profit - buying at the day's low and selling at a later
+                    day's high, or the same day's high when that day closes above its low. The name labels this
+                    run's rows in buy_sell_patterns and is only used on a manual run; leave it blank (and auto runs
+                    always) to use the start and end date. If the name is already taken you'll be asked whether to
+                    replace it. Tickers per batch (1-5000) sets how many tickers' bars are held in memory and
+                    committed at once - lower it for long date ranges.
                   </p>
                 </>
               )}

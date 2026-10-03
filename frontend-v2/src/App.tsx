@@ -14,6 +14,7 @@ import { PredictionAccuracyPage } from './components/PredictionAccuracyPage'
 import { ResearchPage } from './components/ResearchPage'
 import { TickerTypesPage } from './components/TickerTypesPage'
 import { SqlConsolePage } from './components/SqlConsolePage'
+import { WatchlistPage } from './components/WatchlistPage'
 
 // Below this width the side menu renders as an overlay drawer (see index.css) and
 // should start closed; at/above it, it renders inline and should start open.
@@ -24,6 +25,7 @@ export type View =
   | 'Positions'
   | 'Signals'
   | 'Research'
+  | 'Watchlist'
   | 'Jobs'
   | 'Analytics'
   | 'Top Movers'
@@ -79,6 +81,8 @@ function App() {
             <PredictionComparisonPage />
           ) : activeView === 'Prediction Accuracy' ? (
             <PredictionAccuracyPage />
+          ) : activeView === 'Watchlist' ? (
+            <WatchlistPage />
           ) : activeView === 'Research' ? (
             <ResearchPage />
           ) : activeView === 'Ticker Types' ? (

@@ -148,7 +148,7 @@ def test_batches_walk_all_tickers_alphabetically_then_complete():
         first = _run(session, config, requested, batch_size=2)
         assert sorted(requested) == ["AAA", "BBB"]
         assert not first.cycle_complete
-        assert session.get(JobConfig, OHLC_UPDATE_JOB).ohlc_update_cursor == "BBB"
+        assert _saved(session).ohlc_update_cursor == "BBB"
 
         requested.clear()
         second = _run(session, config, requested, batch_size=2)
@@ -159,7 +159,7 @@ def test_batches_walk_all_tickers_alphabetically_then_complete():
         third = _run(session, config, requested, batch_size=2)
         assert requested == ["EEE"]
         assert third.cycle_complete
-        saved = session.get(JobConfig, OHLC_UPDATE_JOB)
+        saved = _saved(session)
         assert saved.ohlc_update_cursor is None
         assert saved.ohlc_update_completed_at is not None
     finally:
@@ -255,7 +255,7 @@ def test_empty_selection_completes_the_cycle_immediately():
     try:
         result = _run(session, config, [], batch_size=5000)
         assert result.cycle_complete
-        assert session.get(JobConfig, OHLC_UPDATE_JOB).ohlc_update_completed_at is not None
+        assert _saved(session).ohlc_update_completed_at is not None
     finally:
         session.close()
 

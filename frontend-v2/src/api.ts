@@ -76,6 +76,9 @@ export interface Job {
   // Whether this job offers the single "MCMC range win confidence level" field (see
   // win_rate_mcmc_range_confidence_level below) - only compute-win-rates sets this.
   has_win_rate_fields: boolean
+  // Whether this job offers the Start date/End date/Name group (see
+  // buy_sell_pattern_start_date etc. below) - only buy-sell-pattern sets this.
+  has_buy_sell_pattern_fields: boolean
   // Always the full massive.com asset-class list (jobs/registry.py's
   // SNAPSHOT_TYPE_OPTIONS), regardless of has_snapshot_type_filter - fetched from the
   // backend rather than hardcoded here so the two never drift.
@@ -177,6 +180,17 @@ export interface Job {
   // WinRate.mcmc_range_win_rate. Only meaningful alongside has_win_rate_fields
   // (compute-win-rates).
   win_rate_mcmc_range_confidence_level: number | null
+  // ISO dates ("YYYY-MM-DD"), both required at run time - no default range. Only
+  // meaningful alongside has_buy_sell_pattern_fields (buy-sell-pattern).
+  buy_sell_pattern_start_date: string | null
+  buy_sell_pattern_end_date: string | null
+  // Label for the run's buy_sell_patterns rows, honoured on a manual run only - null
+  // (or an auto run) uses "<start_date>_<end_date>". See backend-v2
+  // jobs/buy_sell_pattern.py's resolve_pattern_name.
+  buy_sell_pattern_name: string | null
+  // Tickers loaded, solved, and committed per batch - lower it to cap memory on a long
+  // date range. null uses backend-v2 jobs/buy_sell_pattern.py's TICKER_BATCH_SIZE (500).
+  buy_sell_pattern_batch_size: number | null
   // Persisted (JobConfig.hidden), not display-only - keeps a job off the Jobs page's
   // default list across reloads until explicitly unhidden. Independent of running/
   // paused: a hidden job still runs on its schedule, it's just tucked away here.
@@ -230,6 +244,10 @@ export interface JobConfigInput {
   lstm_model_version_id?: number | null
   prediction_accuracy_pass_threshold_std?: number | null
   win_rate_mcmc_range_confidence_level?: number | null
+  buy_sell_pattern_start_date?: string | null
+  buy_sell_pattern_end_date?: string | null
+  buy_sell_pattern_name?: string | null
+  buy_sell_pattern_batch_size?: number | null
 }
 
 export interface TickerOption {
@@ -241,6 +259,17 @@ export interface TickerTypeOption {
   code: string
   asset_class: string
   description: string | null
+}
+
+// One ticker the operator has chosen to monitor - backs the Watchlist page. Stored
+// server-side as a ticker_groups row under the "watchlist" group (see app/main.py's
+// watchlist endpoints); name/type/primary_exchange are joined out from tickers.
+export interface WatchlistRow {
+  ticker: string
+  name: string | null
+  type: string | null
+  primary_exchange: string | null
+  added_at: string
 }
 
 export type TickerTypeStatus = 'active' | 'inactive'
@@ -551,6 +580,38 @@ export interface BacktestPoint {
   predicted_exit_price: number
   actual_exit_price: number
   price_error_pct: number
+}
+
+// One buy_sell_patterns run name with stored trades for a ticker - backs the Buy Sell
+// Pattern chart's run picker and its available-date-range hint (see app/main.py's
+// buy_sell_pattern_runs). Dates are ISO ("YYYY-MM-DD"); trades counts buy/sell pairs.
+export interface BuySellPatternRun {
+  name: string
+  first_trade_date: string
+  last_trade_date: string
+  trades: number
+}
+
+export interface BuySellPatternBar {
+  date: string
+  low: number | null
+  high: number | null
+  close: number
+}
+
+export interface BuySellPatternTrade {
+  buy_date: string
+  buy_price: number
+  sell_date: string
+  sell_price: number
+  profit: number
+}
+
+// See app/main.py's buy_sell_pattern_report - only trades whose buy and sell both fall
+// inside the requested range are returned.
+export interface BuySellPatternReport {
+  bars: BuySellPatternBar[]
+  trades: BuySellPatternTrade[]
 }
 
 // One row per ticker that has a Markov chain prediction (jobs/predict_market_state.py,
@@ -1054,6 +1115,15 @@ async function postJSONBody<T>(path: string, body: unknown): Promise<T> {
   return res.json()
 }
 
+async function deleteJSON<T>(path: string): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, { method: 'DELETE' })
+  if (!res.ok) {
+    const detail = await res.json().catch(() => null)
+    throw new Error(detail?.detail ?? `${path} failed: ${res.status}`)
+  }
+  return res.json()
+}
+
 // Fills in abs_expected_return_pct on a report row fetched from the backend, which only
 // sends expected_return (a signed fraction, e.g. -0.29) - shared by both report fetches
 // below so the derivation lives in one place.
@@ -1093,9 +1163,19 @@ function addNumericFilter(qs: URLSearchParams, prefix: string, filter?: NumericF
 export type JobRunOverrides = Omit<
   JobConfigInput,
   'run_type' | 'schedule_interval_unit' | 'schedule_interval_value' | 'start_time'
->
+> & {
+  // Run-only, never saved: set after the user accepts replacing an existing
+  // buy-sell-pattern name's rows (see the 'name-conflict' TriggerJobResult below).
+  buy_sell_pattern_replace?: boolean
+}
 
-export type TriggerJobResult = { status: 'started' } | { status: 'already-running' }
+// 'name-conflict' is buy-sell-pattern's 409 when the run's resolved name already has
+// rows (see app/main.py's _check_buy_sell_pattern_name) - re-send with a different
+// buy_sell_pattern_name, or with buy_sell_pattern_replace: true.
+export type TriggerJobResult =
+  | { status: 'started' }
+  | { status: 'already-running' }
+  | { status: 'name-conflict'; name: string }
 
 // Mirrors app/main.py's run_adhoc_query response - "rows" for SELECT/anything else
 // CursorResult.returns_rows is true for, "statement" for INSERT/UPDATE/DELETE/DDL.
@@ -1119,7 +1199,11 @@ export const api = {
       method: 'POST',
       ...(overrides ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(overrides) } : {}),
     })
-    if (res.status === 409) return { status: 'already-running' }
+    if (res.status === 409) {
+      const body = await res.json().catch(() => null)
+      if (body?.detail?.code === 'name_conflict') return { status: 'name-conflict', name: body.detail.name }
+      return { status: 'already-running' }
+    }
     if (!res.ok) {
       const detail = await res.json().catch(() => null)
       throw new Error(detail?.detail ?? `trigger ${name} failed: ${res.status}`)
@@ -1139,6 +1223,10 @@ export const api = {
   searchTickerTypes: (q: string, limit = 20) =>
     getJSON<TickerTypeOption[]>(`/ticker-types/search?q=${encodeURIComponent(q)}&limit=${limit}`),
   tickerTypes: () => getJSON<TickerTypeRow[]>('/ticker-types'),
+  watchlist: () => getJSON<WatchlistRow[]>('/watchlist'),
+  addToWatchlist: (ticker: string) => postJSONBody<WatchlistRow>('/watchlist', { ticker }),
+  reorderWatchlist: (tickers: string[]) => postJSONBody<WatchlistRow[]>('/watchlist/reorder', { tickers }),
+  removeFromWatchlist: (ticker: string) => deleteJSON<{ ticker: string }>(`/watchlist/${encodeURIComponent(ticker)}`),
   updateTickerType: (code: string, assetClass: string, locale: string, body: TickerTypeUpdateInput) =>
     putJSON<TickerTypeRow>(
       `/ticker-types/${encodeURIComponent(code)}/${encodeURIComponent(assetClass)}/${encodeURIComponent(locale)}`,
@@ -1260,6 +1348,13 @@ export const api = {
   backtestReport: (ticker: string, startDate?: string, endDate?: string) =>
     getJSON<BacktestPoint[]>(
       `/reports/backtest?ticker=${encodeURIComponent(ticker)}&start_date=${encodeURIComponent(startDate ?? '')}&end_date=${encodeURIComponent(endDate ?? '')}`,
+    ),
+  buySellPatternRuns: (ticker: string) =>
+    getJSON<BuySellPatternRun[]>(`/reports/buy-sell-pattern/runs?ticker=${encodeURIComponent(ticker)}`),
+  // startDate/endDate are ISO dates ("YYYY-MM-DD"), both required.
+  buySellPatternReport: (ticker: string, name: string, startDate: string, endDate: string) =>
+    getJSON<BuySellPatternReport>(
+      `/reports/buy-sell-pattern?ticker=${encodeURIComponent(ticker)}&name=${encodeURIComponent(name)}&start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}`,
     ),
   // startDate/endDate are ISO dates ("YYYY-MM-DD"); each independently defaults to
   // today (UTC) server-side when omitted - see app/main.py's

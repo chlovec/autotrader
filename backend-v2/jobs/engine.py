@@ -27,6 +27,12 @@ from db.models import JobConfig, JobRun
 from db.session import SessionLocal
 from jobs.average_volume import DEFAULT_DAYS_INTERVAL, compute_average_volume
 from jobs.backtest_market_state import compute_market_state_backtest
+from jobs.buy_sell_pattern import (
+    TICKER_BATCH_SIZE,
+    compute_buy_sell_pattern,
+    resolve_pattern_name,
+    validate_date_range,
+)
 from jobs.config_store import get_or_create_config, interval_trigger, split_csv
 from jobs.control import JobCancelled, JobControl
 from jobs.lstm_common import (
@@ -49,6 +55,7 @@ from jobs.registry import (
     AVERAGE_VOLUME_JOB,
     BACKTEST_MARKET_STATE_JOB,
     BARS_JOB,
+    BUY_SELL_PATTERN_JOB,
     ETF_CONSTITUENTS_JOB,
     GROUPED_DAILY_JOB,
     INDICATOR_NAMES,
@@ -452,6 +459,33 @@ async def run_job(job_name: str, trigger: str) -> None:
                 control=control,
             )
             summary = f"{count} result(s) backtested"
+        elif job_name == BUY_SELL_PATTERN_JOB:
+            # Same reasoning as the backtest branch above - purely local, off the event
+            # loop via asyncio.to_thread. buy_sell_pattern_replace only ever arrives via
+            # a manual run's overrides (see db/models.py's JobConfig), so an auto run
+            # with a conflicting name fails rather than replacing.
+            start_date, end_date = validate_date_range(
+                config.buy_sell_pattern_start_date, config.buy_sell_pattern_end_date
+            )
+            pattern = await asyncio.to_thread(
+                compute_buy_sell_pattern,
+                session,
+                start_date,
+                end_date,
+                resolve_pattern_name(config.buy_sell_pattern_name, start_date, end_date, trigger),
+                split_csv(config.ticker_types),
+                split_csv(config.tickers),
+                replace=bool(config.buy_sell_pattern_replace) and trigger == "manual",
+                batch_size=config.buy_sell_pattern_batch_size or TICKER_BATCH_SIZE,
+                control=control,
+                run_id=run_id,
+            )
+            summary = (
+                f"{pattern.trades} trade(s) across {pattern.tickers} ticker(s) stored as {pattern.name!r} "
+                f"({start_date} to {end_date})"
+            )
+            if pattern.replaced:
+                summary += " - replaced existing rows"
         elif job_name in INDICATOR_NAMES:
             # Same no-shared-DataClient reasoning as the snapshots branch above -
             # sync_indicator fans out across its own thread pool of per-worker clients.

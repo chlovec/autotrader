@@ -22,6 +22,7 @@ const NAV_ITEMS: NavItem[] = [
   { view: 'Positions' },
   { view: 'Signals' },
   { view: 'Research' },
+  { view: 'Watchlist' },
   { view: 'Jobs' },
   {
     view: 'Analytics',

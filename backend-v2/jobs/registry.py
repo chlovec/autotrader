@@ -59,6 +59,7 @@ TRAIN_LSTM_WALKFORWARD_JOB = "train-lstm-walkforward"
 # (ticker, predicted_date, training_method) row - see db/models.py's LstmInference.
 PREDICT_LSTM_HOLDOUT_JOB = "predict-lstm-market-state-holdout"
 PREDICT_LSTM_WALKFORWARD_JOB = "predict-lstm-market-state-walkforward"
+BUY_SELL_PATTERN_JOB = "buy-sell-pattern"
 
 # job name -> training_method - jobs/engine.py's run_job looks up which of the two
 # flavors a given predict-lstm-market-state-* job name is via this dict, same "job name
@@ -101,6 +102,8 @@ JOB_CONFIG_DATE_FIELDS: frozenset[str] = frozenset(
         "ohlc_update_end_date",
         "lstm_train_start_date",
         "lstm_train_end_date",
+        "buy_sell_pattern_start_date",
+        "buy_sell_pattern_end_date",
     }
 )
 
@@ -141,6 +144,7 @@ DEFAULT_SCHEDULES: dict[str, tuple[str, int]] = {
     TRAIN_LSTM_WALKFORWARD_JOB: ("days", 1),
     PREDICT_LSTM_HOLDOUT_JOB: ("days", 1),
     PREDICT_LSTM_WALKFORWARD_JOB: ("days", 1),
+    BUY_SELL_PATTERN_JOB: ("days", 1),
 }
 
 
@@ -268,6 +272,10 @@ class JobDefinition:
     # has_prediction_accuracy_fields; also paired with has_ticker_selector, so a run
     # can be scoped to a handful of tickers.
     has_win_rate_fields: bool = False
+    # Whether this job offers the "Start date"/"End date"/"Name" group (see
+    # jobs/buy_sell_pattern.py) - only the buy-sell-pattern job takes this. Also paired
+    # with has_ticker_selector on that job, to scope which tickers get computed.
+    has_buy_sell_pattern_fields: bool = False
     # Seeded into JobConfig.run_type the first time this job's config row is created
     # (see app/main.py's _get_or_create_config). "auto" unless overridden below.
     default_run_type: str = "auto"
@@ -753,6 +761,29 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
         has_predicted_date_offset_field=True,
         has_prediction_start_date_field=True,
         has_lstm_inference_fields=True,
+        default_run_type="manual",
+    ),
+    BUY_SELL_PATTERN_JOB: JobDefinition(
+        name=BUY_SELL_PATTERN_JOB,
+        label="Buy/sell pattern",
+        description=(
+            "For each selected ticker, finds the buy and sell days across the Start "
+            "date/End date range that maximize total profit from daily ohlc_bars - any "
+            "number of non-overlapping trades, each buying at the buy day's low and "
+            "selling at the sell day's high. A trade can buy and sell on the same day "
+            "only if that day's close is above its low; otherwise it sells on a later "
+            "day. Stores one buy row and one sell row per trade in the "
+            "buy_sell_patterns table under a name - by default the start and end date "
+            "(e.g. 2026-01-01_2026-03-31), or the Name field on a manual run. If that "
+            "name already has rows, a manual run asks whether to replace them or pick "
+            "another name; an auto run fails. Purely local - no massive.com call, reads "
+            "bars already synced by the bars jobs."
+        ),
+        has_bars_fields=False,
+        has_ticker_selector=True,
+        has_buy_sell_pattern_fields=True,
+        # Run-on-demand analysis over an explicit date range - manual by default, same
+        # reasoning as backtest-market-state.
         default_run_type="manual",
     ),
 }

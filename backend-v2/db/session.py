@@ -65,6 +65,7 @@ def init_db() -> None:
     _add_market_predictions_exit_price_confidence_column()
     _add_ohlc_bars_pcnt_increase_column()
     _convert_ohlc_bars_pcnt_increase_generated_column()
+    _add_ohlc_bars_span_timestamp_index()
     _drop_ticker_bar_sync_state_table()
     _add_tickers_last_ohlc_sync_date_column()
     _add_ticker_types_rank_status_columns()
@@ -79,6 +80,8 @@ def init_db() -> None:
     _add_job_configs_win_rate_mcmc_range_confidence_level_column()
     _add_win_rates_mcmc_range_columns()
     _add_ticker_details_columns()
+    _add_job_configs_buy_sell_pattern_columns()
+    _add_ticker_groups_sort_order_column()
 
 
 def _add_column_if_missing(table: str, column: str, ddl_type: str) -> None:
@@ -253,6 +256,23 @@ def _convert_ohlc_bars_pcnt_increase_generated_column() -> None:
         conn.execute(text("ALTER TABLE ohlc_bars RENAME COLUMN pcnt_gain TO pcnt_increase"))
 
 
+def _add_ohlc_bars_span_timestamp_index() -> None:
+    """Base.metadata.create_all only creates indexes alongside tables it creates, so an
+    existing ohlc_bars (live data predating ix_ohlc_bars_span_ts in db/models.py's
+    OhlcBar) never gets the index from it - this adds it. IF NOT EXISTS makes it a
+    no-op on every startup after the first."""
+    inspector = inspect(engine)
+    if "ohlc_bars" not in inspector.get_table_names():
+        return
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_ohlc_bars_span_ts "
+                "ON ohlc_bars (multiplier, timespan, timestamp)"
+            )
+        )
+
+
 def _drop_ticker_bar_sync_state_table() -> None:
     """ticker_bar_sync_state (db/models.py's now-removed TickerBarSyncState) used to
     track each ticker's "synced through" cursor separately from ohlc_bars itself - that
@@ -424,6 +444,22 @@ def _add_ticker_details_columns() -> None:
     _add_column_if_missing("ticker_details", "address_postal_code", "VARCHAR")
     _add_column_if_missing("ticker_details", "branding_logo_url", "VARCHAR")
     _add_column_if_missing("ticker_details", "branding_icon_url", "VARCHAR")
+
+
+def _add_job_configs_buy_sell_pattern_columns() -> None:
+    """See db/models.py's JobConfig.buy_sell_pattern_* - added after job_configs itself,
+    left NULL on existing rows."""
+    _add_job_configs_column("buy_sell_pattern_start_date", "DATE")
+    _add_job_configs_column("buy_sell_pattern_end_date", "DATE")
+    _add_job_configs_column("buy_sell_pattern_name", "VARCHAR")
+    _add_job_configs_column("buy_sell_pattern_replace", "BOOLEAN")
+    _add_job_configs_column("buy_sell_pattern_batch_size", "INTEGER")
+
+
+def _add_ticker_groups_sort_order_column() -> None:
+    """See db/models.py's TickerGroup.sort_order - added after ticker_groups itself,
+    left NULL on existing rows, which sort after every explicitly ordered row."""
+    _add_column_if_missing("ticker_groups", "sort_order", "INTEGER")
 
 
 def get_session() -> Session:

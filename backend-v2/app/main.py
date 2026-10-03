@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session, aliased
 from db.models import (
     AverageVolume,
     Base,
+    BuySellPattern,
     CurrentSnapshot,
     JobConfig,
     JobRun,
@@ -47,18 +48,21 @@ from db.models import (
     TechnicalIndicator,
     Ticker,
     TickerDetail,
+    TickerGroup,
     TickerType,
     TopMarketMover,
     UnifiedSnapshot,
     WinRate,
 )
 from db.session import SessionLocal, init_db
+from jobs.buy_sell_pattern import MAX_TICKER_BATCH_SIZE, pattern_name_exists, resolve_pattern_name
 from jobs.config_store import get_or_create_config, interval_trigger, job_is_active, split_csv
 from jobs.lstm_common import DEFAULT_WALKFORWARD_NUM_FOLDS
 from jobs.registry import (
     AVERAGE_VOLUME_JOB,
     BACKTEST_MARKET_STATE_JOB,
     BARS_JOB,
+    BUY_SELL_PATTERN_JOB,
     DEFAULT_START_TIME,
     ETF_CONSTITUENTS_JOB,
     GROUPED_DAILY_JOB,
@@ -188,6 +192,7 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         "has_lstm_inference_fields": definition.has_lstm_inference_fields,
         "has_prediction_accuracy_fields": definition.has_prediction_accuracy_fields,
         "has_win_rate_fields": definition.has_win_rate_fields,
+        "has_buy_sell_pattern_fields": definition.has_buy_sell_pattern_fields,
         "snapshot_type_options": SNAPSHOT_TYPE_OPTIONS,
         "run_type": config.run_type,
         "schedule_interval_unit": config.schedule_interval_unit,
@@ -234,6 +239,14 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         "lstm_model_version_id": config.lstm_model_version_id,
         "prediction_accuracy_pass_threshold_std": config.prediction_accuracy_pass_threshold_std,
         "win_rate_mcmc_range_confidence_level": config.win_rate_mcmc_range_confidence_level,
+        "buy_sell_pattern_start_date": (
+            config.buy_sell_pattern_start_date.isoformat() if config.buy_sell_pattern_start_date else None
+        ),
+        "buy_sell_pattern_end_date": (
+            config.buy_sell_pattern_end_date.isoformat() if config.buy_sell_pattern_end_date else None
+        ),
+        "buy_sell_pattern_name": config.buy_sell_pattern_name,
+        "buy_sell_pattern_batch_size": config.buy_sell_pattern_batch_size,
         "hidden": config.hidden,
         "sort_order": config.sort_order,
         "running": config.run_requested_at is not None or run is not None,
@@ -285,6 +298,7 @@ _RESET_TABLES: dict[str, list[type[Base]]] = {
     WIN_RATE_JOB: [WinRate],
     PREDICTION_ACCURACY_JOB: [PredictionAccuracy],
     RESEARCH_PICKS_JOB: [ResearchPick],
+    BUY_SELL_PATTERN_JOB: [BuySellPattern],
     # train-lstm-holdout/train-lstm-walkforward share the lstm_model_versions table
     # (distinguished by training_method), and predict-lstm-market-state-holdout/
     # -walkforward share lstm_inferences (also distinguished by training_method) - the
@@ -356,6 +370,10 @@ class _JobFieldsIn(BaseModel):
     lstm_model_version_id: int | None = None
     prediction_accuracy_pass_threshold_std: float | None = None
     win_rate_mcmc_range_confidence_level: float | None = None
+    buy_sell_pattern_start_date: str | None = None
+    buy_sell_pattern_end_date: str | None = None
+    buy_sell_pattern_name: str | None = None
+    buy_sell_pattern_batch_size: int | None = None
 
 
 class JobConfigIn(_JobFieldsIn):
@@ -370,7 +388,13 @@ class JobRunOverridesIn(_JobFieldsIn):
     whatever a job's card currently shows (saved or not - see frontend-v2's
     JobCard.tsx/RunJobModal.tsx) as a one-time override for just that run, so a manual
     run never silently falls back to a stale saved JobConfig field. No run_type/
-    schedule_* fields here - those only make sense for a saved, recurring config."""
+    schedule_* fields here - those only make sense for a saved, recurring config.
+
+    buy_sell_pattern_replace is the one run-only field: the dashboard sends it after
+    the user accepts replacing an existing buy-sell-pattern name's rows (see
+    trigger_job's name-conflict 409)."""
+
+    buy_sell_pattern_replace: bool = False
 
 
 class JobReorderIn(BaseModel):
@@ -384,6 +408,14 @@ class TickerTypeUpdateIn(BaseModel):
 
 class AdhocQueryIn(BaseModel):
     sql: str
+
+
+class WatchlistAddIn(BaseModel):
+    ticker: str
+
+
+class WatchlistReorderIn(BaseModel):
+    tickers: list[str]
 
 
 @app.get("/health")
@@ -477,6 +509,111 @@ def search_tickers(q: str = "", limit: int = 20) -> list[dict]:
         query = query.order_by(Ticker.ticker).limit(limit)
         rows = session.execute(query).all()
         return [{"ticker": row.ticker, "name": row.name} for row in rows]
+
+
+# The Watchlist page's tickers are stored as ticker_groups rows under this one group
+# label (see db/models.py's TickerGroup) rather than in a table of their own.
+WATCHLIST_GROUP = "watchlist"
+
+
+def _watchlist_rows(session: Session) -> list[dict]:
+    rows = session.execute(
+        select(TickerGroup.ticker, TickerGroup.created_at, Ticker.name, Ticker.type, Ticker.primary_exchange)
+        .outerjoin(Ticker, Ticker.ticker == TickerGroup.ticker)
+        .where(TickerGroup.group == WATCHLIST_GROUP)
+        .order_by(
+            TickerGroup.sort_order.is_(None),
+            TickerGroup.sort_order,
+            TickerGroup.created_at.desc(),
+            TickerGroup.ticker,
+        )
+    ).all()
+    return [
+        {
+            "ticker": row.ticker,
+            "name": row.name,
+            "type": row.type,
+            "primary_exchange": row.primary_exchange,
+            "added_at": row.created_at.isoformat(),
+        }
+        for row in rows
+    ]
+
+
+@app.get("/watchlist")
+def list_watchlist() -> list[dict]:
+    """Backs the Watchlist page - every ticker the operator has chosen to monitor,
+    joined out to the tickers table for name/type/exchange, in the operator's chosen
+    order (see reorder_watchlist below)."""
+    with SessionLocal() as session:
+        return _watchlist_rows(session)
+
+
+@app.post("/watchlist")
+def add_to_watchlist(body: WatchlistAddIn) -> dict:
+    """Adds one ticker to the watchlist. The ticker must already exist in the tickers
+    table - SQLite doesn't enforce TickerGroup's foreign key on its own, so this checks
+    explicitly rather than letting a typo land as an orphaned row."""
+    symbol = body.ticker.strip().upper()
+    if not symbol:
+        raise HTTPException(status_code=400, detail="ticker is required")
+    with SessionLocal() as session:
+        ticker = session.get(Ticker, symbol)
+        if ticker is None:
+            raise HTTPException(status_code=404, detail=f"unknown ticker {symbol!r}")
+        if session.get(TickerGroup, (symbol, WATCHLIST_GROUP)) is not None:
+            raise HTTPException(status_code=409, detail=f"{symbol} is already on the watchlist")
+        # A new ticker goes to the top of the list, one slot above the current first.
+        top = session.execute(
+            select(func.min(TickerGroup.sort_order)).where(TickerGroup.group == WATCHLIST_GROUP)
+        ).scalar()
+        entry = TickerGroup(
+            ticker=symbol,
+            group=WATCHLIST_GROUP,
+            created_at=dt.datetime.now(dt.timezone.utc).replace(tzinfo=None),
+            sort_order=0 if top is None else top - 1,
+        )
+        session.add(entry)
+        session.commit()
+        return {
+            "ticker": symbol,
+            "name": ticker.name,
+            "type": ticker.type,
+            "primary_exchange": ticker.primary_exchange,
+            "added_at": entry.created_at.isoformat(),
+        }
+
+
+@app.post("/watchlist/reorder")
+def reorder_watchlist(body: WatchlistReorderIn) -> list[dict]:
+    """Persists the Watchlist page's new order: body.tickers is every watchlist ticker
+    in the desired order, stored as each one's list index - same shape as
+    reorder_jobs. Must be exactly the current watchlist, so a reorder sent from a
+    stale page (e.g. after a ticker was added or removed in another tab) is rejected
+    rather than silently dropping or reviving entries."""
+    tickers = [t.upper() for t in body.tickers]
+    with SessionLocal() as session:
+        entries = {
+            entry.ticker: entry
+            for entry in session.execute(select(TickerGroup).where(TickerGroup.group == WATCHLIST_GROUP)).scalars()
+        }
+        if len(tickers) != len(set(tickers)) or set(tickers) != set(entries):
+            raise HTTPException(status_code=409, detail="watchlist changed since it was loaded - reload and try again")
+        for index, ticker in enumerate(tickers):
+            entries[ticker].sort_order = index
+        session.commit()
+        return _watchlist_rows(session)
+
+
+@app.delete("/watchlist/{ticker}")
+def remove_from_watchlist(ticker: str) -> dict:
+    with SessionLocal() as session:
+        entry = session.get(TickerGroup, (ticker.upper(), WATCHLIST_GROUP))
+        if entry is None:
+            raise HTTPException(status_code=404, detail=f"{ticker.upper()} is not on the watchlist")
+        session.delete(entry)
+        session.commit()
+        return {"ticker": entry.ticker}
 
 
 def _prediction_fields(prediction: MarketPrediction | None) -> dict[str, Any]:
@@ -755,14 +892,15 @@ def trading_symbols_report(
     state_confidence_op: str = "",
     state_confidence_value: float | None = None,
 ) -> dict[str, Any]:
-    """Backs the Analytics > Trading Symbols page's report grid: every synced tickers
-    row, joined out to its asset_class, most recently computed average_volumes row, and
-    current_snapshots row (both may be missing for a ticker that's never had that job
-    run against it, unlike top_movers_report's mover-driven rows which always have a
-    tickers row to join against).
+    """Backs the Analytics > Trading Symbols page's report grid: every tickers row that
+    has a market_predictions row on the latest predicted_date (the max across all
+    tickers - a ticker only predicted on an older date, or never, is left out), joined
+    out to that prediction, its asset_class, most recently computed average_volumes row,
+    and current_snapshots row (the last two may be missing for a ticker that's never had
+    that job run against it).
 
     Paginated - `page` (1-based) and `page_size` (capped at
-    TRADING_SYMBOLS_MAX_PAGE_SIZE) select a slice of the full tickers table.
+    TRADING_SYMBOLS_MAX_PAGE_SIZE) select a slice of those tickers.
     average_volumes is looked up only for that page's tickers rather than loaded in
     full, so page_size bounds the work done per request the same way it bounds the
     response size.
@@ -786,15 +924,13 @@ def trading_symbols_report(
     on the same market_predictions.entry_price the report already joins in for
     abs_expected_return_pct ordering - applied as a real SQL WHERE (unlike ReportGrid's
     client-side numeric column filters), so it narrows `total`/pagination too, not just
-    the returned page. A ticker with no market_predictions row (entry_price null) never
-    matches any condition, same null-exclusion semantics as the client-side filter.
+    the returned page.
 
     `market_cap_op`/`market_cap_value` are the same shape, filtering on
-    ticker_details.market_cap - unlike entry_price's MarketPrediction join, base_query
-    doesn't otherwise join TickerDetail in (market_cap is normally resolved separately
-    below, page-scoped, purely for display), so this filter adds that join itself,
-    scoped to this branch, the same "only pay for it when it's actually used" reasoning
-    entry_price's count_query join already uses.
+    ticker_details.market_cap - unlike market_predictions, neither query otherwise joins
+    TickerDetail in (market_cap is normally resolved separately below, page-scoped,
+    purely for display), so this filter adds that join itself, scoped to this branch -
+    only paying for it when it's actually used.
 
     `predicted_states` (comma-separated, e.g. "up,strong_up" - see jobs/
     predict_market_state.py's STATE_LABELS for the full set) filters on the same
@@ -804,12 +940,7 @@ def trading_symbols_report(
     nothing rather than 422ing.
 
     `state_confidence_op`/`state_confidence_value` are the same numeric-filter shape as
-    entry_price's, filtering on market_predictions.state_confidence. Both this and
-    `predicted_states` reuse entry_price's count_query join (added once, guarded by
-    `needs_market_prediction_join` below) rather than each adding their own - joining
-    the same latest_predicted_date/MarketPrediction pair into count_query twice would be
-    redundant at best and (depending on the SQLAlchemy version) an ambiguous-join error
-    at worst."""
+    entry_price's, filtering on market_predictions.state_confidence."""
     types = split_csv(ticker_types)
     selected_tickers = split_csv(tickers)
     page = max(1, page)
@@ -834,27 +965,23 @@ def trading_symbols_report(
             raise HTTPException(422, f"state_confidence_op must be one of {', '.join(NUMERIC_FILTER_OPS)}")
     states = split_csv(predicted_states)
     with SessionLocal() as session:
-        count_query = select(func.count(Ticker.ticker))
-        # current_snapshots and (the latest per ticker, same pattern as
-        # top_movers_report) market_predictions are joined in - rather than looked up
-        # separately, as average_volumes still is below - so todays_change_perc/
-        # day_volume/abs_expected_return_pct are available to order_by before
-        # LIMIT/OFFSET slices out the page. Left joins throughout since a ticker that's
-        # never had sync-snapshots/predict-market-state run against it still needs to
-        # appear.
-        latest_predicted_date = select(
-            MarketPrediction.ticker, func.max(MarketPrediction.predicted_date).label("predicted_date")
-        ).group_by(MarketPrediction.ticker)
-        latest_predicted_date = latest_predicted_date.subquery()
+        # Only tickers predicted on the newest predicted_date across every ticker - an
+        # inner join, so a ticker the latest predict-market-state run didn't cover
+        # (never predicted, or only on an older date) drops out of both the rows and
+        # `total`. current_snapshots stays a left join, since a predicted ticker that's
+        # never had sync-snapshots run against it still needs to appear. Both are
+        # joined in (rather than looked up separately, as average_volumes still is
+        # below) so todays_change_perc/day_volume/abs_expected_return_pct are available
+        # to order_by before LIMIT/OFFSET slices out the page.
+        latest_predicted_date = select(func.max(MarketPrediction.predicted_date)).scalar_subquery()
+        in_latest_predictions = (MarketPrediction.ticker == Ticker.ticker) & (
+            MarketPrediction.predicted_date == latest_predicted_date
+        )
+        count_query = select(func.count(Ticker.ticker)).join(MarketPrediction, in_latest_predictions)
         base_query = (
             select(Ticker, CurrentSnapshot, MarketPrediction)
+            .join(MarketPrediction, in_latest_predictions)
             .outerjoin(CurrentSnapshot, CurrentSnapshot.ticker == Ticker.ticker)
-            .outerjoin(latest_predicted_date, latest_predicted_date.c.ticker == Ticker.ticker)
-            .outerjoin(
-                MarketPrediction,
-                (MarketPrediction.ticker == latest_predicted_date.c.ticker)
-                & (MarketPrediction.predicted_date == latest_predicted_date.c.predicted_date),
-            )
         )
         if types:
             base_query = base_query.where(Ticker.type.in_(types))
@@ -862,21 +989,6 @@ def trading_symbols_report(
         if selected_tickers:
             base_query = base_query.where(Ticker.ticker.in_(selected_tickers))
             count_query = count_query.where(Ticker.ticker.in_(selected_tickers))
-        # count_query doesn't join market_predictions by default (nothing else it counts
-        # needs to) - only add the join once, shared by entry_price/predicted_states/
-        # state_confidence below, so the common no-filter case stays as cheap as it was
-        # before these filters existed, and the join isn't added twice (which - joining
-        # the same subquery/table pair in twice - is redundant at best and an
-        # ambiguous-join error at worst).
-        needs_market_prediction_join = bool(entry_price_op or states or state_confidence_op)
-        if needs_market_prediction_join:
-            count_query = count_query.outerjoin(
-                latest_predicted_date, latest_predicted_date.c.ticker == Ticker.ticker
-            ).outerjoin(
-                MarketPrediction,
-                (MarketPrediction.ticker == latest_predicted_date.c.ticker)
-                & (MarketPrediction.predicted_date == latest_predicted_date.c.predicted_date),
-            )
         if entry_price_op:
             condition = _numeric_condition_clause(MarketPrediction.entry_price, entry_price_op, entry_price_value)
             base_query = base_query.where(condition)
@@ -895,9 +1007,8 @@ def trading_symbols_report(
             condition = _numeric_condition_clause(TickerDetail.market_cap, market_cap_op, market_cap_value)
             # Neither query joins ticker_details by default (market_cap is normally
             # resolved separately below, page-scoped, purely for display) - add it here,
-            # scoped to this branch, same reasoning as entry_price's join above. A plain
-            # join (not a "latest per ticker" subquery like MarketPrediction's): unlike
-            # market_predictions, ticker_details has one row per ticker already.
+            # scoped to this branch. A plain join on ticker: ticker_details has one row
+            # per ticker already.
             base_query = base_query.outerjoin(TickerDetail, TickerDetail.ticker == Ticker.ticker).where(condition)
             count_query = count_query.outerjoin(TickerDetail, TickerDetail.ticker == Ticker.ticker).where(condition)
         total = session.execute(count_query).scalar_one()
@@ -1167,6 +1278,110 @@ def backtest_report(ticker: str, start_date: str = "", end_date: str = "") -> li
             .order_by(MarketPredictionBacktest.evaluated_date.asc())
         ).scalars().all()
         return [_backtest_point_to_dict(row) for row in rows]
+
+
+def _parse_iso_date(value: str, label: str) -> dt.date:
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(422, f"{label} must be an ISO date, e.g. '2026-08-06'") from exc
+
+
+@app.get("/reports/buy-sell-pattern/runs")
+def buy_sell_pattern_runs(ticker: str) -> list[dict[str, Any]]:
+    """Backs the Buy Sell Pattern chart's run picker and its "available date range"
+    hint: one entry per buy_sell_patterns name that has rows for `ticker`, with the
+    first/last trade_date stored for it and its trade count (one buy + one sell row per
+    trade). Newest last_trade_date first, so the chart can default to entry 0."""
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(
+                BuySellPattern.name,
+                func.min(BuySellPattern.trade_date),
+                func.max(BuySellPattern.trade_date),
+                func.sum(case((BuySellPattern.buy_sell == "buy", 1), else_=0)),
+            )
+            .where(BuySellPattern.ticker == ticker)
+            .group_by(BuySellPattern.name)
+            .order_by(func.max(BuySellPattern.trade_date).desc(), BuySellPattern.name)
+        ).all()
+        return [
+            {
+                "name": name,
+                "first_trade_date": first.isoformat(),
+                "last_trade_date": last.isoformat(),
+                "trades": int(trades or 0),
+            }
+            for name, first, last, trades in rows
+        ]
+
+
+@app.get("/reports/buy-sell-pattern")
+def buy_sell_pattern_report(ticker: str, name: str, start_date: str, end_date: str) -> dict[str, Any]:
+    """Backs the Buy Sell Pattern chart: `ticker`'s daily ohlc_bars within
+    [start_date, end_date] (the price series the chart draws) plus the trades stored in
+    buy_sell_patterns under run `name` whose buy and sell both fall inside that range.
+
+    Trades are rebuilt by pairing each buy row with the next sell row in date order -
+    jobs/buy_sell_pattern.py never overlaps trades, and a same-day trade stores its buy
+    and sell on the same date, so sorting buys before sells on a shared date keeps every
+    pair intact."""
+    parsed_start = _parse_iso_date(start_date, "start_date")
+    parsed_end = _parse_iso_date(end_date, "end_date")
+    if parsed_start > parsed_end:
+        raise HTTPException(422, "start_date must not be after end_date")
+
+    with SessionLocal() as session:
+        bars = session.execute(
+            select(OhlcBar.timestamp, OhlcBar.low, OhlcBar.high, OhlcBar.close)
+            .where(
+                OhlcBar.ticker == ticker,
+                OhlcBar.multiplier == DEFAULT_MULTIPLIER,
+                OhlcBar.timespan == DEFAULT_TIMESPAN,
+                OhlcBar.timestamp >= dt.datetime.combine(parsed_start, dt.time.min),
+                OhlcBar.timestamp <= dt.datetime.combine(parsed_end, dt.time.max),
+                OhlcBar.close.is_not(None),
+            )
+            .order_by(OhlcBar.timestamp)
+        ).all()
+        pattern_rows = session.execute(
+            select(BuySellPattern.trade_date, BuySellPattern.buy_sell, BuySellPattern.price)
+            .where(
+                BuySellPattern.ticker == ticker,
+                BuySellPattern.name == name,
+                BuySellPattern.trade_date >= parsed_start,
+                BuySellPattern.trade_date <= parsed_end,
+            )
+            .order_by(BuySellPattern.trade_date, case((BuySellPattern.buy_sell == "buy", 0), else_=1))
+        ).all()
+
+    trades: list[dict[str, Any]] = []
+    pending_buy: tuple[dt.date, float] | None = None
+    for trade_date, buy_sell, price in pattern_rows:
+        if buy_sell == "buy":
+            pending_buy = (trade_date, price)
+        elif pending_buy is not None:
+            # A sell with no buy before it in range belongs to a trade bought before
+            # start_date - skipped, same as a buy whose sell lands after end_date.
+            buy_date, buy_price = pending_buy
+            trades.append(
+                {
+                    "buy_date": buy_date.isoformat(),
+                    "buy_price": buy_price,
+                    "sell_date": trade_date.isoformat(),
+                    "sell_price": price,
+                    "profit": price - buy_price,
+                }
+            )
+            pending_buy = None
+
+    return {
+        "bars": [
+            {"date": timestamp.date().isoformat(), "low": low, "high": high, "close": close}
+            for timestamp, low, high, close in bars
+        ],
+        "trades": trades,
+    }
 
 
 NEXT_10_DAY_PREDICTIONS_MAX_PAGE_SIZE = 1000
@@ -1445,9 +1660,8 @@ MCMC_P10_RETURN_PCT_EXPR = (MarketPredictionMonteCarlo.exit_price_p10 / MarketPr
 
 # order_by field keys accepted by market_predictions_report, mapped to the column they
 # sort on - both prediction tables are unconditionally left-joined into base_query
-# below (this report's whole point is showing both side by side), so unlike
-# trading_symbols_report's optional entry_price_op join, no extra count_query join is
-# needed to make these orderable. average_volume/market_cap/validation_score are also
+# below (this report's whole point is showing both side by side), so no extra
+# count_query join is needed to make these orderable. average_volume/market_cap/validation_score are also
 # unconditionally joined below (see market_predictions_report's docstring for why they
 # stopped being page-scoped-only lookups), so they're orderable/filterable the same way.
 MARKET_PREDICTIONS_ORDERABLE_FIELDS: dict[str, ColumnElement] = {
@@ -3106,6 +3320,36 @@ def _validate_and_normalize_job_fields(definition: JobDefinition, body: _JobFiel
         raise HTTPException(status_code=400, detail="lstm_walkforward_num_folds must be at least 1")
     if body.prediction_accuracy_pass_threshold_std is not None and body.prediction_accuracy_pass_threshold_std <= 0:
         raise HTTPException(status_code=400, detail="prediction_accuracy_pass_threshold_std must be greater than 0")
+    buy_sell_pattern_start_date: dt.date | None = None
+    if body.buy_sell_pattern_start_date is not None:
+        try:
+            buy_sell_pattern_start_date = dt.date.fromisoformat(body.buy_sell_pattern_start_date)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail="buy_sell_pattern_start_date must be an ISO date, e.g. '2026-08-06'"
+            ) from exc
+    buy_sell_pattern_end_date: dt.date | None = None
+    if body.buy_sell_pattern_end_date is not None:
+        try:
+            buy_sell_pattern_end_date = dt.date.fromisoformat(body.buy_sell_pattern_end_date)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail="buy_sell_pattern_end_date must be an ISO date, e.g. '2026-08-06'"
+            ) from exc
+    if (
+        buy_sell_pattern_start_date is not None
+        and buy_sell_pattern_end_date is not None
+        and buy_sell_pattern_start_date > buy_sell_pattern_end_date
+    ):
+        raise HTTPException(
+            status_code=400, detail="buy_sell_pattern_start_date must not be after buy_sell_pattern_end_date"
+        )
+    if body.buy_sell_pattern_batch_size is not None and not (
+        1 <= body.buy_sell_pattern_batch_size <= MAX_TICKER_BATCH_SIZE
+    ):
+        raise HTTPException(
+            status_code=400, detail=f"buy_sell_pattern_batch_size must be between 1 and {MAX_TICKER_BATCH_SIZE}"
+        )
     if body.win_rate_mcmc_range_confidence_level is not None and not (
         0 < body.win_rate_mcmc_range_confidence_level < 1
     ):
@@ -3164,6 +3408,16 @@ def _validate_and_normalize_job_fields(definition: JobDefinition, body: _JobFiel
         "win_rate_mcmc_range_confidence_level": (
             body.win_rate_mcmc_range_confidence_level if definition.has_win_rate_fields else None
         ),
+        "buy_sell_pattern_start_date": (
+            buy_sell_pattern_start_date if definition.has_buy_sell_pattern_fields else None
+        ),
+        "buy_sell_pattern_end_date": buy_sell_pattern_end_date if definition.has_buy_sell_pattern_fields else None,
+        "buy_sell_pattern_name": (
+            (body.buy_sell_pattern_name or "").strip() or None if definition.has_buy_sell_pattern_fields else None
+        ),
+        "buy_sell_pattern_batch_size": (
+            body.buy_sell_pattern_batch_size if definition.has_buy_sell_pattern_fields else None
+        ),
     }
     return fields
 
@@ -3215,16 +3469,27 @@ def trigger_job(job_name: str, body: JobRunOverridesIn | None = None) -> dict:
     The UPDATE ... WHERE run_requested_at IS NULL is atomic at the DB row level, so two
     near-simultaneous clicks (e.g. two dashboard tabs) can't both queue a request - only
     one succeeds (rowcount 1), the other sees rowcount 0 and gets the same 409 a
-    genuinely-already-running job would give."""
+    genuinely-already-running job would give.
+
+    For a job with has_buy_sell_pattern_fields, a run whose resolved name already has
+    rows in buy_sell_patterns gets a 409 whose detail is an object ({"code":
+    "name_conflict", "name": ...}) rather than a string, unless the body sets
+    buy_sell_pattern_replace - the dashboard then asks the user to pick another name
+    or re-send with replace set. jobs/buy_sell_pattern.py re-checks at run time."""
     _require_job(job_name)
     definition = JOB_DEFINITIONS[job_name]
     overrides_json = None
+    fields: dict[str, Any] | None = None
     if body is not None:
         fields = _validate_and_normalize_job_fields(definition, body)
+        if definition.has_buy_sell_pattern_fields and body.buy_sell_pattern_replace:
+            fields["buy_sell_pattern_replace"] = True
         overrides_json = json.dumps(fields, default=str)
     with SessionLocal() as session:
         if job_is_active(session, job_name):
             raise HTTPException(status_code=409, detail=f"{job_name} is already running")
+        if definition.has_buy_sell_pattern_fields:
+            _check_buy_sell_pattern_name(session, job_name, fields)
         result = session.execute(
             update(JobConfig)
             .where(JobConfig.job_name == job_name, JobConfig.run_requested_at.is_(None))
@@ -3234,6 +3499,36 @@ def trigger_job(job_name: str, body: JobRunOverridesIn | None = None) -> dict:
         if result.rowcount == 0:
             raise HTTPException(status_code=409, detail=f"{job_name} is already running")
     return {"status": "started"}
+
+
+def _check_buy_sell_pattern_name(session: Session, job_name: str, fields: dict[str, Any] | None) -> None:
+    """trigger_job's pre-flight for a buy-sell-pattern run: resolves the run's dates and
+    name the same way jobs/engine.py will (this run's overrides when sent, the saved
+    config otherwise) and rejects a missing date range or an unaccepted name conflict
+    up front, instead of queueing a run that would only fail."""
+    if fields is None:
+        config = get_or_create_config(session, job_name)
+        start_date = config.buy_sell_pattern_start_date
+        end_date = config.buy_sell_pattern_end_date
+        name = config.buy_sell_pattern_name
+        replace = False
+    else:
+        start_date = fields["buy_sell_pattern_start_date"]
+        end_date = fields["buy_sell_pattern_end_date"]
+        name = fields["buy_sell_pattern_name"]
+        replace = bool(fields.get("buy_sell_pattern_replace"))
+    if start_date is None or end_date is None:
+        raise HTTPException(status_code=400, detail="buy-sell-pattern needs both a Start date and an End date")
+    resolved = resolve_pattern_name(name, start_date, end_date, "manual")
+    if not replace and pattern_name_exists(session, resolved):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "name_conflict",
+                "name": resolved,
+                "message": f"buy_sell_patterns already has rows named {resolved!r}",
+            },
+        )
 
 
 def _require_running(job_name: str, session: Session) -> JobRun:
