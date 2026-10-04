@@ -79,6 +79,9 @@ export interface Job {
   // Whether this job offers the Start date/End date/Name group (see
   // buy_sell_pattern_start_date etc. below) - only buy-sell-pattern sets this.
   has_buy_sell_pattern_fields: boolean
+  // Whether this job offers the single "Max age (hours)" field (see
+  // query_export_max_age_hours below) - only cleanup-query-exports sets this.
+  has_query_export_cleanup_fields: boolean
   // Always the full massive.com asset-class list (jobs/registry.py's
   // SNAPSHOT_TYPE_OPTIONS), regardless of has_snapshot_type_filter - fetched from the
   // backend rather than hardcoded here so the two never drift.
@@ -191,6 +194,9 @@ export interface Job {
   // Tickers loaded, solved, and committed per batch - lower it to cap memory on a long
   // date range. null uses backend-v2 jobs/buy_sell_pattern.py's TICKER_BATCH_SIZE (500).
   buy_sell_pattern_batch_size: number | null
+  // How old a SQL console export file must be before cleanup-query-exports deletes it.
+  // null uses backend-v2 jobs/query_exports.py's DEFAULT_MAX_AGE_HOURS (2).
+  query_export_max_age_hours: number | null
   // Persisted (JobConfig.hidden), not display-only - keeps a job off the Jobs page's
   // default list across reloads until explicitly unhidden. Independent of running/
   // paused: a hidden job still runs on its schedule, it's just tucked away here.
@@ -248,6 +254,7 @@ export interface JobConfigInput {
   buy_sell_pattern_end_date?: string | null
   buy_sell_pattern_name?: string | null
   buy_sell_pattern_batch_size?: number | null
+  query_export_max_age_hours?: number | null
 }
 
 export interface TickerOption {
@@ -1181,9 +1188,37 @@ export type TriggerJobResult =
 // CursorResult.returns_rows is true for, "statement" for INSERT/UPDATE/DELETE/DDL.
 // row values are unknown rather than a narrower type since the SQL console can query
 // any table/column the caller writes.
+// elapsed_ms is execute + fetch time measured on the backend (see run_adhoc_query) -
+// for a truncated result, the time to produce the rows actually shipped back.
 export type AdhocQueryResult =
-  | { kind: 'rows'; columns: string[]; rows: Record<string, unknown>[]; row_count: number; truncated: boolean }
-  | { kind: 'statement'; rowcount: number | null }
+  | {
+      kind: 'rows'
+      columns: string[]
+      rows: Record<string, unknown>[]
+      row_count: number
+      truncated: boolean
+      elapsed_ms: number
+    }
+  | { kind: 'statement'; rowcount: number | null; elapsed_ms: number }
+
+export type AdhocExportFormat = 'csv' | 'json'
+
+// Mirrors app/main.py's export_adhoc_query response - the file itself is saved on the
+// backend and downloaded separately from adhocExportDownloadUrl(id). delete_after is
+// the earliest time the cleanup-query-exports job will delete it (aware ISO).
+export type AdhocExport = {
+  id: string
+  format: AdhocExportFormat
+  filename: string
+  row_count: number
+  size_bytes: number
+  elapsed_ms: number
+  delete_after: string
+}
+
+export function adhocExportDownloadUrl(id: string): string {
+  return `${API_BASE}/admin/query/exports/${id}`
+}
 
 export const api = {
   jobs: () => getJSON<Job[]>('/jobs'),
@@ -1217,7 +1252,18 @@ export const api = {
   unhideJob: (name: string) => postJSON<Job>(`/jobs/${name}/unhide`),
   reorderJobs: (jobNames: string[]) => postJSONBody<Job[]>('/jobs/reorder', { job_names: jobNames }),
   resetJob: (name: string) => postJSON<Job>(`/jobs/${name}/reset`),
-  runAdhocQuery: (sql: string) => postJSONBody<AdhocQueryResult>('/admin/query', { sql }),
+  // `queryId` is any client-chosen unique id - passing the same one to
+  // cancelAdhocQuery aborts this query while it runs (see app/main.py's
+  // cancel_adhoc_query); the aborted call then rejects with "Query cancelled.".
+  runAdhocQuery: (sql: string, queryId?: string) =>
+    postJSONBody<AdhocQueryResult>('/admin/query', { sql, query_id: queryId }),
+  // Saves the full, uncapped result of `sql` to a file on the backend - see
+  // app/main.py's export_adhoc_query. Cancellable the same way as runAdhocQuery.
+  exportAdhocQuery: (sql: string, format: AdhocExportFormat, queryId?: string) =>
+    postJSONBody<AdhocExport>('/admin/query/export', { sql, format, query_id: queryId }),
+  // `cancelled` is false if nothing was running under that id any more.
+  cancelAdhocQuery: (queryId: string) =>
+    postJSONBody<{ cancelled: boolean }>(`/admin/query/${encodeURIComponent(queryId)}/cancel`, {}),
   searchTickers: (q: string, limit = 20) =>
     getJSON<TickerOption[]>(`/tickers/search?q=${encodeURIComponent(q)}&limit=${limit}`),
   searchTickerTypes: (q: string, limit = 20) =>

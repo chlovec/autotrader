@@ -3,6 +3,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent 
 import { isNumericFilterOp, matchesCondition, type NumericCondition } from '../numericFilter'
 import { downloadCsv, downloadPdf } from '../reportExport'
 import { ColumnHeaderMenu } from './ColumnHeaderMenu'
+import { CheckIcon, CopyIcon } from './icons'
 import { useAnchoredDropdown } from './useAnchoredDropdown'
 
 export type ReportColumn<T> = {
@@ -40,6 +41,11 @@ type ReportGridProps<T> = {
   // Title printed above the table in the exported PDF - only used when exportFilename
   // is set. Defaults to exportFilename itself if omitted.
   exportTitle?: string
+  // Adds a toolbar icon button that copies the grid as shown - visible columns, current
+  // filters and sort, every row (not just the ones scrolled into view) - to the
+  // clipboard as tab-separated text with a header row, which pastes straight into
+  // Excel/Sheets as cells. Omit to leave the grid without it.
+  copyable?: boolean
 }
 
 type SortDir = 'asc' | 'desc'
@@ -241,6 +247,7 @@ export function ReportGrid<T>({
   rowContextMenu,
   exportFilename,
   exportTitle,
+  copyable,
 }: ReportGridProps<T>) {
   type Key = Extract<keyof T, string>
 
@@ -412,6 +419,32 @@ export function ReportGrid<T>({
   const handleExportCsv = () => {
     if (!exportFilename) return
     downloadCsv(`${exportFilename}.csv`, visibleColumns, sortedRows, formatCell)
+  }
+
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle')
+  const copyFlashTimeout = useRef<number | null>(null)
+  useEffect(() => () => {
+    if (copyFlashTimeout.current) window.clearTimeout(copyFlashTimeout.current)
+  }, [])
+
+  const handleCopy = async () => {
+    // Tabs/newlines inside a value would split it across cells on paste, so they're
+    // flattened to spaces rather than quoted - spreadsheets don't reliably honour
+    // quoting in pasted TSV.
+    const clean = (value: string) => value.replace(/[\t\r\n]+/g, ' ')
+    const lines = [
+      visibleColumns.map((col) => clean(col.label)).join('\t'),
+      ...sortedRows.map((row) => visibleColumns.map((col) => clean(formatCell(row, col.key))).join('\t')),
+    ]
+    let next: 'copied' | 'failed' = 'copied'
+    try {
+      await navigator.clipboard.writeText(lines.join('\n'))
+    } catch {
+      next = 'failed'
+    }
+    setCopyState(next)
+    if (copyFlashTimeout.current) window.clearTimeout(copyFlashTimeout.current)
+    copyFlashTimeout.current = window.setTimeout(() => setCopyState('idle'), 1500)
   }
 
   const handleExportPdf = () => {
@@ -587,6 +620,25 @@ export function ReportGrid<T>({
           </>
         )}
         <ColumnsMenu columns={columns} hiddenKeys={hiddenKeys} onToggle={toggleHidden} />
+        {copyable && (
+          <span className="tooltip-anchor">
+            <button
+              type="button"
+              className="icon-button report-copy-button"
+              aria-label="Copy grid to clipboard"
+              onClick={() => void handleCopy()}
+            >
+              {copyState === 'copied' ? <CheckIcon className="icon" /> : <CopyIcon className="icon" />}
+            </button>
+            <span className="tooltip-bubble tooltip-bubble-right" role="tooltip">
+              {copyState === 'copied'
+                ? `Copied ${sortedRows.length.toLocaleString()} row(s).`
+                : copyState === 'failed'
+                  ? "Couldn't copy - the browser blocked clipboard access."
+                  : 'Copy the grid as shown (visible columns, current filters and sort) as tab-separated text, ready to paste into a spreadsheet.'}
+            </span>
+          </span>
+        )}
         {exportFilename && (
           <>
             <button type="button" className="job-button" onClick={handleExportCsv}>

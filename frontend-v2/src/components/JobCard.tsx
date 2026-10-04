@@ -92,6 +92,7 @@ type JobFieldsState = {
   buySellPatternEndDate: string
   buySellPatternName: string
   buySellPatternBatchSize: number
+  queryExportMaxAgeHours: number
 }
 
 // Gates each field by job.has_* the same way JobCard's render order decides which
@@ -174,6 +175,7 @@ function buildJobFieldsPayload(job: Job, fields: JobFieldsState): JobRunOverride
           buy_sell_pattern_batch_size: fields.buySellPatternBatchSize,
         }
       : {}),
+    ...(job.has_query_export_cleanup_fields ? { query_export_max_age_hours: fields.queryExportMaxAgeHours } : {}),
   }
 }
 
@@ -302,6 +304,8 @@ export function JobCard({
   const [buySellPatternName, setBuySellPatternName] = useState(job.buy_sell_pattern_name ?? '')
   // Default 500 matches backend-v2 jobs/buy_sell_pattern.py's TICKER_BATCH_SIZE.
   const [buySellPatternBatchSize, setBuySellPatternBatchSize] = useState(job.buy_sell_pattern_batch_size ?? 500)
+  // Default 2 matches backend-v2 jobs/query_exports.py's DEFAULT_MAX_AGE_HOURS.
+  const [queryExportMaxAgeHours, setQueryExportMaxAgeHours] = useState(job.query_export_max_age_hours ?? 2)
 
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
@@ -359,6 +363,7 @@ export function JobCard({
     buySellPatternEndDate,
     buySellPatternName,
     buySellPatternBatchSize,
+    queryExportMaxAgeHours,
   })
 
   const handleSave = async (event: FormEvent) => {
@@ -716,7 +721,8 @@ export function JobCard({
                 !job.has_lstm_inference_fields &&
                 !job.has_prediction_accuracy_fields &&
                 !job.has_win_rate_fields &&
-                !job.has_buy_sell_pattern_fields && (
+                !job.has_buy_sell_pattern_fields &&
+                !job.has_query_export_cleanup_fields && (
                   <p className="job-field-hint">This job has no run parameters to configure.</p>
                 )}
 
@@ -1254,6 +1260,28 @@ export function JobCard({
                     always) to use the start and end date. If the name is already taken you'll be asked whether to
                     replace it. Tickers per batch (1-5000) sets how many tickers' bars are held in memory and
                     committed at once - lower it for long date ranges.
+                  </p>
+                </>
+              )}
+
+              {job.has_query_export_cleanup_fields && (
+                <>
+                  <div className="job-field-row">
+                    <label className="job-field">
+                      Max age (hours)
+                      <input
+                        type="number"
+                        min={0.25}
+                        step={0.25}
+                        value={queryExportMaxAgeHours}
+                        onChange={(e) => setQueryExportMaxAgeHours(Number(e.target.value))}
+                      />
+                    </label>
+                  </div>
+                  <p className="job-field-hint">
+                    SQL console export files at least this many hours old are deleted on each run (default 2). A
+                    file can stay up to one schedule interval past this age, since it's only removed when the job
+                    next runs.
                   </p>
                 </>
               )}

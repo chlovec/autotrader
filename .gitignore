@@ -8,6 +8,7 @@ questrade_token_*.json
 *.db-journal
 *.db.bak-*
 backend-v2/data/etf_holdings/
+backend-v2/data/query_exports/
 __pycache__/
 *.pyc
 .pytest_cache/

@@ -82,6 +82,8 @@ def init_db() -> None:
     _add_ticker_details_columns()
     _add_job_configs_buy_sell_pattern_columns()
     _add_ticker_groups_sort_order_column()
+    _add_job_configs_query_export_max_age_hours_column()
+    _create_tickers_market_direction_60days_min_from_latest_view()
 
 
 def _add_column_if_missing(table: str, column: str, ddl_type: str) -> None:
@@ -258,20 +260,24 @@ def _convert_ohlc_bars_pcnt_increase_generated_column() -> None:
 
 def _add_ohlc_bars_span_timestamp_index() -> None:
     """Base.metadata.create_all only creates indexes alongside tables it creates, so an
-    existing ohlc_bars (live data predating ix_ohlc_bars_span_ts in db/models.py's
-    OhlcBar) never gets the index from it - this adds it. IF NOT EXISTS makes it a
-    no-op on every startup after the first."""
+    existing ohlc_bars (live data predating ix_ohlc_bars_span_ts_ticker in
+    db/models.py's OhlcBar) never gets the index from it - this adds it. IF NOT EXISTS
+    makes it a no-op on every startup after the first.
+
+    Also drops ix_ohlc_bars_span_ts, the same index without ticker that this one
+    replaced - only after the new one exists, so queries are never left without
+    either. The new index serves everything the old one did (same leading columns)."""
     inspector = inspect(engine)
     if "ohlc_bars" not in inspector.get_table_names():
         return
     with engine.begin() as conn:
         conn.execute(
             text(
-                "CREATE INDEX IF NOT EXISTS ix_ohlc_bars_span_ts "
-                "ON ohlc_bars (multiplier, timespan, timestamp)"
+                "CREATE INDEX IF NOT EXISTS ix_ohlc_bars_span_ts_ticker "
+                "ON ohlc_bars (multiplier, timespan, timestamp, ticker)"
             )
         )
-
+        conn.execute(text("DROP INDEX IF EXISTS ix_ohlc_bars_span_ts"))
 
 def _drop_ticker_bar_sync_state_table() -> None:
     """ticker_bar_sync_state (db/models.py's now-removed TickerBarSyncState) used to
@@ -461,6 +467,100 @@ def _add_ticker_groups_sort_order_column() -> None:
     left NULL on existing rows, which sort after every explicitly ordered row."""
     _add_column_if_missing("ticker_groups", "sort_order", "INTEGER")
 
+
+def _add_job_configs_query_export_max_age_hours_column() -> None:
+    """See db/models.py's JobConfig.query_export_max_age_hours - added after
+    job_configs itself, left NULL on existing rows (resolved at run time)."""
+    _add_job_configs_column("query_export_max_age_hours", "FLOAT")
+
+
+_TICKERS_MARKET_DIRECTION_VIEW = "tickers_market_direction_60days_min_from_latest"
+
+# No ORDER BY on purpose: it would stop SQLite from merging the view into the query
+# reading it, so a reader's WHERE (one ticker, a date range) would only be applied
+# after the whole view was built. Readers order the rows themselves. Filter date
+# ranges on `timestamp` (indexed) rather than the computed `date` column, which
+# can't use an index.
+_TICKERS_MARKET_DIRECTION_VIEW_SQL = f"""CREATE VIEW {_TICKERS_MARKET_DIRECTION_VIEW} AS
+WITH
+-- Only daily bars matter; every step below reads from this.
+daily_bars AS (
+    SELECT *
+    FROM ohlc_bars
+    WHERE multiplier = 1 AND timespan = 'day'
+),
+
+-- The most recent trading day in the data. ORDER BY ... LIMIT 1 rather than MAX() so
+-- it's guaranteed to be a single seek to the end of ix_ohlc_bars_span_ts_ticker.
+latest_day AS (
+    SELECT timestamp AS ts
+    FROM daily_bars
+    ORDER BY timestamp DESC
+    LIMIT 1
+),
+
+-- Filter 1: tickers that have a bar on the latest day.
+current_tickers AS (
+    SELECT ticker
+    FROM daily_bars
+    WHERE timestamp = (SELECT ts FROM latest_day)
+),
+
+-- Filter 2: of those, tickers whose 60 most recent bars all exist.
+eligible_tickers AS (
+    SELECT c.ticker
+    FROM current_tickers c
+    WHERE (
+        SELECT COUNT(*)
+        FROM (
+            SELECT 1
+            FROM daily_bars d
+            WHERE d.ticker = c.ticker
+            ORDER BY d.timestamp DESC
+            LIMIT 60
+        ) AS recent
+    ) = 60
+)
+
+SELECT
+    b.ticker,
+    b.timestamp,
+    date(b.timestamp)                            AS date,
+    CAST(strftime('%Y', b.timestamp) AS INTEGER) AS year,
+    CAST(strftime('%m', b.timestamp) AS INTEGER) AS month,
+    CAST(strftime('%d', b.timestamp) AS INTEGER) AS day,
+    b.open,
+    b.close,
+    b.pcnt_increase,
+    CASE
+        WHEN b.pcnt_increase <  -20  THEN -3  -- Very Strong Down
+        WHEN b.pcnt_increase <  -5   THEN -2  -- Strong Down
+        WHEN b.pcnt_increase <  -0.1 THEN -1  -- Down
+        WHEN b.pcnt_increase <=  0.1 THEN  0  -- Neutral
+        WHEN b.pcnt_increase <=  5   THEN  1  -- Up
+        WHEN b.pcnt_increase <=  20  THEN  2  -- Strong Up
+        WHEN b.pcnt_increase >   20  THEN  3  -- Very Strong Up
+    END AS direction
+FROM daily_bars b
+WHERE b.ticker IN (SELECT ticker FROM eligible_tickers)"""
+
+
+def _create_tickers_market_direction_60days_min_from_latest_view() -> None:
+    """Every daily bar for tickers that have a bar on the latest trading day and a full
+    60 most recent daily bars, bucketed by pcnt_increase into a -3..3 direction score.
+    create_all doesn't manage views, so this is created here instead - and dropped and
+    recreated whenever the definition above changes, which is safe since a view holds
+    no data, just the query. SQLite stores a view's CREATE statement verbatim in
+    sqlite_master, so comparing it to the text above is enough to detect a change."""
+    with engine.begin() as conn:
+        existing = conn.execute(
+            text("SELECT sql FROM sqlite_master WHERE type = 'view' AND name = :name"),
+            {"name": _TICKERS_MARKET_DIRECTION_VIEW},
+        ).scalar()
+        if existing == _TICKERS_MARKET_DIRECTION_VIEW_SQL:
+            return
+        conn.execute(text(f"DROP VIEW IF EXISTS {_TICKERS_MARKET_DIRECTION_VIEW}"))
+        conn.execute(text(_TICKERS_MARKET_DIRECTION_VIEW_SQL))
 
 def get_session() -> Session:
     return SessionLocal()

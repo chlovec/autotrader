@@ -133,7 +133,9 @@ class OhlcBar(Base):
     # granularity across all tickers" (e.g. MAX(timestamp) WHERE multiplier = 1 AND
     # timespan = 'day') without a full scan - this index can. See db/session.py's
     # _add_ohlc_bars_span_timestamp_index for databases created before it existed.
-    __table_args__ = (Index("ix_ohlc_bars_span_ts", "multiplier", "timespan", "timestamp"),)
+    # ticker is last so "which tickers have a bar on day X" reads it from the index
+    # itself instead of looking up each matching row in the table.
+    __table_args__ = (Index("ix_ohlc_bars_span_ts_ticker", "multiplier", "timespan", "timestamp", "ticker"),)
 
     ticker: Mapped[str] = mapped_column(ForeignKey("tickers.ticker"), primary_key=True)
     multiplier: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -1282,6 +1284,11 @@ class JobConfig(Base):
     buy_sell_pattern_batch_size is how many tickers the job loads, solves, and commits
     per batch; NULL uses jobs/buy_sell_pattern.py's TICKER_BATCH_SIZE.
 
+    query_export_max_age_hours only applies to the cleanup-query-exports job
+    (registry.JobDefinition.has_query_export_cleanup_fields) - how old a SQL console
+    export file must be before that job deletes it. NULL uses jobs/query_exports.py's
+    DEFAULT_MAX_AGE_HOURS (2.0).
+
     run_requested_at is how app/main.py (the API process) asks job_runner.py (the
     separate process that actually executes jobs - see jobs/engine.py) to run this job
     now: POST /jobs/{name}/run sets it, job_runner.py's poll_run_requests clears it
@@ -1347,6 +1354,7 @@ class JobConfig(Base):
     # Only ever set through run_overrides, never by PUT /jobs/{name}/config - see the
     # docstring above.
     buy_sell_pattern_replace: Mapped[bool | None] = mapped_column(Boolean)
+    query_export_max_age_hours: Mapped[float | None] = mapped_column(Float)
     # Hides the job's card from the Jobs page's default list (see app/main.py's
     # list_jobs) without affecting its schedule - a hidden job still runs normally.
     hidden: Mapped[bool] = mapped_column(default=False)

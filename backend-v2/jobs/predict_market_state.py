@@ -62,11 +62,30 @@ DEFAULT_PREDICTED_DATE_OFFSET_DAYS = 1
 ENTRY_TIME = "09:30:00"
 EXIT_TIME = "16:00:00"
 
-# Commits every this-many tickers instead of once at the very end, so a full run (tens
+# Writes every this-many tickers instead of once at the very end, so a full run (tens
 # of thousands of tickers) doesn't hold a single write transaction open for its entire
 # duration - see db/session.py's WAL-mode comment for why that matters even with WAL,
-# since writers are still serialized against each other.
+# since writers are still serialized against each other. Rows are buffered in memory
+# and written by _upsert_batch only once the batch is fully computed: SQLite takes the
+# write lock at a transaction's first INSERT, so upserting each ticker as it's computed
+# held the lock through the whole batch's computation - long enough (>30s under the
+# Monte Carlo job's simulations) to time out every other writer's busy_timeout.
 COMMIT_BATCH_SIZE = 500
+
+
+def _upsert_batch(session: Session, model, index_elements: list, rows: list[dict]) -> None:
+    """Upserts `rows` into `model` in one executemany and commits straight away, so the
+    write lock is held only for the insert itself. Clears `rows` for the next batch."""
+    if not rows:
+        return
+    stmt = sqlite_insert(model)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=index_elements,
+        set_={column: stmt.excluded[column] for column in rows[0]},
+    )
+    session.execute(stmt, rows)
+    session.commit()
+    rows.clear()
 
 
 def _apply_ticker_filter(query, ticker_types: list[str] | None, tickers: list[str] | None):
@@ -206,6 +225,8 @@ def compute_market_state_predictions(
 
     computed_at = dt.datetime.utcnow()
     stored = 0
+    pending: list[dict] = []
+    index_elements = [MarketPrediction.ticker, MarketPrediction.predicted_date]
     skipped = 0
     for ticker, group in groupby(rows, key=lambda row: row.ticker):
         if control is not None:
@@ -256,15 +277,11 @@ def compute_market_state_predictions(
             "history_days": len(returns),
             "computed_at": computed_at,
         }
-        stmt = sqlite_insert(MarketPrediction).values(**values)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=[MarketPrediction.ticker, MarketPrediction.predicted_date],
-            set_=values,
-        )
-        session.execute(stmt)
+        pending.append(values)
         stored += 1
-        if stored % COMMIT_BATCH_SIZE == 0:
-            session.commit()
+        if len(pending) >= COMMIT_BATCH_SIZE:
+            _upsert_batch(session, MarketPrediction, index_elements, pending)
+    _upsert_batch(session, MarketPrediction, index_elements, pending)
     session.commit()
 
     logger.info(

@@ -6,7 +6,7 @@ UVICORN ?= .venv/bin/uvicorn
 BACKEND_HOST ?= 127.0.0.1
 BACKEND_PORT ?= 8000
 
-.PHONY: help run-engine research backend dashboard stop restart restart-v2 stop-v2 docker-build docker-up docker-down docker-logs
+.PHONY: help run-engine research backend dashboard stop restart restart-v2 stop-v2 backup-db docker-build docker-up docker-down docker-logs
 
 help:
 	@echo "Autotrader run targets:"
@@ -28,6 +28,9 @@ help:
 	@echo "                   Flags: --skip-backend --skip-dashboard"
 	@echo "  stop-v2          Kill whatever 'restart-v2' (or a previous manual run) started (bin/stop-v2.sh)"
 	@echo "                   Same per-service prompts/ARGS as restart-v2"
+	@echo "  backup-db        Snapshot autotrader.db and backend-v2/backend_v2.db into backups/ (bin/backup-db.sh)"
+	@echo "                   Keeps the 14 newest backups per database; change via ARGS, e.g.:"
+	@echo "                     make backup-db ARGS=\"--keep 0\"   (no pruning)"
 	@echo "  docker-build     Build the backend/engine and dashboard images"
 	@echo "  docker-up        Start backend+engine+dashboard in containers (see docker-compose.yml)"
 	@echo "  docker-down      Stop and remove the containers docker-up started"
@@ -56,6 +59,9 @@ restart-v2:
 
 stop-v2:
 	@bin/stop-v2.sh $(ARGS)
+
+backup-db:
+	@bin/backup-db.sh $(ARGS)
 
 docker-build:
 	docker compose build

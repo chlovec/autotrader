@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from 'react'
-import { api, type AdhocQueryResult } from '../api'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { adhocExportDownloadUrl, api, type AdhocExport, type AdhocExportFormat, type AdhocQueryResult } from '../api'
 import { loadReportProfiles, upsertReportProfile, deleteReportProfile, type ReportProfile } from '../reportProfiles'
+import { ReportGrid, type ReportColumn } from './ReportGrid'
 
 // Leading keyword that doesn't mutate/create/drop anything - matches app/main.py's
 // run_adhoc_query, which decides "rows" vs "statement" from CursorResult.returns_rows
@@ -23,10 +24,43 @@ function isReadOnly(sql: string): boolean {
   return firstWord != null && READ_ONLY_KEYWORDS.includes(firstWord)
 }
 
+type ResultRow = Record<string, unknown>
+
 function formatCell(value: unknown): string {
   if (value === null || value === undefined) return '—'
   if (typeof value === 'boolean') return value ? 'true' : 'false'
   return String(value)
+}
+
+function formatElapsed(ms: number): string {
+  if (ms < 1000) return `${ms.toFixed(ms < 10 ? 1 : 0)} ms`
+  if (ms < 60_000) return `${(ms / 1000).toFixed(2)} s`
+  const minutes = Math.floor(ms / 60_000)
+  return `${minutes}m ${((ms % 60_000) / 1000).toFixed(1)}s`
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`
+  return `${(bytes / 1024 ** 3).toFixed(2)} GB`
+}
+
+// A plain link to the saved file rather than fetch + Blob: the backend serves it as an
+// attachment, so the browser streams it straight to disk without navigating away or
+// holding the whole export in memory.
+// Id the backend registers a running query/export under, so cancel_adhoc_query can
+// interrupt it. randomUUID needs a secure context (localhost counts), hence the fallback.
+function newQueryId(): string {
+  return typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
+function startDownload(id: string): void {
+  const anchor = document.createElement('a')
+  anchor.href = adhocExportDownloadUrl(id)
+  anchor.click()
 }
 
 export function SqlConsolePage() {
@@ -35,6 +69,20 @@ export function SqlConsolePage() {
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<AdhocQueryResult | null>(null)
   const [confirming, setConfirming] = useState(false)
+  // The SQL text that produced `result` - what the export buttons re-run, so editing
+  // the textarea after a run can't silently export a different query than the one on
+  // screen. runId remounts ReportGrid per run so sort/filter state keyed to the last
+  // result's columns doesn't carry over to a query with different ones.
+  const [resultSql, setResultSql] = useState('')
+  const [runId, setRunId] = useState(0)
+  const [exporting, setExporting] = useState<AdhocExportFormat | null>(null)
+  const [exportError, setExportError] = useState<string | null>(null)
+  const [lastExport, setLastExport] = useState<AdhocExport | null>(null)
+  // Id of the query or export currently running on the backend - what the Cancel
+  // buttons abort. Only one runs at a time: Run and the export buttons are disabled
+  // while either is in flight.
+  const [activeQueryId, setActiveQueryId] = useState<string | null>(null)
+  const [cancelling, setCancelling] = useState(false)
 
   // Named, saved queries - see SAVED_QUERIES_ID above.
   const [savedQueries, setSavedQueries] = useState<ReportProfile<SavedSqlParams>[]>(() =>
@@ -69,6 +117,8 @@ export function SqlConsolePage() {
     setActiveQueryName(query.name)
     setResult(null)
     setError(null)
+    setExportError(null)
+    setLastExport(null)
   }
 
   const handleUpdateActiveQuery = () => {
@@ -110,19 +160,75 @@ export function SqlConsolePage() {
   const execute = async () => {
     setRunning(true)
     setError(null)
+    setExportError(null)
+    setLastExport(null)
+    const queryId = newQueryId()
+    setActiveQueryId(queryId)
     try {
-      const res = await api.runAdhocQuery(sql)
+      const res = await api.runAdhocQuery(sql, queryId)
       setResult(res)
+      setResultSql(sql)
+      setRunId((id) => id + 1)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Query failed')
       setResult(null)
     } finally {
       setRunning(false)
+      setActiveQueryId(null)
+      setCancelling(false)
     }
   }
 
+  // Interrupts the running query/export on the backend; the request that started it
+  // then fails with "Query cancelled." and resets the page through its own finally.
+  // If it had already finished (cancelled: false), its result just arrives as normal.
+  const handleCancel = async () => {
+    if (!activeQueryId || cancelling) return
+    setCancelling(true)
+    try {
+      const { cancelled } = await api.cancelAdhocQuery(activeQueryId)
+      if (!cancelled) setCancelling(false)
+    } catch {
+      setCancelling(false)
+    }
+  }
+
+  // The export endpoint runs resultSql again with no row cap and saves the result to a
+  // file on the backend, so it holds everything the query returns (its own LIMIT, if
+  // any, still applies) - not just the rows the grid shows, and not affected by the
+  // grid's sort/filter. The file stays downloadable until cleanup-query-exports
+  // deletes it.
+  const handleExport = async (format: AdhocExportFormat) => {
+    setExporting(format)
+    setExportError(null)
+    const queryId = newQueryId()
+    setActiveQueryId(queryId)
+    try {
+      const saved = await api.exportAdhocQuery(resultSql, format, queryId)
+      setLastExport(saved)
+      startDownload(saved.id)
+    } catch (err) {
+      setExportError(err instanceof Error ? err.message : 'Export failed')
+    } finally {
+      setExporting(null)
+      setActiveQueryId(null)
+      setCancelling(false)
+    }
+  }
+
+  const gridColumns = useMemo<ReportColumn<ResultRow>[]>(
+    () => (result?.kind === 'rows' ? result.columns.map((col) => ({ key: col, label: col })) : []),
+    [result],
+  )
+  // Ad-hoc rows have no stable identity, so key each one by its position in the
+  // result as returned (not as sorted/filtered by the grid).
+  const rowKeys = useMemo(
+    () => new Map(result?.kind === 'rows' ? result.rows.map((row, i) => [row, String(i)]) : []),
+    [result],
+  )
+
   const handleRunClick = () => {
-    if (!sql.trim() || running) return
+    if (!sql.trim() || running || exporting != null) return
     if (isReadOnly(sql)) {
       void execute()
     } else {
@@ -238,55 +344,99 @@ export function SqlConsolePage() {
           type="button"
           className="job-button job-button-primary"
           onClick={handleRunClick}
-          disabled={!sql.trim() || running}
+          disabled={!sql.trim() || running || exporting != null}
         >
           {running ? 'Running...' : 'Run (⌘/Ctrl + Enter)'}
         </button>
+        {running && (
+          <button
+            type="button"
+            className="job-button job-button-danger"
+            disabled={cancelling || !activeQueryId}
+            onClick={() => void handleCancel()}
+          >
+            {cancelling ? 'Cancelling...' : 'Cancel query'}
+          </button>
+        )}
       </div>
 
       {result && result.kind === 'statement' && (
         <p className="placeholder-note">
-          Statement executed successfully.{' '}
+          Statement executed successfully in {formatElapsed(result.elapsed_ms)}.{' '}
           {result.rowcount != null ? `${result.rowcount} row(s) affected.` : ''}
         </p>
       )}
 
       {result && result.kind === 'rows' && (
-        <div className="report-grid">
-          <p className="placeholder-note">
-            {result.row_count} row(s) returned
-            {result.truncated ? ' (truncated - add a LIMIT to your query to see fewer/more rows)' : ''}.
-          </p>
-          <div className="report-table-wrap">
-            <table className="job-history-table report-table">
-              <thead>
-                <tr>
-                  {result.columns.map((col) => (
-                    <th key={col}>{col}</th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {result.rows.length === 0 ? (
-                  <tr>
-                    <td className="report-empty-cell" colSpan={result.columns.length || 1}>
-                      No rows returned.
-                    </td>
-                  </tr>
-                ) : (
-                  // Index as key: rows from an arbitrary ad-hoc query have no stable identity.
-                  result.rows.map((row, i) => (
-                    <tr key={i}>
-                      {result.columns.map((col) => (
-                        <td key={col}>{formatCell(row[col])}</td>
-                      ))}
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
+        <>
+          <div className="sql-console-result-bar">
+            <p className="placeholder-note">
+              {result.row_count} row(s) returned in {formatElapsed(result.elapsed_ms)}
+              {result.truncated
+                ? ` - showing the first ${result.row_count}; the export includes every row the query returns`
+                : ''}
+              .
+            </p>
+            <div className="sql-console-export-buttons">
+              <span className="tooltip-anchor">
+                <button
+                  type="button"
+                  className="job-button"
+                  disabled={exporting != null || running}
+                  onClick={() => void handleExport('csv')}
+                >
+                  {exporting === 'csv' ? 'Exporting...' : 'Export CSV'}
+                </button>
+                <span className="tooltip-bubble tooltip-bubble-right" role="tooltip">
+                  Re-runs the query and downloads every row it returns as a .csv with a header row - all columns,
+                  ignoring the grid's sort, filters and hidden columns.
+                </span>
+              </span>
+              <span className="tooltip-anchor">
+                <button
+                  type="button"
+                  className="job-button"
+                  disabled={exporting != null || running}
+                  onClick={() => void handleExport('json')}
+                >
+                  {exporting === 'json' ? 'Exporting...' : 'Export JSON'}
+                </button>
+                <span className="tooltip-bubble tooltip-bubble-right" role="tooltip">
+                  Re-runs the query and downloads every row it returns as a .json array of objects keyed by column
+                  name - ignoring the grid's sort, filters and hidden columns.
+                </span>
+              </span>
+              {exporting != null && (
+                <button
+                  type="button"
+                  className="job-button job-button-danger"
+                  disabled={cancelling || !activeQueryId}
+                  onClick={() => void handleCancel()}
+                >
+                  {cancelling ? 'Cancelling...' : 'Cancel export'}
+                </button>
+              )}
+            </div>
           </div>
-        </div>
+          {exportError && <p className="jobs-error">{exportError}</p>}
+          {lastExport && (
+            <p className="placeholder-note">
+              Exported {lastExport.row_count.toLocaleString()} row(s) to {lastExport.filename} (
+              {formatBytes(lastExport.size_bytes)}) in {formatElapsed(lastExport.elapsed_ms)}. It stays on the server
+              until about {new Date(lastExport.delete_after).toLocaleString()} -{' '}
+              <a href={adhocExportDownloadUrl(lastExport.id)}>download again</a>.
+            </p>
+          )}
+          <ReportGrid<ResultRow>
+            key={runId}
+            columns={gridColumns}
+            rows={result.rows}
+            rowKey={(row) => rowKeys.get(row) ?? ''}
+            formatCell={(row, key) => formatCell(row[key])}
+            emptyMessage="No rows returned."
+            copyable
+          />
+        </>
       )}
 
       {confirming && (

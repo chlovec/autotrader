@@ -60,6 +60,9 @@ TRAIN_LSTM_WALKFORWARD_JOB = "train-lstm-walkforward"
 PREDICT_LSTM_HOLDOUT_JOB = "predict-lstm-market-state-holdout"
 PREDICT_LSTM_WALKFORWARD_JOB = "predict-lstm-market-state-walkforward"
 BUY_SELL_PATTERN_JOB = "buy-sell-pattern"
+# Deletes the SQL console's export files once they're older than a configurable age -
+# see jobs/query_exports.py.
+QUERY_EXPORT_CLEANUP_JOB = "cleanup-query-exports"
 
 # job name -> training_method - jobs/engine.py's run_job looks up which of the two
 # flavors a given predict-lstm-market-state-* job name is via this dict, same "job name
@@ -145,6 +148,9 @@ DEFAULT_SCHEDULES: dict[str, tuple[str, int]] = {
     PREDICT_LSTM_HOLDOUT_JOB: ("days", 1),
     PREDICT_LSTM_WALKFORWARD_JOB: ("days", 1),
     BUY_SELL_PATTERN_JOB: ("days", 1),
+    # Frequent so an export is deleted soon after it reaches its max age (default 2
+    # hours), not up to a day later.
+    QUERY_EXPORT_CLEANUP_JOB: ("minutes", 15),
 }
 
 
@@ -276,6 +282,9 @@ class JobDefinition:
     # jobs/buy_sell_pattern.py) - only the buy-sell-pattern job takes this. Also paired
     # with has_ticker_selector on that job, to scope which tickers get computed.
     has_buy_sell_pattern_fields: bool = False
+    # Whether this job offers the single "Max age (hours)" field (see
+    # jobs/query_exports.py) - only the cleanup-query-exports job takes this.
+    has_query_export_cleanup_fields: bool = False
     # Seeded into JobConfig.run_type the first time this job's config row is created
     # (see app/main.py's _get_or_create_config). "auto" unless overridden below.
     default_run_type: str = "auto"
@@ -785,5 +794,18 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
         # Run-on-demand analysis over an explicit date range - manual by default, same
         # reasoning as backtest-market-state.
         default_run_type="manual",
+    ),
+    QUERY_EXPORT_CLEANUP_JOB: JobDefinition(
+        name=QUERY_EXPORT_CLEANUP_JOB,
+        label="Clean up query exports",
+        description=(
+            "Deletes SQL console export files (CSV/JSON) saved under "
+            "backend-v2/data/query_exports once they are at least Max age (hours) old "
+            "(default: 2). Only touches files the SQL console's exports created - "
+            "nothing in the database."
+        ),
+        has_bars_fields=False,
+        has_ticker_type_filter=False,
+        has_query_export_cleanup_fields=True,
     ),
 }

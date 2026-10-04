@@ -69,6 +69,7 @@ from jobs.registry import (
     PREDICT_10_DAY_MARKET_STATE_JOB,
     PREDICT_MARKET_STATE_JOB,
     PREDICTION_ACCURACY_JOB,
+    QUERY_EXPORT_CLEANUP_JOB,
     RESEARCH_PICKS_JOB,
     SNAPSHOTS_JOB,
     TICKER_DETAILS_JOB,
@@ -83,6 +84,8 @@ from jobs.ohlc_update import is_paused as ohlc_update_is_paused
 from jobs.ohlc_update import resolve_date_range as resolve_ohlc_update_date_range
 from jobs.ohlc_update import resume_at as ohlc_update_resume_at
 from jobs.ohlc_update import sync_ohlc_update_batch
+from jobs.query_exports import DEFAULT_MAX_AGE_HOURS as DEFAULT_QUERY_EXPORT_MAX_AGE_HOURS
+from jobs.query_exports import cleanup_query_exports
 from jobs.research_picks import compute_research_picks
 from jobs.sync_grouped_daily import resolve_date_range as resolve_grouped_daily_date_range
 from jobs.sync_grouped_daily import sync_grouped_daily
@@ -377,6 +380,16 @@ async def run_job(job_name: str, trigger: str) -> None:
             tickers = split_csv(config.tickers) or []
             count = await sync_etf_constituents(tickers, control=control)
             summary = f"{count}/{len(tickers)} etf holdings file(s) downloaded"
+        elif job_name == QUERY_EXPORT_CLEANUP_JOB:
+            # Filesystem only, no DB session or DataClient - off the event loop via
+            # asyncio.to_thread since a large export directory means many stat() calls.
+            max_age_hours = (
+                config.query_export_max_age_hours
+                if config.query_export_max_age_hours is not None
+                else DEFAULT_QUERY_EXPORT_MAX_AGE_HOURS
+            )
+            count = await asyncio.to_thread(cleanup_query_exports, max_age_hours, control=control)
+            summary = f"{count} query export file(s) older than {max_age_hours:g} hour(s) deleted"
         elif job_name == TRAIN_LSTM_HOLDOUT_JOB:
             # Same reasoning as the average-volume/predict-market-state branches above -
             # purely local, off the event loop via asyncio.to_thread. Training can take

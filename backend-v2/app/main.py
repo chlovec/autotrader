@@ -11,17 +11,21 @@ directly) - see db/session.py's WAL-mode comment for why that stopped being viab
 (a heavy job's CPU/DB usage could make the dashboard unresponsive while it ran).
 """
 
+import csv
 import datetime as dt
 import json
 import logging
 import os
-from contextlib import asynccontextmanager
+import threading
+import time
+from contextlib import asynccontextmanager, contextmanager
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from sqlalchemy import Float, case, cast, delete, func, or_, select, text, update
+from sqlalchemy import Connection, Float, case, cast, delete, func, or_, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.orm import Session, aliased
@@ -54,15 +58,18 @@ from db.models import (
     UnifiedSnapshot,
     WinRate,
 )
-from db.session import SessionLocal, init_db
+from db.session import SessionLocal, engine, init_db
 from jobs.buy_sell_pattern import MAX_TICKER_BATCH_SIZE, pattern_name_exists, resolve_pattern_name
 from jobs.config_store import get_or_create_config, interval_trigger, job_is_active, split_csv
+from jobs.query_exports import DEFAULT_MAX_AGE_HOURS as DEFAULT_QUERY_EXPORT_MAX_AGE_HOURS
+from jobs.query_exports import EXPORT_DIR, export_path, find_export, new_export_id
 from jobs.lstm_common import DEFAULT_WALKFORWARD_NUM_FOLDS
 from jobs.registry import (
     AVERAGE_VOLUME_JOB,
     BACKTEST_MARKET_STATE_JOB,
     BARS_JOB,
     BUY_SELL_PATTERN_JOB,
+    QUERY_EXPORT_CLEANUP_JOB,
     DEFAULT_START_TIME,
     ETF_CONSTITUENTS_JOB,
     GROUPED_DAILY_JOB,
@@ -193,6 +200,7 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         "has_prediction_accuracy_fields": definition.has_prediction_accuracy_fields,
         "has_win_rate_fields": definition.has_win_rate_fields,
         "has_buy_sell_pattern_fields": definition.has_buy_sell_pattern_fields,
+        "has_query_export_cleanup_fields": definition.has_query_export_cleanup_fields,
         "snapshot_type_options": SNAPSHOT_TYPE_OPTIONS,
         "run_type": config.run_type,
         "schedule_interval_unit": config.schedule_interval_unit,
@@ -247,6 +255,7 @@ def _job_to_dict(session: Session, job_name: str) -> dict[str, Any]:
         ),
         "buy_sell_pattern_name": config.buy_sell_pattern_name,
         "buy_sell_pattern_batch_size": config.buy_sell_pattern_batch_size,
+        "query_export_max_age_hours": config.query_export_max_age_hours,
         "hidden": config.hidden,
         "sort_order": config.sort_order,
         "running": config.run_requested_at is not None or run is not None,
@@ -299,6 +308,9 @@ _RESET_TABLES: dict[str, list[type[Base]]] = {
     PREDICTION_ACCURACY_JOB: [PredictionAccuracy],
     RESEARCH_PICKS_JOB: [ResearchPick],
     BUY_SELL_PATTERN_JOB: [BuySellPattern],
+    # No DB table - only deletes export files on disk, same reasoning as
+    # ETF_CONSTITUENTS_JOB above.
+    QUERY_EXPORT_CLEANUP_JOB: [],
     # train-lstm-holdout/train-lstm-walkforward share the lstm_model_versions table
     # (distinguished by training_method), and predict-lstm-market-state-holdout/
     # -walkforward share lstm_inferences (also distinguished by training_method) - the
@@ -374,6 +386,7 @@ class _JobFieldsIn(BaseModel):
     buy_sell_pattern_end_date: str | None = None
     buy_sell_pattern_name: str | None = None
     buy_sell_pattern_batch_size: int | None = None
+    query_export_max_age_hours: float | None = None
 
 
 class JobConfigIn(_JobFieldsIn):
@@ -408,6 +421,16 @@ class TickerTypeUpdateIn(BaseModel):
 
 class AdhocQueryIn(BaseModel):
     sql: str
+    # Client-chosen id that POST /admin/query/{query_id}/cancel can later name to abort
+    # this query mid-run - see _cancellable_query. Optional: without one the query
+    # simply can't be cancelled.
+    query_id: str | None = None
+
+
+class AdhocQueryExportIn(BaseModel):
+    sql: str
+    format: Literal["csv", "json"]
+    query_id: str | None = None  # same as AdhocQueryIn.query_id
 
 
 class WatchlistAddIn(BaseModel):
@@ -3350,6 +3373,8 @@ def _validate_and_normalize_job_fields(definition: JobDefinition, body: _JobFiel
         raise HTTPException(
             status_code=400, detail=f"buy_sell_pattern_batch_size must be between 1 and {MAX_TICKER_BATCH_SIZE}"
         )
+    if body.query_export_max_age_hours is not None and not body.query_export_max_age_hours > 0:
+        raise HTTPException(status_code=400, detail="query_export_max_age_hours must be greater than 0")
     if body.win_rate_mcmc_range_confidence_level is not None and not (
         0 < body.win_rate_mcmc_range_confidence_level < 1
     ):
@@ -3417,6 +3442,9 @@ def _validate_and_normalize_job_fields(definition: JobDefinition, body: _JobFiel
         ),
         "buy_sell_pattern_batch_size": (
             body.buy_sell_pattern_batch_size if definition.has_buy_sell_pattern_fields else None
+        ),
+        "query_export_max_age_hours": (
+            body.query_export_max_age_hours if definition.has_query_export_cleanup_fields else None
         ),
     }
     return fields
@@ -3675,6 +3703,58 @@ def job_runs(job_name: str, limit: int = 20) -> list[dict]:
 ADHOC_QUERY_MAX_ROWS = 1000
 
 
+# DBAPI (sqlite3) connection currently running each in-flight console query/export,
+# keyed by the client's query_id - what POST /admin/query/{query_id}/cancel interrupts.
+# The endpoints are plain `def`s, so FastAPI runs each in its own worker thread and the
+# cancel request is served while the query it targets is still running.
+_running_queries: dict[str, Any] = {}
+_cancelled_queries: set[str] = set()
+_running_queries_lock = threading.Lock()
+
+ADHOC_QUERY_CANCELLED_DETAIL = "Query cancelled."
+
+
+@contextmanager
+def _cancellable_query(query_id: str | None, dbapi_connection: Any):
+    """Registers `dbapi_connection` under query_id for the duration of the block, and
+    turns the sqlite3 "interrupted" error a cancel produces into a 409 with
+    ADHOC_QUERY_CANCELLED_DETAIL instead of the generic 400 an SQL error gets.
+    Interrupting rolls back the statement that was running, so a cancelled
+    UPDATE/DELETE leaves nothing half-applied."""
+    if query_id is None:
+        yield
+        return
+    with _running_queries_lock:
+        _running_queries[query_id] = dbapi_connection
+    try:
+        yield
+    except SQLAlchemyError as exc:
+        with _running_queries_lock:
+            cancelled = query_id in _cancelled_queries
+        if cancelled:
+            raise HTTPException(status_code=409, detail=ADHOC_QUERY_CANCELLED_DETAIL) from exc
+        raise
+    finally:
+        with _running_queries_lock:
+            _running_queries.pop(query_id, None)
+            _cancelled_queries.discard(query_id)
+
+
+@app.post("/admin/query/{query_id}/cancel")
+def cancel_adhoc_query(query_id: str) -> dict:
+    """Aborts the console query or export running under query_id via sqlite3's
+    Connection.interrupt(), which makes the in-progress statement fail at its next
+    step. `cancelled` is false if nothing is running under that id (it already
+    finished, or hasn't started yet)."""
+    with _running_queries_lock:
+        dbapi_connection = _running_queries.get(query_id)
+        if dbapi_connection is None:
+            return {"cancelled": False}
+        _cancelled_queries.add(query_id)
+        dbapi_connection.interrupt()
+    return {"cancelled": True}
+
+
 @app.post("/admin/query")
 def run_adhoc_query(body: AdhocQueryIn) -> dict:
     """Runs exactly one arbitrary SQL statement (SELECT or DML/DDL) against
@@ -3689,10 +3769,17 @@ def run_adhoc_query(body: AdhocQueryIn) -> dict:
         raise HTTPException(status_code=400, detail="SQL statement is required.")
     with SessionLocal() as session:
         try:
-            result = session.execute(text(sql))
+            # elapsed_ms spans execute + fetch, not just execute(): sqlite3 steps a SELECT
+            # lazily, so most of a query's real work happens while rows are fetched. For a
+            # truncated result it's the time to produce the first ADHOC_QUERY_MAX_ROWS + 1
+            # rows, not the whole result set.
+            started = time.perf_counter()
+            with _cancellable_query(body.query_id, session.connection().connection.dbapi_connection):
+                result = session.execute(text(sql))
+                fetched = result.fetchmany(ADHOC_QUERY_MAX_ROWS + 1) if result.returns_rows else None
             if result.returns_rows:
                 columns = list(result.keys())
-                fetched = result.fetchmany(ADHOC_QUERY_MAX_ROWS + 1)
+                elapsed_ms = (time.perf_counter() - started) * 1000
                 truncated = len(fetched) > ADHOC_QUERY_MAX_ROWS
                 fetched = fetched[:ADHOC_QUERY_MAX_ROWS]
                 session.commit()
@@ -3702,14 +3789,148 @@ def run_adhoc_query(body: AdhocQueryIn) -> dict:
                     "rows": [dict(zip(columns, row, strict=True)) for row in fetched],
                     "row_count": len(fetched),
                     "truncated": truncated,
+                    "elapsed_ms": round(elapsed_ms, 1),
                 }
+            elapsed_ms = (time.perf_counter() - started) * 1000
             rowcount = result.rowcount
             session.commit()
             return {
                 "kind": "statement",
                 "rowcount": rowcount if rowcount is not None and rowcount >= 0 else None,
+                "elapsed_ms": round(elapsed_ms, 1),
             }
+        except HTTPException:
+            session.rollback()
+            raise
         except SQLAlchemyError as exc:
             session.rollback()
             detail = str(getattr(exc, "orig", None) or exc)
             raise HTTPException(status_code=400, detail=detail) from exc
+
+
+# Rows pulled from the cursor per fetchmany() while writing an export - keeps memory
+# flat no matter how many rows the query returns.
+ADHOC_EXPORT_CHUNK_ROWS = 5000
+
+
+def _close_export_connection(conn: Connection) -> None:
+    """query_only is a per-connection PRAGMA, so it has to be switched back off before
+    this connection goes back to the pool - otherwise the next unrelated request that
+    happens to get it (a job, the console's own DML) would fail with "attempt to write a
+    readonly database". This uses a Connection rather than a Session on purpose: a
+    Session hands its DBAPI connection back to the pool on rollback(), so a PRAGMA run
+    after that could land on a different pooled connection than the one it's meant to
+    reset. A Connection keeps the same DBAPI connection until close()."""
+    try:
+        conn.rollback()
+        conn.exec_driver_sql("PRAGMA query_only = OFF")
+    finally:
+        conn.close()
+
+
+def _write_export_rows(file: Any, fmt: str, columns: list[str], first_chunk: list, result: Any) -> int:
+    """Writes the whole result to `file` and returns how many rows it wrote - CSV with a
+    header row, or one JSON array of {column: value} objects (the same row shape
+    /admin/query returns; default=str covers anything sqlite3 hands back that json
+    can't encode natively)."""
+    row_count = 0
+    chunk = first_chunk
+    if fmt == "csv":
+        writer = csv.writer(file)
+        writer.writerow(columns)
+        while chunk:
+            writer.writerows(chunk)
+            row_count += len(chunk)
+            chunk = result.fetchmany(ADHOC_EXPORT_CHUNK_ROWS)
+        return row_count
+    file.write("[")
+    while chunk:
+        objects = (json.dumps(dict(zip(columns, row, strict=True)), default=str) for row in chunk)
+        file.write(("," if row_count else "") + ",".join(objects))
+        row_count += len(chunk)
+        chunk = result.fetchmany(ADHOC_EXPORT_CHUNK_ROWS)
+    file.write("]")
+    return row_count
+
+
+def _export_download_name(path: Any) -> str:
+    created = dt.datetime.fromtimestamp(path.stat().st_mtime, dt.timezone.utc)
+    return f"query-results-{created:%Y%m%d-%H%M%S}{path.suffix}"
+
+
+@app.post("/admin/query/export")
+def export_adhoc_query(body: AdhocQueryExportIn) -> dict:
+    """Saves the full result of one SQL query as a CSV or JSON file under
+    jobs/query_exports.py's EXPORT_DIR, for the SQL console's export buttons - the
+    browser then downloads it from GET /admin/query/exports/{id}, and the
+    cleanup-query-exports job deletes it once it's older than that job's max age.
+
+    Unlike /admin/query there's no ADHOC_QUERY_MAX_ROWS cap: the file holds exactly
+    what the SQL itself returns, whether it has a LIMIT of its own or not. Runs under
+    PRAGMA query_only so an export can never re-run a write - the console only offers
+    export for a result that already came back as rows, but nothing stops a caller
+    from POSTing an UPDATE here directly. Written to a .part file first and renamed
+    once complete, so a failed or in-progress export is never downloadable."""
+    sql = body.sql.strip()
+    if not sql:
+        raise HTTPException(status_code=400, detail="SQL statement is required.")
+    export_id = new_export_id()
+    final_path = export_path(export_id, body.format)
+    part_path = final_path.with_name(final_path.name + ".part")
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    started = time.perf_counter()
+    conn = engine.connect()
+    try:
+        conn.exec_driver_sql("PRAGMA query_only = ON")
+        with _cancellable_query(body.query_id, conn.connection.dbapi_connection):
+            result = conn.execute(text(sql))
+            if not result.returns_rows:
+                raise HTTPException(status_code=400, detail="Only statements that return rows can be exported.")
+            columns = list(result.keys())
+            first_chunk = result.fetchmany(ADHOC_EXPORT_CHUNK_ROWS)
+            with part_path.open("w", newline="", encoding="utf-8") as file:
+                row_count = _write_export_rows(file, body.format, columns, first_chunk, result)
+        part_path.replace(final_path)
+    except SQLAlchemyError as exc:
+        part_path.unlink(missing_ok=True)
+        detail = str(getattr(exc, "orig", None) or exc)
+        raise HTTPException(status_code=400, detail=detail) from exc
+    except BaseException:
+        part_path.unlink(missing_ok=True)
+        raise
+    finally:
+        _close_export_connection(conn)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+
+    with SessionLocal() as session:
+        config = session.get(JobConfig, QUERY_EXPORT_CLEANUP_JOB)
+    max_age_hours = (
+        config.query_export_max_age_hours
+        if config is not None and config.query_export_max_age_hours is not None
+        else DEFAULT_QUERY_EXPORT_MAX_AGE_HOURS
+    )
+    # The earliest the cleanup job will delete it - the actual deletion happens on that
+    # job's first run at or after this time.
+    delete_after = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=max_age_hours)
+    return {
+        "id": export_id,
+        "format": body.format,
+        "filename": _export_download_name(final_path),
+        "row_count": row_count,
+        "size_bytes": final_path.stat().st_size,
+        "elapsed_ms": round(elapsed_ms, 1),
+        "delete_after": delete_after.isoformat(),
+    }
+
+
+@app.get("/admin/query/exports/{export_id}")
+def download_adhoc_query_export(export_id: str) -> FileResponse:
+    """Serves a file saved by export_adhoc_query as an attachment, so the browser
+    streams it straight to disk instead of holding it in memory."""
+    path = find_export(export_id)
+    if path is None:
+        raise HTTPException(
+            status_code=404, detail="Export not found - it may have been deleted by cleanup-query-exports."
+        )
+    media_type = "text/csv; charset=utf-8" if path.suffix == ".csv" else "application/json"
+    return FileResponse(path, media_type=media_type, filename=_export_download_name(path))

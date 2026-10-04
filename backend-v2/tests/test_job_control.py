@@ -6,7 +6,7 @@ import time
 import pytest
 
 from db.models import JobRun
-from db.session import SessionLocal, init_db
+from db.session import SessionLocal, engine, init_db
 from jobs.control import JobCancelled, JobControl, report_job_progress
 
 
@@ -199,4 +199,31 @@ def test_report_job_progress_is_noop_when_run_missing():
     try:
         report_job_progress(session, run_id=999_999, completed=0, total=10)  # should not raise
     finally:
+        session.close()
+
+
+def test_report_job_progress_skips_update_when_database_is_locked(caplog):
+    """Another writer holding SQLite's write lock past busy_timeout (e.g.
+    predict-market-state mid-batch) shouldn't fail the reporting job - the tick is
+    skipped and the session stays usable for the next one."""
+    run_id = _make_run()
+    session = SessionLocal()
+    holder = engine.raw_connection()
+    try:
+        # Fail fast instead of waiting out the real 30s busy_timeout.
+        session.connection().exec_driver_sql("PRAGMA busy_timeout=0")
+        holder.cursor().execute("BEGIN IMMEDIATE")
+
+        report_job_progress(session, run_id, 5, 100, force=True)  # should not raise
+        assert "database is locked" in caplog.text
+
+        holder.rollback()
+        assert _progress(run_id) != (5, 100)
+
+        report_job_progress(session, run_id, 6, 100, force=True)
+        assert _progress(run_id) == (6, 100)
+    finally:
+        holder.close()
+        # Pooled connection - put the real timeout back for whichever test reuses it.
+        session.connection().exec_driver_sql("PRAGMA busy_timeout=30000")
         session.close()

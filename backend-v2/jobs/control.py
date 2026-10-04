@@ -16,8 +16,10 @@ top of that.
 """
 
 import asyncio
+import logging
 import threading
 
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from db.models import JobRun
@@ -28,6 +30,8 @@ from db.models import JobRun
 # dashboard operated by a human (worst case: a fifth of a second to notice a resume or
 # a cancel requested while still paused).
 _POLL_INTERVAL_SECONDS = 0.2
+
+logger = logging.getLogger("backend_v2.jobs.control")
 
 # How often report_job_progress actually commits, in units of work completed - a large
 # fan-out (e.g. sync-bars-nightly's ~46k tickers) would otherwise commit on every
@@ -119,14 +123,25 @@ def report_job_progress(
     dashboard's progress bar frozen at 0 until the run's final unit completes.
 
     No-op if run_id is None - callers (e.g. sync_bars_manual's CLI entry point) that
-    don't have a JobRun row simply don't get progress tracked."""
+    don't have a JobRun row simply don't get progress tracked.
+
+    A "database is locked" (another writer holding SQLite's write lock past
+    busy_timeout - e.g. predict-market-state mid-batch) is logged and swallowed: a
+    progress tick is cosmetic, and the next one catches the bar up, so it shouldn't
+    fail the whole run. Rolled back so `session` stays usable for the job's own work."""
     if run_id is None:
         return
     if not force and completed != total and completed % _PROGRESS_COMMIT_INTERVAL != 0:
         return
-    run = session.get(JobRun, run_id)
-    if run is None:
-        return
-    run.progress_completed = completed
-    run.progress_total = total
-    session.commit()
+    try:
+        run = session.get(JobRun, run_id)
+        if run is None:
+            return
+        run.progress_completed = completed
+        run.progress_total = total
+        session.commit()
+    except OperationalError as exc:
+        if "database is locked" not in str(exc):
+            raise
+        session.rollback()
+        logger.warning("skipped progress update %d/%d for run %d: database is locked", completed, total, run_id)

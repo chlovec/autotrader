@@ -2135,7 +2135,28 @@ body {
 .sql-console-toolbar {
   display: flex;
   justify-content: flex-end;
+  gap: 8px;
   margin: 12px 0 20px;
+}
+
+/* Row count + execution time on the left, Export CSV/JSON on the right - wraps under
+   each other on narrow screens. */
+.sql-console-result-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  margin-bottom: 8px;
+}
+
+.sql-console-result-bar .placeholder-note {
+  margin: 0;
+}
+
+.sql-console-export-buttons {
+  display: flex;
+  gap: 8px;
 }
 
 /* Watchlist page's per-row reorder controls - drag handle (same .job-drag-handle as

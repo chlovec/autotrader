@@ -31,7 +31,6 @@ import statistics
 from itertools import groupby
 
 from sqlalchemy import select
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from db.models import MarketPredictionMonteCarlo, OhlcBar
@@ -47,6 +46,7 @@ from jobs.predict_market_state import (
     _bucket_states,
     _fit_transition,
     _transition_row,
+    _upsert_batch,
 )
 
 logger = logging.getLogger("backend_v2.jobs.predict_market_state_mcmc")
@@ -145,6 +145,8 @@ def compute_market_state_mcmc_predictions(
     state_range = range(len(STATE_LABELS))
     computed_at = dt.datetime.utcnow()
     stored = 0
+    pending: list[dict] = []
+    index_elements = [MarketPredictionMonteCarlo.ticker, MarketPredictionMonteCarlo.predicted_date]
     skipped = 0
     for ticker, group in groupby(rows, key=lambda row: row.ticker):
         if control is not None:
@@ -209,15 +211,11 @@ def compute_market_state_mcmc_predictions(
             "history_days": len(returns),
             "computed_at": computed_at,
         }
-        stmt = sqlite_insert(MarketPredictionMonteCarlo).values(**values)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=[MarketPredictionMonteCarlo.ticker, MarketPredictionMonteCarlo.predicted_date],
-            set_=values,
-        )
-        session.execute(stmt)
+        pending.append(values)
         stored += 1
-        if stored % COMMIT_BATCH_SIZE == 0:
-            session.commit()
+        if len(pending) >= COMMIT_BATCH_SIZE:
+            _upsert_batch(session, MarketPredictionMonteCarlo, index_elements, pending)
+    _upsert_batch(session, MarketPredictionMonteCarlo, index_elements, pending)
     session.commit()
 
     logger.info(
