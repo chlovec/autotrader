@@ -1,28 +1,42 @@
 """Computes, per selected ticker, the set of buy/sell trades across a [start_date,
-end_date] range of daily ohlc_bars that maximizes total profit, and stores them in the
-buy_sell_patterns table (db/models.py's BuySellPattern) under a run name - one "buy" row
-(price = the buy day's low) and one "sell" row (price = the sell day's high) per trade.
+end_date] range of daily bars - either bound optional, a missing one leaving that side
+of the range open that maximizes total profit, and stores them in the
+buy_sell_patterns table (db/models.py's BuySellPattern) under a run name - recorded once
+in buy_sell_pattern_names (BuySellPatternName), which each trade row points to by
+pattern_id - one "buy" row
+and one "sell" row per trade, each priced at the open or close it traded at and stamped
+with that price point's datetime: the bar's date at MARKET_OPEN for an open, at
+MARKET_CLOSE (21:00 UTC, stored naive) for a close - daily bars carry no intraday
+time, same reasoning as jobs/predict_market_state.py's ENTRY_TIME/EXIT_TIME.
 
-Trade rules:
+Bars are read from the tickers_daily_bars_min_60_days_from_latest view (see
+db/session.py) - so only tickers with a bar on the latest trading day and a full 60
+most recent daily bars are considered - filtered by the run's Start/End date and
+ticker type/ticker selection.
 
-- Buy at the buy day's low; sell at the sell day's high - profit = high[sell] - low[buy].
-- A trade may buy and sell on the same day only if that day's close is above its low
-  (the purchase price); otherwise the sell must come on a later day.
-- Any number of trades per ticker, never overlapping: the next buy is on a day after
-  the previous sell day.
+Trade rules - each day contributes two price points, its open then its close, giving
+one sequence open[0], close[0], open[1], close[1], ...:
 
-Because buys and sells read different price series (low vs high), the classic "sum
-every up-move" greedy doesn't apply - see max_profit_trades for the exact DP.
+- A trade buys at any price point and sells at a later, higher one - so a buy can be
+  at a day's open or close, and so can a sell. profit = sell price - buy price.
+- A trade may buy and sell on the same day (buy at the open, sell at the close) when
+  the close is above the open.
+- Any number of trades per ticker, never overlapping: the next buy is at a price point
+  after the previous sell - which can be the same day (sell at the open, buy back at
+  the close).
 
-Each run's rows are labelled with a name - by default "<start_date>_<end_date>",
-overridable on a manual run (see resolve_pattern_name). A name that already has rows
+Under these rules every up-move between consecutive price points can be captured, so
+the classic valley/peak greedy is exact - see max_profit_trades_unlimited.
+
+Each run's rows are labelled with a name - by default "<start_date>_<end_date>", with
+"earliest"/"latest" standing in for a missing Start/End date - overridable on a manual run (see resolve_pattern_name). A name that already has rows
 is a conflict: the run fails unless it was explicitly asked to replace them (see
 app/main.py's trigger_job, which warns the dashboard before a manual run gets here).
 
 A run is all-or-nothing: each ticker batch is written to a connection-private TEMP
 staging table, and only once every batch has succeeded are the rows copied into
 buy_sell_patterns (replacing the name's old rows, if asked) and committed in one short
-transaction. An error or cancel part-way through leaves buy_sell_patterns untouched.
+transaction, together with the name's buy_sell_pattern_names row. An error or cancel part-way through leaves buy_sell_patterns untouched.
 Staging in a TEMP table rather than holding one long transaction open on
 buy_sell_patterns matters on sqlite: TEMP writes don't take the main database's single
 write lock, so the dashboard's Pause/Cancel, progress updates, and other jobs can still
@@ -36,17 +50,41 @@ import itertools
 import logging
 from dataclasses import dataclass
 
-from sqlalchemy import Column, Date, DateTime, Float, MetaData, String, Table, delete, distinct, insert, select
+from typing import NamedTuple
+
+from sqlalchemy import (
+    Column,
+    DateTime,
+    Float,
+    MetaData,
+    String,
+    Table,
+    delete,
+    distinct,
+    func,
+    insert,
+    literal,
+    select,
+    update,
+)
 from sqlalchemy.orm import Session
 
-from db.models import BuySellPattern, OhlcBar
-from jobs.average_volume import _apply_ticker_filter
+from db.models import BuySellPattern, BuySellPatternName, Ticker
 from jobs.control import JobControl, report_job_progress
 
 logger = logging.getLogger("backend_v2.jobs.buy_sell_pattern")
 
-DEFAULT_MULTIPLIER = 1
-DEFAULT_TIMESPAN = "day"
+# The columns of db/session.py's tickers_daily_bars_min_60_days_from_latest view
+# this job reads - already daily bars only (multiplier 1, timespan "day"). Not part of
+# Base.metadata, so create_all never tries to create it as a table.
+_TICKERS_DAILY_BARS_MIN_60_VIEW = Table(
+    "tickers_daily_bars_min_60_days_from_latest",
+    MetaData(),
+    Column("ticker", String),
+    Column("timestamp", DateTime(timezone=False)),
+    Column("open", Float),
+    Column("close", Float),
+)
 
 # Default number of tickers whose bars are loaded, solved, and committed together -
 # keeps memory bounded on an every-ticker run. Overridable per run from the dashboard
@@ -55,20 +93,23 @@ DEFAULT_TIMESPAN = "day"
 TICKER_BATCH_SIZE = 500
 MAX_TICKER_BATCH_SIZE = 5000
 
+# The time of day a trade at a bar's open/close is stamped with (see the module
+# docstring). MARKET_CLOSE is 21:00 UTC on the bar's own date.
+MARKET_OPEN = dt.time(9, 30)
+MARKET_CLOSE = dt.time(21, 0)
+
 
 # Mirrors buy_sell_patterns' columns and primary key (so a duplicate row fails on the
-# batch that produced it), minus the tickers FK - a TEMP table can't reference a table
-# in the main database.
+# batch that produced it), minus pattern_id - one run writes one pattern, whose id is
+# only known in the final transaction - and minus the FKs, since a TEMP table can't
+# reference a table in the main database.
 _STAGING = Table(
     "buy_sell_patterns_staging",
     MetaData(),
-    Column("name", String, primary_key=True),
     Column("ticker", String, primary_key=True),
-    Column("trade_date", Date, primary_key=True),
+    Column("trade_datetime", DateTime(timezone=False), primary_key=True),
     Column("buy_sell", String, primary_key=True),
     Column("price", Float),
-    Column("created_at", DateTime(timezone=False)),
-    Column("updated_at", DateTime(timezone=False)),
     prefixes=["TEMPORARY"],
 )
 
@@ -80,16 +121,15 @@ class PatternNameConflict(ValueError):
 @dataclass(frozen=True)
 class DailyBar:
     date: dt.date
-    low: float
-    high: float
+    open: float
     close: float
 
 
 @dataclass(frozen=True)
 class Trade:
-    buy_date: dt.date
+    buy_datetime: dt.datetime
     buy_price: float
-    sell_date: dt.date
+    sell_datetime: dt.datetime
     sell_price: float
 
     @property
@@ -97,11 +137,28 @@ class Trade:
         return self.sell_price - self.buy_price
 
 
-def default_pattern_name(start_date: dt.date, end_date: dt.date) -> str:
-    return f"{start_date.isoformat()}_{end_date.isoformat()}"
+class PricePoint(NamedTuple):
+    at: dt.datetime
+    price: float
 
 
-def resolve_pattern_name(name: str | None, start_date: dt.date, end_date: dt.date, trigger: str) -> str:
+def open_datetime(date: dt.date) -> dt.datetime:
+    return dt.datetime.combine(date, MARKET_OPEN)
+
+
+def close_datetime(date: dt.date) -> dt.datetime:
+    return dt.datetime.combine(date, MARKET_CLOSE)
+
+
+def default_pattern_name(start_date: dt.date | None, end_date: dt.date | None) -> str:
+    start = start_date.isoformat() if start_date else "earliest"
+    end = end_date.isoformat() if end_date else "latest"
+    return f"{start}_{end}"
+
+
+def resolve_pattern_name(
+    name: str | None, start_date: dt.date | None, end_date: dt.date | None, trigger: str
+) -> str:
     """A manual run uses the caller's name when one is given; every auto run, and a
     manual run with a blank name, uses default_pattern_name."""
     if trigger == "manual" and name and name.strip():
@@ -109,110 +166,224 @@ def resolve_pattern_name(name: str | None, start_date: dt.date, end_date: dt.dat
     return default_pattern_name(start_date, end_date)
 
 
-def validate_date_range(start_date: dt.date | None, end_date: dt.date | None) -> tuple[dt.date, dt.date]:
-    if start_date is None or end_date is None:
-        raise ValueError("buy-sell-pattern needs both a Start date and an End date")
-    if start_date > end_date:
+def validate_date_range(
+    start_date: dt.date | None, end_date: dt.date | None
+) -> tuple[dt.date | None, dt.date | None]:
+    """Either date may be None - that side of the range is then unbounded."""
+    if start_date is not None and end_date is not None and start_date > end_date:
         raise ValueError("buy-sell-pattern's Start date must not be after End date")
     return start_date, end_date
 
 
 def pattern_name_exists(session: Session, name: str) -> bool:
-    return session.execute(select(BuySellPattern.name).where(BuySellPattern.name == name).limit(1)).first() is not None
+    return (
+        session.execute(
+            select(BuySellPatternName.id).where(BuySellPatternName.name == name)
+        ).first()
+        is not None
+    )
 
 
-def max_profit_trades(bars: list[DailyBar]) -> list[Trade]:
-    """Exact maximum-total-profit set of non-overlapping trades over `bars` (sorted by
-    date), under the module docstring's rules.
+def max_profit_trades_unlimited(bars: list[DailyBar]) -> list[Trade]:
+    """Calculates all profitable trades to maximize cumulative profit from daily bar data.
 
-    DP over days, two states at the end of day t:
-      cash[t] - best profit holding nothing
-      hold[t] - best profit holding one share (bought on some day <= t, not yet sold)
-    transitions:
-      hold[t] = max(hold[t-1], cash[t-1] - low[t])                    buy today
-      cash[t] = max(cash[t-1],
-                    hold[t-1] + high[t],                              sell a prior buy
-                    cash[t-1] + high[t] - low[t]  if close[t] > low[t])  same-day trade
-    Buying from cash[t-1] (not cash[t]) is what keeps the next buy after the previous
-    sell day. Ties keep the option with fewer trades. Each day's choices are recorded
-    and walked backwards from cash[last] to recover the trades."""
+    This algorithm uses a two-pointer peak-and-valley strategy across a flattened
+    chronological sequence of open and close prices. It supports unlimited
+    non-overlapping trades (equivalent to LeetCode 122), entering positions at
+    local minimums (valleys) and exiting at local maximums (peaks).
+
+    Algorithm Breakdown:
+        1. **Chronological Ordering & Flattening**:
+           Sorts bars by date and flattens daily bars into discrete price points
+           ordered as [Open_0, Close_0, Open_1, Close_1, ...].
+        2. **Valley Detection (Buy Entry)**:
+           Advances pointer `i` through non-increasing price segments to locate
+           the trough before an upward movement begins.
+        3. **Peak Detection (Sell Exit)**:
+           Advances pointer `i` through non-decreasing price segments to ride the
+           rally up to its crest.
+        4. **Validation & Logging**:
+           Appends the executed trade to the result list only if `sell_price > buy_price`.
+           The outer loop automatically begins looking for the next entry immediately
+           from the exit position.
+
+    Complexity:
+        - Time Complexity: O(N log N) dominated by the initial date sort, where N is
+          the number of daily bars. The peak-valley traversal itself is strictly O(N)
+          as each point is visited at most twice.
+        - Space Complexity: O(N) to store flattened price points and generated trades.
+
+    Args:
+        bars: A list of `DailyBar` records containing date, open, and close prices.
+
+    Returns:
+        A list of `Trade` instances representing optimal entries and exits.
+        Returns an empty list if input has fewer than 2 price points or no upward trend.
+
+    Example:
+        >>> bars = [
+        ...     DailyBar(date=dt.date(2026, 1, 1), open=10.0, close=15.0),
+        ...     DailyBar(date=dt.date(2026, 1, 2), open=12.0, close=20.0),
+        ... ]
+        >>> trades = max_profit_trades_unlimited(bars)
+        >>> len(trades)
+        2
+        >>> trades[0]
+        Trade(buy_datetime=datetime.datetime(2026, 1, 1, 9, 30), buy_price=10.0, sell_datetime=datetime.datetime(2026, 1, 1, 21, 0), sell_price=15.0)
+    """
     if not bars:
         return []
-    cash, hold = 0.0, float("-inf")
-    # Per day: cash choice ("carry" | "sell" | "same_day"), hold choice ("carry" | "buy").
-    cash_choices: list[str] = []
-    hold_choices: list[str] = []
-    for bar in bars:
-        buy = cash - bar.low
-        new_hold, hold_choice = (buy, "buy") if buy > hold else (hold, "carry")
 
-        new_cash, cash_choice = cash, "carry"
-        if hold + bar.high > new_cash:
-            new_cash, cash_choice = hold + bar.high, "sell"
-        if bar.close > bar.low and cash + bar.high - bar.low > new_cash:
-            new_cash, cash_choice = cash + bar.high - bar.low, "same_day"
+    sorted_bars = sorted(bars, key=lambda b: b.date)
 
-        cash, hold = new_cash, new_hold
-        cash_choices.append(cash_choice)
-        hold_choices.append(hold_choice)
-
+    # Flatten open and close into discrete sequential price points
+    points: list[PricePoint] = []
+    for b in sorted_bars:
+        points.extend(
+            (
+                PricePoint(at=open_datetime(b.date), price=b.open),
+                PricePoint(at=close_datetime(b.date), price=b.close),
+            )
+        )
     trades: list[Trade] = []
-    state = "cash"
-    sell_index: int | None = None
-    for t in range(len(bars) - 1, -1, -1):
-        if state == "cash":
-            choice = cash_choices[t]
-            if choice == "sell":
-                sell_index, state = t, "hold"
-            elif choice == "same_day":
-                bar = bars[t]
-                trades.append(Trade(bar.date, bar.low, bar.date, bar.high))
-        elif hold_choices[t] == "buy":
-            assert sell_index is not None
-            buy_bar, sell_bar = bars[t], bars[sell_index]
-            trades.append(Trade(buy_bar.date, buy_bar.low, sell_bar.date, sell_bar.high))
-            sell_index, state = None, "cash"
-    trades.reverse()
+    n = len(points)
+    i = 0
+
+    while i < n - 1:
+        # Find local minimum (valley)
+        while i < n - 1 and points[i].price >= points[i + 1].price:
+            i += 1
+        if i >= n - 1:
+            break
+        buy_pt = points[i]
+
+        # Find local maximum (peak)
+        while i < n - 1 and points[i].price <= points[i + 1].price:
+            i += 1
+        sell_pt = points[i]
+
+        if sell_pt.price > buy_pt.price:
+            trades.append(
+                Trade(
+                    buy_datetime=buy_pt.at,
+                    buy_price=buy_pt.price,
+                    sell_datetime=sell_pt.at,
+                    sell_price=sell_pt.price,
+                )
+            )
+
     return trades
+
+
+def _apply_ticker_filter(
+    query, ticker_types: list[str] | None, tickers: list[str] | None
+):
+    """Same shape as jobs/average_volume.py's _apply_ticker_filter, against the view's
+    ticker column instead of OhlcBar.ticker."""
+    if tickers and ticker_types:
+        raise ValueError("specify tickers or ticker_types, not both")
+    view = _TICKERS_DAILY_BARS_MIN_60_VIEW.c
+    if tickers:
+        return query.where(view.ticker.in_(tickers))
+    if ticker_types:
+        return query.where(
+            view.ticker.in_(select(Ticker.ticker).where(Ticker.type.in_(ticker_types)))
+        )
+    return query
+
+
+def _date_range_conditions(start: dt.datetime | None, end: dt.datetime | None) -> list:
+    """The view's timestamp bounds for whichever of start/end is set."""
+    view = _TICKERS_DAILY_BARS_MIN_60_VIEW.c
+    conditions = []
+    if start is not None:
+        conditions.append(view.timestamp >= start)
+    if end is not None:
+        conditions.append(view.timestamp <= end)
+    return conditions
 
 
 def _select_tickers(
     session: Session,
-    start: dt.datetime,
-    end: dt.datetime,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
     ticker_types: list[str] | None,
     tickers: list[str] | None,
 ) -> list[str]:
-    query = select(distinct(OhlcBar.ticker)).where(
-        OhlcBar.multiplier == DEFAULT_MULTIPLIER,
-        OhlcBar.timespan == DEFAULT_TIMESPAN,
-        OhlcBar.timestamp >= start,
-        OhlcBar.timestamp <= end,
-    )
+    view = _TICKERS_DAILY_BARS_MIN_60_VIEW.c
+    query = select(distinct(view.ticker)).where(*_date_range_conditions(start, end))
     query = _apply_ticker_filter(query, ticker_types, tickers)
     return sorted(session.execute(query).scalars())
 
 
-def _load_bars(session: Session, tickers: list[str], start: dt.datetime, end: dt.datetime) -> dict[str, list[DailyBar]]:
+def _load_bars(
+    session: Session,
+    tickers: list[str],
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+) -> dict[str, list[DailyBar]]:
+    view = _TICKERS_DAILY_BARS_MIN_60_VIEW.c
     rows = session.execute(
-        select(OhlcBar.ticker, OhlcBar.timestamp, OhlcBar.low, OhlcBar.high, OhlcBar.close)
+        select(view.ticker, view.timestamp, view.open, view.close)
         .where(
-            OhlcBar.ticker.in_(tickers),
-            OhlcBar.multiplier == DEFAULT_MULTIPLIER,
-            OhlcBar.timespan == DEFAULT_TIMESPAN,
-            OhlcBar.timestamp >= start,
-            OhlcBar.timestamp <= end,
-            # A bar missing a price, or with a non-positive one, can't be traded on.
-            OhlcBar.low > 0,
-            OhlcBar.high > 0,
-            OhlcBar.close > 0,
+            view.ticker.in_(tickers),
+            *_date_range_conditions(start, end)
         )
-        .order_by(OhlcBar.ticker, OhlcBar.timestamp)
+        .order_by(view.ticker, view.timestamp)
     ).all()
     return {
-        ticker: [DailyBar(timestamp.date(), low, high, close) for _, timestamp, low, high, close in group]
+        ticker: [
+            DailyBar(timestamp.date(), open_, close)
+            for _, timestamp, open_, close in group
+        ]
         for ticker, group in itertools.groupby(rows, key=lambda row: row[0])
     }
+
+
+def _publish_pattern(staging_conn, name: str, now: dt.datetime) -> None:
+    """Swaps the staged trades in as pattern `name`, on staging_conn's open transaction:
+    clears the name's old trades (if any), then inserts or updates its
+    buy_sell_pattern_names row - keeping its id and created_at on a replace - with the
+    staged span, and copies the staged rows under that id. A run that staged no trades
+    deletes the name's row instead, so a name never exists without trades (as before
+    the name moved out of buy_sell_patterns, when "exists" meant "has rows")."""
+    names = BuySellPatternName.__table__
+    pattern_id = staging_conn.execute(
+        select(names.c.id).where(names.c.name == name)
+    ).scalar()
+    if pattern_id is not None:
+        staging_conn.execute(
+            delete(BuySellPattern).where(BuySellPattern.pattern_id == pattern_id)
+        )
+    first, last = staging_conn.execute(
+        select(func.min(_STAGING.c.trade_datetime), func.max(_STAGING.c.trade_datetime))
+    ).one()
+    if first is None:
+        if pattern_id is not None:
+            staging_conn.execute(delete(names).where(names.c.id == pattern_id))
+        return
+    if pattern_id is None:
+        pattern_id = staging_conn.execute(
+            insert(names).values(
+                name=name,
+                first_trade_datetime=first,
+                last_trade_datetime=last,
+                created_at=now,
+                updated_at=now,
+            )
+        ).inserted_primary_key[0]
+    else:
+        staging_conn.execute(
+            update(names)
+            .where(names.c.id == pattern_id)
+            .values(first_trade_datetime=first, last_trade_datetime=last, updated_at=now)
+        )
+    staging_conn.execute(
+        insert(BuySellPattern.__table__).from_select(
+            ["pattern_id", *(column.name for column in _STAGING.columns)],
+            select(literal(pattern_id), *_STAGING.columns),
+        )
+    )
 
 
 @dataclass
@@ -225,8 +396,8 @@ class BuySellPatternResult:
 
 def compute_buy_sell_pattern(
     session: Session,
-    start_date: dt.date,
-    end_date: dt.date,
+    start_date: dt.date | None,
+    end_date: dt.date | None,
     name: str,
     ticker_types: list[str] | None = None,
     tickers: list[str] | None = None,
@@ -235,7 +406,10 @@ def compute_buy_sell_pattern(
     control: JobControl | None = None,
     run_id: int | None = None,
 ) -> BuySellPatternResult:
-    """Raises PatternNameConflict if `name` already has rows and `replace` is False.
+    """A None start_date/end_date leaves that side of the range open - every bar in
+    the view from the earliest / through the latest.
+
+    Raises PatternNameConflict if `name` already has rows and `replace` is False.
     With `replace`, that name's existing rows are deleted (every ticker, not just this
     run's selection) in the same final transaction that inserts the new ones.
 
@@ -249,15 +423,17 @@ def compute_buy_sell_pattern(
     tickers."""
     start_date, end_date = validate_date_range(start_date, end_date)
     if not 1 <= batch_size <= MAX_TICKER_BATCH_SIZE:
-        raise ValueError(f"buy-sell-pattern's batch size must be between 1 and {MAX_TICKER_BATCH_SIZE}")
+        raise ValueError(
+            f"buy-sell-pattern's batch size must be between 1 and {MAX_TICKER_BATCH_SIZE}"
+        )
     existed = pattern_name_exists(session, name)
     if existed and not replace:
         raise PatternNameConflict(
             f"buy_sell_pattern already has rows named {name!r} - pick another name or choose to replace them"
         )
 
-    start = dt.datetime.combine(start_date, dt.time.min)
-    end = dt.datetime.combine(end_date, dt.time.max)
+    start = dt.datetime.combine(start_date, dt.time.min) if start_date else None
+    end = dt.datetime.combine(end_date, dt.time.max) if end_date else None
     selected = _select_tickers(session, start, end, ticker_types, tickers)
     report_job_progress(session, run_id, 0, len(selected), force=True)
 
@@ -277,40 +453,33 @@ def compute_buy_sell_pattern(
                 batch = selected[offset : offset + batch_size]
                 rows = []
                 for ticker, bars in _load_bars(session, batch, start, end).items():
-                    for trade in max_profit_trades(bars):
-                        for buy_sell, trade_date, price in (
-                            ("buy", trade.buy_date, trade.buy_price),
-                            ("sell", trade.sell_date, trade.sell_price),
-                        ):
-                            rows.append(
-                                {
-                                    "name": name,
-                                    "ticker": ticker,
-                                    "trade_date": trade_date,
-                                    "buy_sell": buy_sell,
-                                    "price": price,
-                                    "created_at": now,
-                                    "updated_at": now,
-                                }
+                    for trade in max_profit_trades_unlimited(bars):
+                        rows.extend(
+                            {
+                                "ticker": ticker,
+                                "trade_datetime": trade_datetime,
+                                "buy_sell": buy_sell,
+                                "price": price,
+                            }
+                            for buy_sell, trade_datetime, price in (
+                                ("buy", trade.buy_datetime, trade.buy_price),
+                                ("sell", trade.sell_datetime, trade.sell_price),
                             )
+                        )
                         trade_count += 1
                 if rows:
                     staging_conn.execute(insert(_STAGING), rows)
                 # Commits only the TEMP table - nothing in buy_sell_patterns yet.
                 staging_conn.commit()
-                report_job_progress(session, run_id, offset + len(batch), len(selected), force=True)
+                report_job_progress(
+                    session, run_id, offset + len(batch), len(selected), force=True
+                )
 
             # End `session`'s read transaction first: under WAL its snapshot predates
             # the commit below, and a later write through it (e.g. engine.py recording
             # the run's result) would otherwise fail on a stale snapshot.
             session.commit()
-            if existed:
-                staging_conn.execute(delete(BuySellPattern).where(BuySellPattern.name == name))
-            staging_conn.execute(
-                insert(BuySellPattern.__table__).from_select(
-                    [column.name for column in _STAGING.columns], select(_STAGING)
-                )
-            )
+            _publish_pattern(staging_conn, name, now)
             staging_conn.commit()
         except BaseException:
             staging_conn.rollback()
@@ -324,7 +493,9 @@ def compute_buy_sell_pattern(
         name,
         trade_count,
         len(selected),
-        start_date,
-        end_date,
+        start_date or "earliest",
+        end_date or "latest",
     )
-    return BuySellPatternResult(name=name, tickers=len(selected), trades=trade_count, replaced=existed)
+    return BuySellPatternResult(
+        name=name, tickers=len(selected), trades=trade_count, replaced=existed
+    )

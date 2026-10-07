@@ -599,19 +599,28 @@ export interface BuySellPatternRun {
   trades: number
 }
 
+// open_datetime/close_datetime are the datetimes backend-v2 jobs/buy_sell_pattern.py
+// stamps this bar's open and close with - naive "YYYY-MM-DDTHH:MM:SS" US/Eastern
+// wall-clock time (09:30 / 16:00), so they're displayed as-is, never shifted by timezone.
 export interface BuySellPatternBar {
   date: string
+  open_datetime: string
+  close_datetime: string
+  open: number | null
   low: number | null
   high: number | null
   close: number
 }
 
+// buy_datetime/sell_datetime match a bar's open_datetime or close_datetime.
 export interface BuySellPatternTrade {
-  buy_date: string
+  buy_datetime: string
   buy_price: number
-  sell_date: string
+  sell_datetime: string
   sell_price: number
   profit: number
+  // profit as a % of buy_price; null when buy_price is 0.
+  profit_pct: number | null
 }
 
 // See app/main.py's buy_sell_pattern_report - only trades whose buy and sell both fall
@@ -619,6 +628,45 @@ export interface BuySellPatternTrade {
 export interface BuySellPatternReport {
   bars: BuySellPatternBar[]
   trades: BuySellPatternTrade[]
+}
+
+// One ticker's buy_sell_pattern_stats row under a pattern name - backs the Analytics >
+// Buy Sell Pattern page's grid (see app/main.py's buy_sell_pattern_tickers). Profits
+// are percentages - the sum and mean of each trade's profit as a % of its buy price.
+// latest_close is the close of the ticker's most recent daily bar, null if it has none.
+// first/last_trade_datetime are naive US/Eastern wall-clock time (see
+// BuySellPatternBar); computed_at is naive UTC. The three trade fields are null on a
+// row computed before they existed, until the stats job runs again.
+export interface BuySellPatternTickerRow {
+  ticker: string
+  name: string | null
+  type: string | null
+  primary_exchange: string | null
+  latest_close: number | null
+  trades: number
+  total_profit: number | null
+  first_trade_datetime: string | null
+  last_trade_datetime: string | null
+  avg_profit: number
+  avg_buy_price: number
+  avg_sell_price: number
+  buy_price_min: number
+  buy_price_max: number
+  buy_price_median: number
+  sell_price_min: number
+  sell_price_max: number
+  sell_price_median: number
+  computed_at: string
+}
+
+// Backend caps page_size at 1000 (see app/main.py's BUY_SELL_PATTERN_TICKERS_MAX_PAGE_SIZE).
+export const BUY_SELL_PATTERN_TICKERS_MAX_PAGE_SIZE = 1000
+
+export interface BuySellPatternTickersReport {
+  rows: BuySellPatternTickerRow[]
+  total: number
+  page: number
+  page_size: number
 }
 
 // One row per ticker that has a Markov chain prediction (jobs/predict_market_state.py,
@@ -1395,6 +1443,13 @@ export const api = {
     getJSON<BacktestPoint[]>(
       `/reports/backtest?ticker=${encodeURIComponent(ticker)}&start_date=${encodeURIComponent(startDate ?? '')}&end_date=${encodeURIComponent(endDate ?? '')}`,
     ),
+  // Every stored trade for one ticker under one pattern, oldest first - see app/main.py's
+  // buy_sell_pattern_trades. startDate/endDate are ISO dates, '' for no bound; only
+  // trades lying entirely within the range come back.
+  buySellPatternTrades: (ticker: string, name: string, startDate = '', endDate = '') =>
+    getJSON<BuySellPatternTrade[]>(
+      `/reports/buy-sell-pattern/trades?ticker=${encodeURIComponent(ticker)}&name=${encodeURIComponent(name)}&start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}`,
+    ),
   buySellPatternRuns: (ticker: string) =>
     getJSON<BuySellPatternRun[]>(`/reports/buy-sell-pattern/runs?ticker=${encodeURIComponent(ticker)}`),
   // startDate/endDate are ISO dates ("YYYY-MM-DD"), both required.
@@ -1402,6 +1457,41 @@ export const api = {
     getJSON<BuySellPatternReport>(
       `/reports/buy-sell-pattern?ticker=${encodeURIComponent(ticker)}&name=${encodeURIComponent(name)}&start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}`,
     ),
+  buySellPatternNames: () => getJSON<string[]>('/reports/buy-sell-pattern/names'),
+  // Names straight from buy_sell_patterns, for the Date Range page (see app/main.py's
+  // buy_sell_pattern_pattern_names).
+  buySellPatternPatternNames: () => getJSON<string[]>('/reports/buy-sell-pattern/pattern-names'),
+  // Same rows as buySellPatternTickers, computed on the fly over only the trades that
+  // lie entirely within [startDate, endDate] (ISO dates) - see app/main.py's
+  // buy_sell_pattern_range_tickers.
+  buySellPatternRangeTickers: (
+    name: string,
+    startDate: string,
+    endDate: string,
+    tickerTypes: string[] = [],
+    tickers: string[] = [],
+    page = 1,
+    pageSize = BUY_SELL_PATTERN_TICKERS_MAX_PAGE_SIZE,
+    orderBy: Next10DayPredictionOrderField[] = [],
+  ) => {
+    const orderByParam = orderBy.map(({ field, dir }) => `${field}:${dir}`).join(',')
+    return getJSON<BuySellPatternTickersReport>(
+      `/reports/buy-sell-pattern/range-tickers?name=${encodeURIComponent(name)}&start_date=${encodeURIComponent(startDate)}&end_date=${encodeURIComponent(endDate)}&ticker_types=${encodeURIComponent(tickerTypes.join(','))}&tickers=${encodeURIComponent(tickers.join(','))}&page=${page}&page_size=${pageSize}&order_by=${encodeURIComponent(orderByParam)}`,
+    )
+  },
+  buySellPatternTickers: (
+    name: string,
+    tickerTypes: string[] = [],
+    tickers: string[] = [],
+    page = 1,
+    pageSize = BUY_SELL_PATTERN_TICKERS_MAX_PAGE_SIZE,
+    orderBy: Next10DayPredictionOrderField[] = [],
+  ) => {
+    const orderByParam = orderBy.map(({ field, dir }) => `${field}:${dir}`).join(',')
+    return getJSON<BuySellPatternTickersReport>(
+      `/reports/buy-sell-pattern/tickers?name=${encodeURIComponent(name)}&ticker_types=${encodeURIComponent(tickerTypes.join(','))}&tickers=${encodeURIComponent(tickers.join(','))}&page=${page}&page_size=${pageSize}&order_by=${encodeURIComponent(orderByParam)}`,
+    )
+  },
   // startDate/endDate are ISO dates ("YYYY-MM-DD"); each independently defaults to
   // today (UTC) server-side when omitted - see app/main.py's
   // market_predictions_performance_report. market_cap/markovExitPriceConfidence/

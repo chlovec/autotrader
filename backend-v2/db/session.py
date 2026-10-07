@@ -81,9 +81,12 @@ def init_db() -> None:
     _add_win_rates_mcmc_range_columns()
     _add_ticker_details_columns()
     _add_job_configs_buy_sell_pattern_columns()
+    _migrate_buy_sell_patterns_trade_datetime()
+    _migrate_buy_sell_patterns_pattern_id()
+    _add_buy_sell_pattern_stats_trade_columns()
     _add_ticker_groups_sort_order_column()
     _add_job_configs_query_export_max_age_hours_column()
-    _create_tickers_market_direction_60days_min_from_latest_view()
+    _create_tickers_daily_bars_min_60_days_from_latest_view()
 
 
 def _add_column_if_missing(table: str, column: str, ddl_type: str) -> None:
@@ -462,6 +465,139 @@ def _add_job_configs_buy_sell_pattern_columns() -> None:
     _add_job_configs_column("buy_sell_pattern_batch_size", "INTEGER")
 
 
+def _migrate_buy_sell_patterns_trade_datetime() -> None:
+    """BuySellPattern's trade_date (a DATE in the primary key) became trade_datetime -
+    the bar's date at the regular-session open or close it traded at (see
+    jobs/buy_sell_pattern.py's MARKET_OPEN/MARKET_CLOSE), so a buy at an open and a
+    sell at that day's close no longer share one point in time. Same
+    recreate-copy-drop pattern as _migrate_lstm_inferences_training_method_pk, since
+    SQLite can't change a PRIMARY KEY in place.
+
+    Existing rows are backfilled by matching each row's price to that day's daily
+    ohlc_bars row: the close if the price equals it, else the open if it equals that.
+    The close wins a tie because max_profit_trades_unlimited moves past an equal open
+    to the close on both its buy and sell scans. A row with no matching bar (e.g. bars
+    re-synced since) falls back to the open for a buy and the close for a sell. The
+    timestamps are written in SQLAlchemy's sqlite DATETIME text format.
+
+    Recreates the table in its shape as of this migration (still keyed by name) rather
+    than from Base.metadata - _migrate_buy_sell_patterns_pattern_id, which runs next,
+    takes it the rest of the way."""
+    inspector = inspect(engine)
+    if "buy_sell_patterns" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("buy_sell_patterns")}
+    if "trade_date" not in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE buy_sell_patterns RENAME TO buy_sell_patterns_old"))
+        conn.execute(
+            text(
+                """
+                CREATE TABLE buy_sell_patterns (
+                    name VARCHAR NOT NULL,
+                    ticker VARCHAR NOT NULL,
+                    trade_datetime DATETIME NOT NULL,
+                    buy_sell VARCHAR NOT NULL,
+                    price FLOAT NOT NULL,
+                    created_at DATETIME NOT NULL,
+                    updated_at DATETIME NOT NULL,
+                    PRIMARY KEY (name, ticker, trade_datetime, buy_sell),
+                    FOREIGN KEY(ticker) REFERENCES tickers (ticker)
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                INSERT INTO buy_sell_patterns (
+                    name, ticker, trade_datetime, buy_sell, price, created_at, updated_at
+                )
+                SELECT
+                    o.name, o.ticker,
+                    o.trade_date || CASE
+                        WHEN EXISTS (
+                            SELECT 1 FROM ohlc_bars b
+                            WHERE b.ticker = o.ticker AND b.multiplier = 1 AND b.timespan = 'day'
+                              AND b.timestamp >= o.trade_date
+                              AND b.timestamp < date(o.trade_date, '+1 day')
+                              AND b.close = o.price
+                        ) THEN ' 21:00:00.000000'
+                        WHEN EXISTS (
+                            SELECT 1 FROM ohlc_bars b
+                            WHERE b.ticker = o.ticker AND b.multiplier = 1 AND b.timespan = 'day'
+                              AND b.timestamp >= o.trade_date
+                              AND b.timestamp < date(o.trade_date, '+1 day')
+                              AND b.open = o.price
+                        ) THEN ' 09:30:00.000000'
+                        WHEN o.buy_sell = 'buy' THEN ' 09:30:00.000000'
+                        ELSE ' 21:00:00.000000'
+                    END,
+                    o.buy_sell, o.price, o.created_at, o.updated_at
+                FROM buy_sell_patterns_old o
+                """
+            )
+        )
+        conn.execute(text("DROP TABLE buy_sell_patterns_old"))
+
+
+def _migrate_buy_sell_patterns_pattern_id() -> None:
+    """BuySellPattern's name, created_at and updated_at moved to BuySellPatternName
+    (buy_sell_pattern_names, created by create_all) - each trade row now points to its
+    pattern by pattern_id. One buy_sell_pattern_names row is created per distinct name,
+    with its first/last trade_datetime and its earliest created_at / latest updated_at,
+    then buy_sell_patterns is rebuilt keyed by pattern_id - same
+    recreate-copy-drop pattern as _migrate_buy_sell_patterns_trade_datetime, since
+    SQLite can't change a PRIMARY KEY in place. All in one transaction, so a failure
+    part-way leaves the old table as it was.
+
+    Copies every trade row once, so on a large table the first startup after this
+    change takes a while - back up first (bin/backup-db.sh)."""
+    inspector = inspect(engine)
+    if "buy_sell_patterns" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("buy_sell_patterns")}
+    if "name" not in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO buy_sell_pattern_names (
+                    name, first_trade_datetime, last_trade_datetime, created_at, updated_at
+                )
+                SELECT name, MIN(trade_datetime), MAX(trade_datetime), MIN(created_at), MAX(updated_at)
+                FROM buy_sell_patterns
+                WHERE name NOT IN (SELECT name FROM buy_sell_pattern_names)
+                GROUP BY name
+                """
+            )
+        )
+        conn.execute(text("ALTER TABLE buy_sell_patterns RENAME TO buy_sell_patterns_old"))
+        Base.metadata.tables["buy_sell_patterns"].create(conn)
+        conn.execute(
+            text(
+                """
+                INSERT INTO buy_sell_patterns (pattern_id, ticker, trade_datetime, buy_sell, price)
+                SELECT n.id, o.ticker, o.trade_datetime, o.buy_sell, o.price
+                FROM buy_sell_patterns_old o
+                JOIN buy_sell_pattern_names n ON n.name = o.name
+                """
+            )
+        )
+        conn.execute(text("DROP TABLE buy_sell_patterns_old"))
+
+
+def _add_buy_sell_pattern_stats_trade_columns() -> None:
+    """See db/models.py's BuySellPatternStat.total_profit/first_trade_datetime/
+    last_trade_datetime - added after buy_sell_pattern_stats itself, left NULL until
+    the next buy-sell-pattern-stats run rebuilds the table."""
+    _add_column_if_missing("buy_sell_pattern_stats", "total_profit", "FLOAT")
+    _add_column_if_missing("buy_sell_pattern_stats", "first_trade_datetime", "DATETIME")
+    _add_column_if_missing("buy_sell_pattern_stats", "last_trade_datetime", "DATETIME")
+
+
 def _add_ticker_groups_sort_order_column() -> None:
     """See db/models.py's TickerGroup.sort_order - added after ticker_groups itself,
     left NULL on existing rows, which sort after every explicitly ordered row."""
@@ -474,14 +610,16 @@ def _add_job_configs_query_export_max_age_hours_column() -> None:
     _add_job_configs_column("query_export_max_age_hours", "FLOAT")
 
 
-_TICKERS_MARKET_DIRECTION_VIEW = "tickers_market_direction_60days_min_from_latest"
+_TICKERS_DAILY_BARS_MIN_60_VIEW = "tickers_daily_bars_min_60_days_from_latest"
+# This view's name before it was renamed - dropped on startup so it doesn't linger.
+_TICKERS_DAILY_BARS_MIN_60_VIEW_OLD_NAME = "tickers_market_direction_60days_min_from_latest"
 
 # No ORDER BY on purpose: it would stop SQLite from merging the view into the query
 # reading it, so a reader's WHERE (one ticker, a date range) would only be applied
 # after the whole view was built. Readers order the rows themselves. Filter date
 # ranges on `timestamp` (indexed) rather than the computed `date` column, which
 # can't use an index.
-_TICKERS_MARKET_DIRECTION_VIEW_SQL = f"""CREATE VIEW {_TICKERS_MARKET_DIRECTION_VIEW} AS
+_TICKERS_DAILY_BARS_MIN_60_VIEW_SQL = f"""CREATE VIEW {_TICKERS_DAILY_BARS_MIN_60_VIEW} AS
 WITH
 -- Only daily bars matter; every step below reads from this.
 daily_bars AS (
@@ -545,7 +683,7 @@ FROM daily_bars b
 WHERE b.ticker IN (SELECT ticker FROM eligible_tickers)"""
 
 
-def _create_tickers_market_direction_60days_min_from_latest_view() -> None:
+def _create_tickers_daily_bars_min_60_days_from_latest_view() -> None:
     """Every daily bar for tickers that have a bar on the latest trading day and a full
     60 most recent daily bars, bucketed by pcnt_increase into a -3..3 direction score.
     create_all doesn't manage views, so this is created here instead - and dropped and
@@ -553,14 +691,15 @@ def _create_tickers_market_direction_60days_min_from_latest_view() -> None:
     no data, just the query. SQLite stores a view's CREATE statement verbatim in
     sqlite_master, so comparing it to the text above is enough to detect a change."""
     with engine.begin() as conn:
+        conn.execute(text(f"DROP VIEW IF EXISTS {_TICKERS_DAILY_BARS_MIN_60_VIEW_OLD_NAME}"))
         existing = conn.execute(
             text("SELECT sql FROM sqlite_master WHERE type = 'view' AND name = :name"),
-            {"name": _TICKERS_MARKET_DIRECTION_VIEW},
+            {"name": _TICKERS_DAILY_BARS_MIN_60_VIEW},
         ).scalar()
-        if existing == _TICKERS_MARKET_DIRECTION_VIEW_SQL:
+        if existing == _TICKERS_DAILY_BARS_MIN_60_VIEW_SQL:
             return
-        conn.execute(text(f"DROP VIEW IF EXISTS {_TICKERS_MARKET_DIRECTION_VIEW}"))
-        conn.execute(text(_TICKERS_MARKET_DIRECTION_VIEW_SQL))
+        conn.execute(text(f"DROP VIEW IF EXISTS {_TICKERS_DAILY_BARS_MIN_60_VIEW}"))
+        conn.execute(text(_TICKERS_DAILY_BARS_MIN_60_VIEW_SQL))
 
 def get_session() -> Session:
     return SessionLocal()

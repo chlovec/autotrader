@@ -1233,11 +1233,7 @@ export function JobCard({
                       <input
                         type="text"
                         value={buySellPatternName}
-                        placeholder={
-                          buySellPatternStartDate && buySellPatternEndDate
-                            ? `${buySellPatternStartDate}_${buySellPatternEndDate}`
-                            : 'start date_end date'
-                        }
+                        placeholder={`${buySellPatternStartDate || 'earliest'}_${buySellPatternEndDate || 'latest'}`}
                         onChange={(e) => setBuySellPatternName(e.target.value)}
                       />
                     </label>
@@ -1253,9 +1249,10 @@ export function JobCard({
                     </label>
                   </div>
                   <p className="job-field-hint">
-                    Both dates are required. For each selected ticker (every ticker if none is selected above), finds
-                    the buy and sell days that maximize total profit - buying at the day's low and selling at a later
-                    day's high, or the same day's high when that day closes above its low. The name labels this
+                    Either date may be left blank to use the earliest/latest bar. For each selected ticker (every
+                    ticker if none is selected above), finds the trades that maximize total profit - buying at a
+                    day's open or close and selling at a later, higher open or close. Each row is stored with its
+                    trade datetime (09:30 for an open, 16:00 for a close, US/Eastern). The name labels this
                     run's rows in buy_sell_patterns and is only used on a manual run; leave it blank (and auto runs
                     always) to use the start and end date. If the name is already taken you'll be asked whether to
                     replace it. Tickers per batch (1-5000) sets how many tickers' bars are held in memory and

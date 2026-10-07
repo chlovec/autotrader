@@ -33,6 +33,7 @@ from jobs.buy_sell_pattern import (
     resolve_pattern_name,
     validate_date_range,
 )
+from jobs.buy_sell_pattern_stats import compute_buy_sell_pattern_stats
 from jobs.config_store import get_or_create_config, interval_trigger, split_csv
 from jobs.control import JobCancelled, JobControl
 from jobs.lstm_common import (
@@ -56,6 +57,7 @@ from jobs.registry import (
     BACKTEST_MARKET_STATE_JOB,
     BARS_JOB,
     BUY_SELL_PATTERN_JOB,
+    BUY_SELL_PATTERN_STATS_JOB,
     ETF_CONSTITUENTS_JOB,
     GROUPED_DAILY_JOB,
     INDICATOR_NAMES,
@@ -370,6 +372,13 @@ async def run_job(job_name: str, trigger: str) -> None:
             # local, off the event loop via asyncio.to_thread.
             count = await asyncio.to_thread(compute_research_picks, session, run_id, control=control)
             summary = f"{count} research pick(s) selected"
+        elif job_name == BUY_SELL_PATTERN_STATS_JOB:
+            # Same reasoning as the research-picks branch above - purely local, off the
+            # event loop via asyncio.to_thread.
+            count = await asyncio.to_thread(
+                compute_buy_sell_pattern_stats, session, run_id, control=control
+            )
+            summary = f"{count} (pattern, ticker) stat row(s) written"
         elif job_name == ETF_CONSTITUENTS_JOB:
             # No DB session and no massive.com DataClient here - this job only
             # downloads raw files from SSGA to disk (see jobs/sync_etf_constituents.py),
@@ -495,7 +504,7 @@ async def run_job(job_name: str, trigger: str) -> None:
             )
             summary = (
                 f"{pattern.trades} trade(s) across {pattern.tickers} ticker(s) stored as {pattern.name!r} "
-                f"({start_date} to {end_date})"
+                f"({start_date or 'earliest'} to {end_date or 'latest'})"
             )
             if pattern.replaced:
                 summary += " - replaced existing rows"

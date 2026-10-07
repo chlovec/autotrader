@@ -15,6 +15,8 @@ import { ResearchPage } from './components/ResearchPage'
 import { TickerTypesPage } from './components/TickerTypesPage'
 import { SqlConsolePage } from './components/SqlConsolePage'
 import { WatchlistPage } from './components/WatchlistPage'
+import { BuySellPatternPage } from './components/BuySellPatternPage'
+import { BuySellTradesPage } from './components/BuySellTradesPage'
 
 // Below this width the side menu renders as an overlay drawer (see index.css) and
 // should start closed; at/above it, it renders inline and should start open.
@@ -37,6 +39,9 @@ export type View =
   | 'Market Prediction Performance'
   | 'Prediction Comparison'
   | 'Prediction Accuracy'
+  | 'Buy Sell Pattern'
+  | 'Buy Sell Pattern (Date Range)'
+  | 'Buy Sell Trades'
   | 'Settings'
   | 'Ticker Types'
   | 'SQL Console'
@@ -81,6 +86,12 @@ function App() {
             <PredictionComparisonPage />
           ) : activeView === 'Prediction Accuracy' ? (
             <PredictionAccuracyPage />
+          ) : activeView === 'Buy Sell Pattern' ? (
+            <BuySellPatternPage />
+          ) : activeView === 'Buy Sell Pattern (Date Range)' ? (
+            <BuySellPatternPage key="date-range" dateRange />
+          ) : activeView === 'Buy Sell Trades' ? (
+            <BuySellTradesPage />
           ) : activeView === 'Watchlist' ? (
             <WatchlistPage />
           ) : activeView === 'Research' ? (

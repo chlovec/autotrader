@@ -16,6 +16,7 @@ import datetime as dt
 import json
 import logging
 import os
+import statistics
 import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
@@ -34,6 +35,8 @@ from db.models import (
     AverageVolume,
     Base,
     BuySellPattern,
+    BuySellPatternName,
+    BuySellPatternStat,
     CurrentSnapshot,
     JobConfig,
     JobRun,
@@ -59,7 +62,13 @@ from db.models import (
     WinRate,
 )
 from db.session import SessionLocal, engine, init_db
-from jobs.buy_sell_pattern import MAX_TICKER_BATCH_SIZE, pattern_name_exists, resolve_pattern_name
+from jobs.buy_sell_pattern import (
+    MAX_TICKER_BATCH_SIZE,
+    close_datetime,
+    open_datetime,
+    pattern_name_exists,
+    resolve_pattern_name,
+)
 from jobs.config_store import get_or_create_config, interval_trigger, job_is_active, split_csv
 from jobs.query_exports import DEFAULT_MAX_AGE_HOURS as DEFAULT_QUERY_EXPORT_MAX_AGE_HOURS
 from jobs.query_exports import EXPORT_DIR, export_path, find_export, new_export_id
@@ -69,6 +78,7 @@ from jobs.registry import (
     BACKTEST_MARKET_STATE_JOB,
     BARS_JOB,
     BUY_SELL_PATTERN_JOB,
+    BUY_SELL_PATTERN_STATS_JOB,
     QUERY_EXPORT_CLEANUP_JOB,
     DEFAULT_START_TIME,
     ETF_CONSTITUENTS_JOB,
@@ -307,7 +317,9 @@ _RESET_TABLES: dict[str, list[type[Base]]] = {
     WIN_RATE_JOB: [WinRate],
     PREDICTION_ACCURACY_JOB: [PredictionAccuracy],
     RESEARCH_PICKS_JOB: [ResearchPick],
-    BUY_SELL_PATTERN_JOB: [BuySellPattern],
+    # Trades first, then the names they point to.
+    BUY_SELL_PATTERN_JOB: [BuySellPattern, BuySellPatternName],
+    BUY_SELL_PATTERN_STATS_JOB: [BuySellPatternStat],
     # No DB table - only deletes export files on disk, same reasoning as
     # ETF_CONSTITUENTS_JOB above.
     QUERY_EXPORT_CLEANUP_JOB: [],
@@ -1310,29 +1322,94 @@ def _parse_iso_date(value: str, label: str) -> dt.date:
         raise HTTPException(422, f"{label} must be an ISO date, e.g. '2026-08-06'") from exc
 
 
+def _pattern_id_for(name: str):
+    """buy_sell_pattern_names.id for pattern `name`, as a scalar subquery - NULL (so no
+    trade matches) when there's no such pattern."""
+    return select(BuySellPatternName.id).where(BuySellPatternName.name == name).scalar_subquery()
+
+
+def _pair_pattern_rows(pattern_rows) -> list[dict[str, Any]]:
+    """Pairs (trade_datetime, buy_sell, price) rows, ordered by trade_datetime, into one
+    dict per trade - each buy with the next sell. A sell with no buy before it belongs
+    to a trade bought before the rows start - skipped, same as a buy whose sell lands
+    after they end. profit is per share in dollars; profit_pct is that as a percentage
+    of the buy price, null when the buy price is 0."""
+    trades: list[dict[str, Any]] = []
+    pending_buy: tuple[dt.datetime, float] | None = None
+    for trade_datetime, buy_sell, price in pattern_rows:
+        if buy_sell == "buy":
+            pending_buy = (trade_datetime, price)
+        elif pending_buy is not None:
+            buy_datetime, buy_price = pending_buy
+            trades.append(
+                {
+                    "buy_datetime": buy_datetime.isoformat(),
+                    "buy_price": buy_price,
+                    "sell_datetime": trade_datetime.isoformat(),
+                    "sell_price": price,
+                    "profit": price - buy_price,
+                    "profit_pct": (price - buy_price) / buy_price * 100 if buy_price else None,
+                }
+            )
+            pending_buy = None
+    return trades
+
+
+@app.get("/reports/buy-sell-pattern/trades")
+def buy_sell_pattern_trades(
+    ticker: str, name: str, start_date: str = "", end_date: str = ""
+) -> list[dict[str, Any]]:
+    """Backs the Buy Sell Trades page: every trade stored in buy_sell_patterns for
+    `ticker` under pattern `name`, oldest first, paired by _pair_pattern_rows. Unlike
+    the stats, trades with a buy price of 0 are listed (with a null profit_pct), so
+    bad bars stay visible here.
+
+    `start_date`/`end_date` (ISO dates, each optional - blank for no bound) keep only
+    trades lying entirely within the range: rows are filtered before pairing, so a
+    trade straddling either end loses its partner and drops out."""
+    query = select(BuySellPattern.trade_datetime, BuySellPattern.buy_sell, BuySellPattern.price).where(
+        BuySellPattern.ticker == ticker, BuySellPattern.pattern_id == _pattern_id_for(name)
+    )
+    parsed_start = _parse_iso_date(start_date, "start_date") if start_date else None
+    parsed_end = _parse_iso_date(end_date, "end_date") if end_date else None
+    if parsed_start and parsed_end and parsed_start > parsed_end:
+        raise HTTPException(422, "start_date must not be after end_date")
+    if parsed_start:
+        query = query.where(BuySellPattern.trade_datetime >= dt.datetime.combine(parsed_start, dt.time.min))
+    if parsed_end:
+        query = query.where(BuySellPattern.trade_datetime <= dt.datetime.combine(parsed_end, dt.time.max))
+    with SessionLocal() as session:
+        pattern_rows = session.execute(
+            query.order_by(BuySellPattern.trade_datetime, BuySellPattern.buy_sell)
+        ).all()
+    return _pair_pattern_rows(pattern_rows)
+
+
 @app.get("/reports/buy-sell-pattern/runs")
 def buy_sell_pattern_runs(ticker: str) -> list[dict[str, Any]]:
     """Backs the Buy Sell Pattern chart's run picker and its "available date range"
-    hint: one entry per buy_sell_patterns name that has rows for `ticker`, with the
-    first/last trade_date stored for it and its trade count (one buy + one sell row per
-    trade). Newest last_trade_date first, so the chart can default to entry 0."""
+    hint: one entry per buy_sell_pattern_names name that has rows for `ticker`, with the
+    dates of the first/last trade_datetime stored for it (the chart's date inputs pick
+    whole days) and its trade count (one buy + one sell row per trade). Newest last
+    trade first, so the chart can default to entry 0."""
     with SessionLocal() as session:
         rows = session.execute(
             select(
-                BuySellPattern.name,
-                func.min(BuySellPattern.trade_date),
-                func.max(BuySellPattern.trade_date),
+                BuySellPatternName.name,
+                func.min(BuySellPattern.trade_datetime),
+                func.max(BuySellPattern.trade_datetime),
                 func.sum(case((BuySellPattern.buy_sell == "buy", 1), else_=0)),
             )
+            .join(BuySellPatternName, BuySellPatternName.id == BuySellPattern.pattern_id)
             .where(BuySellPattern.ticker == ticker)
-            .group_by(BuySellPattern.name)
-            .order_by(func.max(BuySellPattern.trade_date).desc(), BuySellPattern.name)
+            .group_by(BuySellPatternName.id, BuySellPatternName.name)
+            .order_by(func.max(BuySellPattern.trade_datetime).desc(), BuySellPatternName.name)
         ).all()
         return [
             {
                 "name": name,
-                "first_trade_date": first.isoformat(),
-                "last_trade_date": last.isoformat(),
+                "first_trade_date": first.date().isoformat(),
+                "last_trade_date": last.date().isoformat(),
                 "trades": int(trades or 0),
             }
             for name, first, last, trades in rows
@@ -1342,13 +1419,14 @@ def buy_sell_pattern_runs(ticker: str) -> list[dict[str, Any]]:
 @app.get("/reports/buy-sell-pattern")
 def buy_sell_pattern_report(ticker: str, name: str, start_date: str, end_date: str) -> dict[str, Any]:
     """Backs the Buy Sell Pattern chart: `ticker`'s daily ohlc_bars within
-    [start_date, end_date] (the price series the chart draws) plus the trades stored in
-    buy_sell_patterns under run `name` whose buy and sell both fall inside that range.
+    [start_date, end_date] plus the trades stored in buy_sell_patterns under run `name`
+    whose buy and sell both fall inside that range.
 
-    Trades are rebuilt by pairing each buy row with the next sell row in date order -
-    jobs/buy_sell_pattern.py never overlaps trades, and a same-day trade stores its buy
-    and sell on the same date, so sorting buys before sells on a shared date keeps every
-    pair intact."""
+    Each bar carries the datetimes jobs/buy_sell_pattern.py stamps its open and close
+    with, so the chart can draw the same open, close, open, close, ... price path the
+    job traded on and place every trade exactly on it. Trades are rebuilt by pairing
+    each buy row with the next sell row in trade_datetime order -
+    jobs/buy_sell_pattern.py never overlaps trades, so that keeps every pair intact."""
     parsed_start = _parse_iso_date(start_date, "start_date")
     parsed_end = _parse_iso_date(end_date, "end_date")
     if parsed_start > parsed_end:
@@ -1356,7 +1434,7 @@ def buy_sell_pattern_report(ticker: str, name: str, start_date: str, end_date: s
 
     with SessionLocal() as session:
         bars = session.execute(
-            select(OhlcBar.timestamp, OhlcBar.low, OhlcBar.high, OhlcBar.close)
+            select(OhlcBar.timestamp, OhlcBar.open, OhlcBar.low, OhlcBar.high, OhlcBar.close)
             .where(
                 OhlcBar.ticker == ticker,
                 OhlcBar.multiplier == DEFAULT_MULTIPLIER,
@@ -1368,43 +1446,345 @@ def buy_sell_pattern_report(ticker: str, name: str, start_date: str, end_date: s
             .order_by(OhlcBar.timestamp)
         ).all()
         pattern_rows = session.execute(
-            select(BuySellPattern.trade_date, BuySellPattern.buy_sell, BuySellPattern.price)
+            select(BuySellPattern.trade_datetime, BuySellPattern.buy_sell, BuySellPattern.price)
             .where(
                 BuySellPattern.ticker == ticker,
-                BuySellPattern.name == name,
-                BuySellPattern.trade_date >= parsed_start,
-                BuySellPattern.trade_date <= parsed_end,
+                BuySellPattern.pattern_id == _pattern_id_for(name),
+                BuySellPattern.trade_datetime >= dt.datetime.combine(parsed_start, dt.time.min),
+                BuySellPattern.trade_datetime <= dt.datetime.combine(parsed_end, dt.time.max),
             )
-            .order_by(BuySellPattern.trade_date, case((BuySellPattern.buy_sell == "buy", 0), else_=1))
+            .order_by(BuySellPattern.trade_datetime)
         ).all()
 
-    trades: list[dict[str, Any]] = []
-    pending_buy: tuple[dt.date, float] | None = None
-    for trade_date, buy_sell, price in pattern_rows:
-        if buy_sell == "buy":
-            pending_buy = (trade_date, price)
-        elif pending_buy is not None:
-            # A sell with no buy before it in range belongs to a trade bought before
-            # start_date - skipped, same as a buy whose sell lands after end_date.
-            buy_date, buy_price = pending_buy
-            trades.append(
-                {
-                    "buy_date": buy_date.isoformat(),
-                    "buy_price": buy_price,
-                    "sell_date": trade_date.isoformat(),
-                    "sell_price": price,
-                    "profit": price - buy_price,
-                }
-            )
-            pending_buy = None
+    trades = _pair_pattern_rows(pattern_rows)
 
     return {
         "bars": [
-            {"date": timestamp.date().isoformat(), "low": low, "high": high, "close": close}
-            for timestamp, low, high, close in bars
+            {
+                "date": timestamp.date().isoformat(),
+                "open_datetime": open_datetime(timestamp.date()).isoformat(),
+                "close_datetime": close_datetime(timestamp.date()).isoformat(),
+                "open": open_,
+                "low": low,
+                "high": high,
+                "close": close,
+            }
+            for timestamp, open_, low, high, close in bars
         ],
         "trades": trades,
     }
+
+
+BUY_SELL_PATTERN_TICKERS_MAX_PAGE_SIZE = 1000
+BUY_SELL_PATTERN_TICKERS_DEFAULT_PAGE_SIZE = 500
+
+# order_by field keys accepted by buy_sell_pattern_tickers.
+BUY_SELL_PATTERN_TICKERS_ORDERABLE_FIELDS: dict[str, ColumnElement] = {
+    "ticker": BuySellPatternStat.ticker,
+    "type": Ticker.type,
+    "avg_profit": BuySellPatternStat.avg_profit,
+}
+
+
+def _parse_buy_sell_pattern_tickers_order_by(order_by: str) -> list[tuple[str, str]]:
+    """Same shape as _parse_next_10_day_order_by, against
+    BUY_SELL_PATTERN_TICKERS_ORDERABLE_FIELDS instead."""
+    fields: list[tuple[str, str]] = []
+    for entry in split_csv(order_by) or []:
+        field, _, direction = entry.partition(":")
+        direction = direction.lower() or "asc"
+        if field not in BUY_SELL_PATTERN_TICKERS_ORDERABLE_FIELDS:
+            raise HTTPException(422, f"Unknown order_by field: {field}")
+        if direction not in ("asc", "desc"):
+            raise HTTPException(422, f"Unknown order_by direction: {direction}")
+        fields.append((field, direction))
+    return fields
+
+
+@app.get("/reports/buy-sell-pattern/names")
+def buy_sell_pattern_names() -> list[str]:
+    """Backs the Buy Sell Pattern page's pattern picker: every distinct
+    buy_sell_pattern_stats name, sorted - the names the page's grid has rows for. name
+    leads the table's primary key, so this reads the key's index rather than the table
+    itself."""
+    with SessionLocal() as session:
+        return list(
+            session.execute(
+                select(BuySellPatternStat.name).distinct().order_by(BuySellPatternStat.name)
+            ).scalars()
+        )
+
+
+@app.get("/reports/buy-sell-pattern/tickers")
+def buy_sell_pattern_tickers(
+    name: str,
+    ticker_types: str = "",
+    tickers: str = "",
+    page: int = 1,
+    page_size: int = BUY_SELL_PATTERN_TICKERS_DEFAULT_PAGE_SIZE,
+    order_by: str = "",
+) -> dict[str, Any]:
+    """Backs the Buy Sell Pattern page's grid: one row per ticker in
+    buy_sell_pattern_stats under pattern `name`, left outer joined to its tickers-table
+    details (null when the ticker has no tickers row), and every statistic jobs/buy_sell_pattern_stats.py computed for it. Paginated like
+    stale_tickers_report. `order_by` (see _parse_order_by) picks the sort priority
+    among BUY_SELL_PATTERN_TICKERS_ORDERABLE_FIELDS, default ticker ascending; ticker
+    is always the final tiebreak so pages stay stable. Reflects the last buy-sell-pattern-stats
+    run, so a pattern run since then shows up once that job runs again.
+
+    `ticker_types` and `tickers` (comma-separated, blank for all) narrow the rows.
+    latest_close is the close of the ticker's most recent daily bar, looked up for the
+    returned page only."""
+    types = split_csv(ticker_types)
+    selected_tickers = split_csv(tickers)
+    order_fields = _parse_buy_sell_pattern_tickers_order_by(order_by) or [("ticker", "asc")]
+    page = max(1, page)
+    page_size = max(1, min(page_size, BUY_SELL_PATTERN_TICKERS_MAX_PAGE_SIZE))
+
+    base_query = (
+        select(BuySellPatternStat, Ticker)
+        .outerjoin(Ticker, Ticker.ticker == BuySellPatternStat.ticker)
+        .where(BuySellPatternStat.name == name)
+    )
+    if types:
+        base_query = base_query.where(Ticker.type.in_(types))
+    if selected_tickers:
+        base_query = base_query.where(BuySellPatternStat.ticker.in_(selected_tickers))
+
+    with SessionLocal() as session:
+        total = session.execute(select(func.count()).select_from(base_query.subquery())).scalar_one()
+        order_clauses = []
+        for field, direction in order_fields:
+            column = BUY_SELL_PATTERN_TICKERS_ORDERABLE_FIELDS[field]
+            order_clauses.append((column.desc() if direction == "desc" else column.asc()).nulls_last())
+        if all(field != "ticker" for field, _ in order_fields):
+            order_clauses.append(BuySellPatternStat.ticker.asc())
+        page_rows = session.execute(
+            base_query.order_by(*order_clauses).limit(page_size).offset((page - 1) * page_size)
+        ).all()
+        latest_closes = _latest_daily_closes(session, [stat.ticker for stat, _ in page_rows])
+        return {
+            "rows": [
+                {
+                    "ticker": stat.ticker,
+                    "name": ticker.name if ticker else None,
+                    "type": ticker.type if ticker else None,
+                    "primary_exchange": ticker.primary_exchange if ticker else None,
+                    "latest_close": latest_closes.get(stat.ticker),
+                    "trades": stat.trades,
+                    "total_profit": stat.total_profit,
+                    "first_trade_datetime": _isoformat_or_none(stat.first_trade_datetime),
+                    "last_trade_datetime": _isoformat_or_none(stat.last_trade_datetime),
+                    "avg_profit": stat.avg_profit,
+                    "avg_buy_price": stat.avg_buy_price,
+                    "avg_sell_price": stat.avg_sell_price,
+                    "buy_price_min": stat.buy_price_min,
+                    "buy_price_max": stat.buy_price_max,
+                    "buy_price_median": stat.buy_price_median,
+                    "sell_price_min": stat.sell_price_min,
+                    "sell_price_max": stat.sell_price_max,
+                    "sell_price_median": stat.sell_price_median,
+                    "computed_at": stat.computed_at.isoformat(),
+                }
+                for stat, ticker in page_rows
+            ],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
+
+
+@app.get("/reports/buy-sell-pattern/pattern-names")
+def buy_sell_pattern_pattern_names() -> list[str]:
+    """Backs the Buy Sell Pattern (Date Range) and Buy Sell Trades pages' pattern
+    pickers: every buy_sell_pattern_names name, sorted - one row per pattern, so unlike
+    buy_sell_pattern_names (which reads buy_sell_pattern_stats) it needs no stats run
+    and never scans the trades."""
+    with SessionLocal() as session:
+        return list(session.execute(select(BuySellPatternName.name).order_by(BuySellPatternName.name)).scalars())
+
+
+def _buy_sell_pattern_range_trades(name: str, start: dt.date, end: dt.date, tickers: list[str] | None = None):
+    """One row per trade under `name` that lies entirely within [start, end] - ticker,
+    buy/sell datetime and price, and profit as a percentage of the buy price. Pairs
+    each buy row with the next row in trade_datetime order when that row is a sell -
+    jobs/buy_sell_pattern.py never overlaps trades, and filtering to the range first
+    means a trade straddling either end has no partner and drops out. A trade with a
+    buy price of 0 is skipped, same as jobs/buy_sell_pattern_stats.py."""
+    window = {
+        "partition_by": BuySellPattern.ticker,
+        "order_by": (BuySellPattern.trade_datetime, BuySellPattern.buy_sell),
+    }
+    rows = select(
+        BuySellPattern.ticker,
+        BuySellPattern.trade_datetime,
+        BuySellPattern.buy_sell,
+        BuySellPattern.price,
+        func.lead(BuySellPattern.buy_sell, type_=BuySellPattern.buy_sell.type).over(**window).label("next_buy_sell"),
+        func.lead(BuySellPattern.trade_datetime, type_=BuySellPattern.trade_datetime.type).over(**window).label("next_trade_datetime"),
+        func.lead(BuySellPattern.price, type_=BuySellPattern.price.type).over(**window).label("next_price"),
+    ).where(
+        BuySellPattern.pattern_id == _pattern_id_for(name),
+        BuySellPattern.trade_datetime >= dt.datetime.combine(start, dt.time.min),
+        BuySellPattern.trade_datetime <= dt.datetime.combine(end, dt.time.max),
+    )
+    if tickers is not None:
+        rows = rows.where(BuySellPattern.ticker.in_(tickers))
+    rows = rows.subquery()
+    return (
+        select(
+            rows.c.ticker,
+            rows.c.trade_datetime.label("buy_datetime"),
+            rows.c.price.label("buy_price"),
+            rows.c.next_trade_datetime.label("sell_datetime"),
+            rows.c.next_price.label("sell_price"),
+            ((rows.c.next_price - rows.c.price) * 100.0 / rows.c.price).label("profit_pct"),
+        )
+        .where(rows.c.buy_sell == "buy", rows.c.next_buy_sell == "sell", rows.c.price != 0)
+        .subquery()
+    )
+
+
+@app.get("/reports/buy-sell-pattern/range-tickers")
+def buy_sell_pattern_range_tickers(
+    name: str,
+    start_date: str,
+    end_date: str,
+    ticker_types: str = "",
+    tickers: str = "",
+    page: int = 1,
+    page_size: int = BUY_SELL_PATTERN_TICKERS_DEFAULT_PAGE_SIZE,
+    order_by: str = "",
+) -> dict[str, Any]:
+    """Backs the Buy Sell Pattern (Date Range) page's grid: the same rows and fields as
+    buy_sell_pattern_tickers, but computed on the fly from buy_sell_patterns over only
+    the trades that lie entirely within [start_date, end_date] (see
+    _buy_sell_pattern_range_trades), so it never waits on a buy-sell-pattern-stats run.
+    A ticker with no trade in the range has no row. The aggregates run in SQL so
+    order_by applies before pagination; medians aren't available in SQLite, so they're
+    computed in Python for the returned page only. computed_at is when this response
+    was built. Filters, order_by and latest_close work as in buy_sell_pattern_tickers."""
+    parsed_start = _parse_iso_date(start_date, "start_date")
+    parsed_end = _parse_iso_date(end_date, "end_date")
+    if parsed_start > parsed_end:
+        raise HTTPException(422, "start_date must not be after end_date")
+    types = split_csv(ticker_types)
+    selected_tickers = split_csv(tickers)
+    order_fields = _parse_buy_sell_pattern_tickers_order_by(order_by) or [("ticker", "asc")]
+    page = max(1, page)
+    page_size = max(1, min(page_size, BUY_SELL_PATTERN_TICKERS_MAX_PAGE_SIZE))
+
+    trades = _buy_sell_pattern_range_trades(name, parsed_start, parsed_end, selected_tickers or None)
+    stats = (
+        select(
+            trades.c.ticker,
+            func.count().label("trades"),
+            func.sum(trades.c.profit_pct).label("total_profit"),
+            func.avg(trades.c.profit_pct).label("avg_profit"),
+            func.min(trades.c.buy_datetime).label("first_trade_datetime"),
+            func.max(trades.c.sell_datetime).label("last_trade_datetime"),
+            func.avg(trades.c.buy_price).label("avg_buy_price"),
+            func.avg(trades.c.sell_price).label("avg_sell_price"),
+            func.min(trades.c.buy_price).label("buy_price_min"),
+            func.max(trades.c.buy_price).label("buy_price_max"),
+            func.min(trades.c.sell_price).label("sell_price_min"),
+            func.max(trades.c.sell_price).label("sell_price_max"),
+        )
+        .group_by(trades.c.ticker)
+        .subquery()
+    )
+    orderable: dict[str, ColumnElement] = {
+        "ticker": stats.c.ticker,
+        "type": Ticker.type,
+        "avg_profit": stats.c.avg_profit,
+    }
+    base_query = select(stats, Ticker).outerjoin(Ticker, Ticker.ticker == stats.c.ticker)
+    if types:
+        base_query = base_query.where(Ticker.type.in_(types))
+
+    with SessionLocal() as session:
+        total = session.execute(select(func.count()).select_from(base_query.subquery())).scalar_one()
+        order_clauses = []
+        for field, direction in order_fields:
+            column = orderable[field]
+            order_clauses.append((column.desc() if direction == "desc" else column.asc()).nulls_last())
+        if all(field != "ticker" for field, _ in order_fields):
+            order_clauses.append(stats.c.ticker.asc())
+        page_rows = session.execute(
+            base_query.order_by(*order_clauses).limit(page_size).offset((page - 1) * page_size)
+        ).all()
+        page_tickers = [row.ticker for row in page_rows]
+        latest_closes = _latest_daily_closes(session, page_tickers)
+        prices: dict[str, tuple[list[float], list[float]]] = {t: ([], []) for t in page_tickers}
+        if page_tickers:
+            page_trades = _buy_sell_pattern_range_trades(name, parsed_start, parsed_end, page_tickers)
+            for ticker_code, buy_price, sell_price in session.execute(
+                select(page_trades.c.ticker, page_trades.c.buy_price, page_trades.c.sell_price)
+            ):
+                prices[ticker_code][0].append(buy_price)
+                prices[ticker_code][1].append(sell_price)
+
+    computed_at = dt.datetime.utcnow().isoformat()
+    rows = []
+    for row in page_rows:
+        ticker = row.Ticker
+        buys, sells = prices[row.ticker]
+        rows.append(
+            {
+                "ticker": row.ticker,
+                "name": ticker.name if ticker else None,
+                "type": ticker.type if ticker else None,
+                "primary_exchange": ticker.primary_exchange if ticker else None,
+                "latest_close": latest_closes.get(row.ticker),
+                "trades": row.trades,
+                "total_profit": row.total_profit,
+                "first_trade_datetime": _isoformat_or_none(row.first_trade_datetime),
+                "last_trade_datetime": _isoformat_or_none(row.last_trade_datetime),
+                "avg_profit": row.avg_profit,
+                "avg_buy_price": row.avg_buy_price,
+                "avg_sell_price": row.avg_sell_price,
+                "buy_price_min": row.buy_price_min,
+                "buy_price_max": row.buy_price_max,
+                "buy_price_median": statistics.median(buys) if buys else None,
+                "sell_price_min": row.sell_price_min,
+                "sell_price_max": row.sell_price_max,
+                "sell_price_median": statistics.median(sells) if sells else None,
+                "computed_at": computed_at,
+            }
+        )
+    return {"rows": rows, "total": total, "page": page, "page_size": page_size}
+
+
+def _latest_daily_closes(session: Session, tickers: list[str]) -> dict[str, float]:
+    """{ticker: close} from each ticker's most recent daily bar with a close. A ticker
+    with no daily bars is left out."""
+    if not tickers:
+        return {}
+    latest = (
+        select(OhlcBar.ticker, func.max(OhlcBar.timestamp).label("timestamp"))
+        .where(
+            OhlcBar.ticker.in_(tickers),
+            OhlcBar.multiplier == DEFAULT_MULTIPLIER,
+            OhlcBar.timespan == DEFAULT_TIMESPAN,
+            OhlcBar.close.is_not(None),
+        )
+        .group_by(OhlcBar.ticker)
+        .subquery()
+    )
+    rows = session.execute(
+        select(OhlcBar.ticker, OhlcBar.close).join(
+            latest,
+            (OhlcBar.ticker == latest.c.ticker)
+            & (OhlcBar.multiplier == DEFAULT_MULTIPLIER)
+            & (OhlcBar.timespan == DEFAULT_TIMESPAN)
+            & (OhlcBar.timestamp == latest.c.timestamp),
+        )
+    ).all()
+    return dict(rows)
+
+
+def _isoformat_or_none(value: dt.datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
 
 
 NEXT_10_DAY_PREDICTIONS_MAX_PAGE_SIZE = 1000
@@ -3532,8 +3912,9 @@ def trigger_job(job_name: str, body: JobRunOverridesIn | None = None) -> dict:
 def _check_buy_sell_pattern_name(session: Session, job_name: str, fields: dict[str, Any] | None) -> None:
     """trigger_job's pre-flight for a buy-sell-pattern run: resolves the run's dates and
     name the same way jobs/engine.py will (this run's overrides when sent, the saved
-    config otherwise) and rejects a missing date range or an unaccepted name conflict
-    up front, instead of queueing a run that would only fail."""
+    config otherwise) and rejects an unaccepted name conflict up front, instead of
+    queueing a run that would only fail. Either date may be blank (an open-ended
+    range)."""
     if fields is None:
         config = get_or_create_config(session, job_name)
         start_date = config.buy_sell_pattern_start_date
@@ -3545,8 +3926,6 @@ def _check_buy_sell_pattern_name(session: Session, job_name: str, fields: dict[s
         end_date = fields["buy_sell_pattern_end_date"]
         name = fields["buy_sell_pattern_name"]
         replace = bool(fields.get("buy_sell_pattern_replace"))
-    if start_date is None or end_date is None:
-        raise HTTPException(status_code=400, detail="buy-sell-pattern needs both a Start date and an End date")
     resolved = resolve_pattern_name(name, start_date, end_date, "manual")
     if not replace and pattern_name_exists(session, resolved):
         raise HTTPException(

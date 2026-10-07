@@ -1075,23 +1075,76 @@ class ResearchPick(Base):
     computed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
 
 
+class BuySellPatternName(Base):
+    """One row per buy_sell_patterns pattern name - `name` identifies whose pattern it is
+    (e.g. an insider, a strategy, or an operator label), and every BuySellPattern row
+    points here by pattern_id rather than repeating the name. Written by
+    jobs/buy_sell_pattern.py in the same transaction as the pattern's trades: inserted
+    on a new name, updated (updated_at, span) when a run replaces it, and deleted when a
+    replacing run produces no trades - so a row here always has trades behind it.
+
+    first_trade_datetime/last_trade_datetime are the pattern's earliest and latest
+    BuySellPattern.trade_datetime across every ticker. created_at/updated_at are when
+    the pattern was first written and last replaced - set explicitly in application
+    code, same as JobConfig.updated_at."""
+
+    __tablename__ = "buy_sell_pattern_names"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String, unique=True)
+    first_trade_datetime: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=False))
+    last_trade_datetime: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=False))
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
+
+
 class BuySellPattern(Base):
-    """One row per (name, ticker, trade_date, buy_sell) - a manually-recorded buy/sell
-    observation for a ticker on a given date. `name` identifies whose pattern this is
-    (e.g. an insider, a strategy, or an operator label) - callers are responsible for
-    setting `created_at`/`updated_at` themselves (this codebase sets such timestamps
-    explicitly in application code - see JobConfig.updated_at - rather than relying on
-    an ORM-level default/onupdate)."""
+    """One row per (pattern_id, ticker, trade_datetime, buy_sell) - a buy/sell
+    observation for a ticker at a given price point, under the BuySellPatternName that
+    pattern_id points to. trade_datetime is the bar's date at the regular session's
+    open (09:30) or close (16:00), US/Eastern wall-clock time stored naive - see
+    jobs/buy_sell_pattern.py's MARKET_OPEN/MARKET_CLOSE. The pattern's name and its
+    created/updated times live on BuySellPatternName - see db/session.py's
+    _migrate_buy_sell_patterns_pattern_id for databases created before that."""
 
     __tablename__ = "buy_sell_patterns"
 
-    name: Mapped[str] = mapped_column(String, primary_key=True)
+    pattern_id: Mapped[int] = mapped_column(ForeignKey("buy_sell_pattern_names.id"), primary_key=True)
     ticker: Mapped[str] = mapped_column(ForeignKey("tickers.ticker"), primary_key=True)
-    trade_date: Mapped[dt.date] = mapped_column(Date, primary_key=True)
+    trade_datetime: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False), primary_key=True)
     buy_sell: Mapped[str] = mapped_column(String, primary_key=True)
     price: Mapped[float] = mapped_column(Float)
-    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
-    updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
+
+
+class BuySellPatternStat(Base):
+    """One row per (name, ticker) in buy_sell_patterns - summary statistics over that
+    ticker's trades stored under that pattern name. Rebuilt in full by
+    jobs/buy_sell_pattern_stats.py's compute_buy_sell_pattern_stats.
+
+    Every statistic is over complete trades (a buy paired with the next sell) - see
+    that module. total_profit and avg_profit are percentages - the sum and the mean of
+    each trade's (sell_price - buy_price) / buy_price * 100. first_trade_datetime is the earliest buy and
+    last_trade_datetime the latest sell, in BuySellPattern.trade_datetime's time base.
+    The buy/sell price ranges are stored as their min and max."""
+
+    __tablename__ = "buy_sell_pattern_stats"
+
+    name: Mapped[str] = mapped_column(String, primary_key=True)
+    ticker: Mapped[str] = mapped_column(ForeignKey("tickers.ticker"), primary_key=True)
+    trades: Mapped[int] = mapped_column(Integer)
+    total_profit: Mapped[float | None] = mapped_column(Float)
+    first_trade_datetime: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=False))
+    last_trade_datetime: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=False))
+    avg_buy_price: Mapped[float] = mapped_column(Float)
+    avg_sell_price: Mapped[float] = mapped_column(Float)
+    avg_profit: Mapped[float] = mapped_column(Float)
+    buy_price_min: Mapped[float] = mapped_column(Float)
+    buy_price_max: Mapped[float] = mapped_column(Float)
+    sell_price_min: Mapped[float] = mapped_column(Float)
+    sell_price_max: Mapped[float] = mapped_column(Float)
+    buy_price_median: Mapped[float] = mapped_column(Float)
+    sell_price_median: Mapped[float] = mapped_column(Float)
+    computed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
 
 
 class News(Base):

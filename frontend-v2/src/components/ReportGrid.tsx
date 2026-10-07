@@ -34,6 +34,9 @@ type ReportGridProps<T> = {
   // Right-click menu shown for any row, e.g. [{ label: 'View Details', onSelect: ... }] -
   // omit to leave rows without a context menu (the browser's native one still shows).
   rowContextMenu?: RowMenuItem<T>[]
+  // Adds a trailing column with one button per row, e.g. { label: 'View', onSelect: ... }
+  // - for an action that should be visible without right-clicking. Omit for no column.
+  rowAction?: RowMenuItem<T>
   // Base filename (no extension - each export button appends its own) for the "Export
   // CSV"/"Export PDF" toolbar buttons. Omit to leave the grid without export buttons,
   // same opt-in shape as storageKey.
@@ -46,6 +49,13 @@ type ReportGridProps<T> = {
   // clipboard as tab-separated text with a header row, which pastes straight into
   // Excel/Sheets as cells. Omit to leave the grid without it.
   copyable?: boolean
+  // Adds a leading checkbox column for picking rows, keyed by rowKey - the caller owns
+  // the selected set. The header checkbox selects/clears every row the current column
+  // filters show. Omit for no checkbox column.
+  rowSelection?: {
+    selected: ReadonlySet<string>
+    onChange: (next: Set<string>) => void
+  }
 }
 
 type SortDir = 'asc' | 'desc'
@@ -245,9 +255,11 @@ export function ReportGrid<T>({
   emptyMessage,
   storageKey,
   rowContextMenu,
+  rowAction,
   exportFilename,
   exportTitle,
   copyable,
+  rowSelection,
 }: ReportGridProps<T>) {
   type Key = Extract<keyof T, string>
 
@@ -357,6 +369,7 @@ export function ReportGrid<T>({
   }
 
   const visibleColumns = useMemo(() => columns.filter((col) => !hiddenKeys.has(col.key)), [columns, hiddenKeys])
+  const bodyColSpan = visibleColumns.length + (rowAction ? 1 : 0) + (rowSelection ? 1 : 0)
 
   // A column counts as numeric when every non-null raw value seen for it (across the
   // full result, same reasoning as columnValues below) is a number - gates whether
@@ -660,6 +673,15 @@ export function ReportGrid<T>({
         <table className="job-history-table report-table">
           <thead>
             <tr>
+              {rowSelection && (
+                <th className="report-select-cell">
+                  <SelectAllCheckbox
+                    keys={sortedRows.map(rowKey)}
+                    selected={rowSelection.selected}
+                    onChange={rowSelection.onChange}
+                  />
+                </th>
+              )}
               {visibleColumns.map((col) => {
                 const isSorted = sortKey === col.key
                 const isFrozen = frozenKeys.has(col.key)
@@ -704,12 +726,13 @@ export function ReportGrid<T>({
                   </th>
                 )
               })}
+              {rowAction && <th aria-label={rowAction.label} />}
             </tr>
           </thead>
           <tbody>
             {sortedRows.length === 0 ? (
               <tr>
-                <td className="report-empty-cell" colSpan={visibleColumns.length}>
+                <td className="report-empty-cell" colSpan={bodyColSpan}>
                   No rows match the current column filters.
                 </td>
               </tr>
@@ -720,7 +743,7 @@ export function ReportGrid<T>({
                     every row between them and the top were actually mounted. */}
                 {topSpacerHeight > 0 && (
                   <tr aria-hidden="true" style={{ height: topSpacerHeight }}>
-                    <td colSpan={visibleColumns.length} style={{ padding: 0, border: 'none' }} />
+                    <td colSpan={bodyColSpan} style={{ padding: 0, border: 'none' }} />
                   </tr>
                 )}
                 {visibleRows.map((row, i) => (
@@ -737,6 +760,21 @@ export function ReportGrid<T>({
                         : undefined
                     }
                   >
+                    {rowSelection && (
+                      <td className="report-select-cell">
+                        <input
+                          type="checkbox"
+                          aria-label="Select row"
+                          checked={rowSelection.selected.has(rowKey(row))}
+                          onChange={(event) => {
+                            const next = new Set(rowSelection.selected)
+                            if (event.target.checked) next.add(rowKey(row))
+                            else next.delete(rowKey(row))
+                            rowSelection.onChange(next)
+                          }}
+                        />
+                      </td>
+                    )}
                     {visibleColumns.map((col) => {
                       const isFrozen = frozenKeys.has(col.key)
                       const width = columnWidths[col.key]
@@ -757,13 +795,20 @@ export function ReportGrid<T>({
                         </td>
                       )
                     })}
+                    {rowAction && (
+                      <td>
+                        <button type="button" className="job-button" onClick={() => rowAction.onSelect(row)}>
+                          {rowAction.label}
+                        </button>
+                      </td>
+                    )}
                   </tr>
                 ))}
                 {/* Same reasoning as the top spacer, for every row below the windowed
                     slice - keeps the scrollbar's total scrollable height correct. */}
                 {bottomSpacerHeight > 0 && (
                   <tr aria-hidden="true" style={{ height: bottomSpacerHeight }}>
-                    <td colSpan={visibleColumns.length} style={{ padding: 0, border: 'none' }} />
+                    <td colSpan={bodyColSpan} style={{ padding: 0, border: 'none' }} />
                   </tr>
                 )}
               </>
@@ -798,5 +843,42 @@ export function ReportGrid<T>({
           document.body,
         )}
     </div>
+  )
+}
+
+// Header checkbox for rowSelection - checked when every key in `keys` is selected,
+// indeterminate when only some are. Toggling adds or removes all of `keys`, leaving
+// any selected row the column filters currently hide as it was.
+function SelectAllCheckbox({
+  keys,
+  selected,
+  onChange,
+}: {
+  keys: string[]
+  selected: ReadonlySet<string>
+  onChange: (next: Set<string>) => void
+}) {
+  const ref = useRef<HTMLInputElement>(null)
+  const selectedCount = keys.filter((key) => selected.has(key)).length
+  const all = keys.length > 0 && selectedCount === keys.length
+  useEffect(() => {
+    if (ref.current) ref.current.indeterminate = selectedCount > 0 && !all
+  }, [selectedCount, all])
+  return (
+    <input
+      ref={ref}
+      type="checkbox"
+      aria-label="Select all rows"
+      checked={all}
+      disabled={keys.length === 0}
+      onChange={() => {
+        const next = new Set(selected)
+        for (const key of keys) {
+          if (all) next.delete(key)
+          else next.add(key)
+        }
+        onChange(next)
+      }}
+    />
   )
 }

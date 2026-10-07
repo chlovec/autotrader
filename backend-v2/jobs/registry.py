@@ -60,6 +60,8 @@ TRAIN_LSTM_WALKFORWARD_JOB = "train-lstm-walkforward"
 PREDICT_LSTM_HOLDOUT_JOB = "predict-lstm-market-state-holdout"
 PREDICT_LSTM_WALKFORWARD_JOB = "predict-lstm-market-state-walkforward"
 BUY_SELL_PATTERN_JOB = "buy-sell-pattern"
+# Summarizes buy_sell_patterns per (name, ticker) - see jobs/buy_sell_pattern_stats.py.
+BUY_SELL_PATTERN_STATS_JOB = "buy-sell-pattern-stats"
 # Deletes the SQL console's export files once they're older than a configurable age -
 # see jobs/query_exports.py.
 QUERY_EXPORT_CLEANUP_JOB = "cleanup-query-exports"
@@ -148,6 +150,7 @@ DEFAULT_SCHEDULES: dict[str, tuple[str, int]] = {
     PREDICT_LSTM_HOLDOUT_JOB: ("days", 1),
     PREDICT_LSTM_WALKFORWARD_JOB: ("days", 1),
     BUY_SELL_PATTERN_JOB: ("days", 1),
+    BUY_SELL_PATTERN_STATS_JOB: ("days", 1),
     # Frequent so an export is deleted soon after it reaches its max age (default 2
     # hours), not up to a day later.
     QUERY_EXPORT_CLEANUP_JOB: ("minutes", 15),
@@ -777,13 +780,16 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
         label="Buy/sell pattern",
         description=(
             "For each selected ticker, finds the buy and sell days across the Start "
-            "date/End date range that maximize total profit from daily ohlc_bars - any "
-            "number of non-overlapping trades, each buying at the buy day's low and "
-            "selling at the sell day's high. A trade can buy and sell on the same day "
-            "only if that day's close is above its low; otherwise it sells on a later "
-            "day. Stores one buy row and one sell row per trade in the "
-            "buy_sell_patterns table under a name - by default the start and end date "
-            "(e.g. 2026-01-01_2026-03-31), or the Name field on a manual run. If that "
+            "date/End date range (either optional - a blank Start date means the earliest "
+            "bar, a blank End date the latest) that maximize total profit from the daily bars in the "
+            "tickers_daily_bars_min_60_days_from_latest view (tickers with a bar "
+            "on the latest trading day and a full 60 most recent daily bars) - any "
+            "number of non-overlapping trades, each buying at a day's open or close and "
+            "selling at a later, higher open or close (the same day's close counts). "
+            "Stores one buy row and one sell row per trade in the "
+            "buy_sell_patterns table, stamped with the trade's datetime (the day at "
+            "09:30 for an open, 21:00 UTC for a close), under a name - by default the start and end date "
+            "(e.g. 2026-01-01_2026-03-31, with earliest/latest for a blank date), or the Name field on a manual run. If that "
             "name already has rows, a manual run asks whether to replace them or pick "
             "another name; an auto run fails. Purely local - no massive.com call, reads "
             "bars already synced by the bars jobs."
@@ -793,6 +799,25 @@ JOB_DEFINITIONS: dict[str, JobDefinition] = {
         has_buy_sell_pattern_fields=True,
         # Run-on-demand analysis over an explicit date range - manual by default, same
         # reasoning as backtest-market-state.
+        default_run_type="manual",
+    ),
+    BUY_SELL_PATTERN_STATS_JOB: JobDefinition(
+        name=BUY_SELL_PATTERN_STATS_JOB,
+        label="Buy/sell pattern stats",
+        description=(
+            "For every ticker under every buy_sell_patterns name, summarizes its stored "
+            "trades into the buy_sell_pattern_stats table: trade count, total and "
+            "average profit per share, first and last trade, average buy price, "
+            "average sell price, buy and sell price range (min and max), and buy and "
+            "sell price median. Rebuilds the whole "
+            "table each run, so run it after the buy/sell pattern job. Purely local - "
+            "no massive.com call."
+        ),
+        has_bars_fields=False,
+        # Covers every stored pattern and ticker - nothing to filter, same reasoning as
+        # research-picks.
+        has_ticker_type_filter=False,
+        # Only meaningful after a buy/sell pattern run, which is itself manual.
         default_run_type="manual",
     ),
     QUERY_EXPORT_CLEANUP_JOB: JobDefinition(

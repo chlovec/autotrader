@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
 
 export type SelectOption = { value: string; label: string }
 
@@ -90,6 +90,23 @@ export function SearchableSelect({
     onChange(selected.filter((v) => v !== value))
   }
 
+  // The option whose value the typed text names exactly (case-insensitive) - e.g.
+  // "nbil" for NBIL - so typing a full ticker works without clicking it in the list.
+  const exactMatch = (): SelectOption | undefined => {
+    const term = query.trim().toLowerCase()
+    return term ? results.find((o) => o.value.toLowerCase() === term) : undefined
+  }
+
+  // Enter picks the exact match, else the first result.
+  const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (e.key !== 'Enter' || loading) return
+    const pick = exactMatch() ?? results[0]
+    if (!pick) return
+    e.preventDefault()
+    if (!isSelected(pick.value)) toggle(pick.value)
+    else setQuery('')
+  }
+
   const handleFocus = () => {
     if (blurTimeoutRef.current) window.clearTimeout(blurTimeoutRef.current)
     setOpen(true)
@@ -98,7 +115,11 @@ export function SearchableSelect({
   // Delayed so a click on a dropdown option (which doesn't itself steal focus, but a
   // click landing just outside the widget should still close it) has a chance to
   // register first.
+  // Leaving the input with an exact match typed (and not picked) selects it, so the
+  // typed text never looks selected while the value stays empty.
   const handleBlur = () => {
+    const match = exactMatch()
+    if (match && !isSelected(match.value)) toggle(match.value)
     blurTimeoutRef.current = window.setTimeout(() => setOpen(false), 120)
   }
 
@@ -132,6 +153,7 @@ export function SearchableSelect({
             onChange={(e) => setQuery(e.target.value)}
             onFocus={handleFocus}
             onBlur={handleBlur}
+            onKeyDown={handleKeyDown}
           />
         )}
       </div>

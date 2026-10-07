@@ -36,6 +36,9 @@ const NAV_ITEMS: NavItem[] = [
       'Market Prediction Performance',
       'Prediction Comparison',
       'Prediction Accuracy',
+      'Buy Sell Pattern',
+      'Buy Sell Pattern (Date Range)',
+      'Buy Sell Trades',
     ],
   },
   {
