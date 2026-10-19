@@ -86,6 +86,8 @@ def init_db() -> None:
     _add_buy_sell_pattern_stats_trade_columns()
     _add_ticker_groups_sort_order_column()
     _add_job_configs_query_export_max_age_hours_column()
+    _add_ticker_prediction_header_ref_pred_id_column()
+    _migrate_tickers_hit_rate_direction_pk()
     _create_tickers_daily_bars_min_60_days_from_latest_view()
 
 
@@ -608,6 +610,49 @@ def _add_job_configs_query_export_max_age_hours_column() -> None:
     """See db/models.py's JobConfig.query_export_max_age_hours - added after
     job_configs itself, left NULL on existing rows (resolved at run time)."""
     _add_job_configs_column("query_export_max_age_hours", "FLOAT")
+
+
+
+def _add_ticker_prediction_header_ref_pred_id_column() -> None:
+    """See db/models.py's TickerPredictionHeader.ref_pred_id - added after
+    prediction_header itself, left NULL on existing rows. SQLite allows a
+    REFERENCES clause on ADD COLUMN as long as the column's default is NULL."""
+    _add_column_if_missing(
+        "prediction_header",
+        "ref_pred_id",
+        "INTEGER REFERENCES prediction_header(pred_id)",
+    )
+
+
+def _migrate_tickers_hit_rate_direction_pk() -> None:
+    """TickerHitRate's primary key widened from (pred_id, ticker) to (pred_id, ticker,
+    direction), so one prediction set can hold a ticker's Up and Down hit rates side by
+    side. Same recreate-copy-drop pattern as _migrate_lstm_inferences_training_method_pk,
+    since SQLite can't change a PRIMARY KEY in place. Every existing row carries over
+    as-is - the old key is a subset of the new one."""
+    inspector = inspect(engine)
+    if "tickers_hit_rate" not in inspector.get_table_names():
+        return
+    if "direction" in inspector.get_pk_constraint("tickers_hit_rate")["constrained_columns"]:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE tickers_hit_rate RENAME TO tickers_hit_rate_old"))
+        Base.metadata.tables["tickers_hit_rate"].create(conn)
+        conn.execute(
+            text(
+                """
+                INSERT INTO tickers_hit_rate (
+                    pred_id, ticker, trading_days_count, hit_rate_count, hit_rate_pcnt,
+                    pcnt_difference, direction
+                )
+                SELECT
+                    pred_id, ticker, trading_days_count, hit_rate_count, hit_rate_pcnt,
+                    pcnt_difference, direction
+                FROM tickers_hit_rate_old
+                """
+            )
+        )
+        conn.execute(text("DROP TABLE tickers_hit_rate_old"))
 
 
 _TICKERS_DAILY_BARS_MIN_60_VIEW = "tickers_daily_bars_min_60_days_from_latest"

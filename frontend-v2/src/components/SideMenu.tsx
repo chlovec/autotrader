@@ -42,6 +42,10 @@ const NAV_ITEMS: NavItem[] = [
     ],
   },
   {
+    view: 'Predictions',
+    children: ['Prediction Headers', 'Upload Ticker Hit Rates', 'Upload Prediction Results'],
+  },
+  {
     view: 'Settings',
     children: ['Ticker Types', 'SQL Console'],
   },

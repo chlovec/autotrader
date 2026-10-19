@@ -107,7 +107,8 @@ def _upsert_bars(session: Session, rows: list[dict[str, Any]]) -> None:
 async def _fetch_day(client: DataClient, day: dt.date) -> list[dict[str, Any]]:
     payload = await client.get(
         f"/v2/aggs/grouped/locale/us/market/stocks/{day.isoformat()}",
-        params={"adjusted": "true", "include_otc": "true"},
+        # Unadjusted, same as sync_bars.fetch_and_store_bars - see the comment there.
+        params={"adjusted": "false", "include_otc": "true"},
     )
     return payload.get("results") or []
 

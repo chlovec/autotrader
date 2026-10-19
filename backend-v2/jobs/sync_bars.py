@@ -118,7 +118,11 @@ async def fetch_and_store_bars(
     up-to-date a ticker is can just look at ohlc_bars.MAX(timestamp) itself (see
     _last_bar_dates), rather than a separately-maintained cursor that could say one
     thing while the data says another."""
-    params: dict[str, Any] = {"adjusted": "true", "sort": "asc", "limit": PAGE_LIMIT}
+    # Unadjusted: adjusted=true back-scales every earlier bar by all later splits, so a
+    # serial reverse-splitter's history turns into impossible prices (WHLR's $2.74 close
+    # on 2021-10-18 came back as ~$179B) and rows fetched at different times end up on
+    # different split bases. Stored bars are the prices that actually traded.
+    params: dict[str, Any] = {"adjusted": "false", "sort": "asc", "limit": PAGE_LIMIT}
     path = _bars_path(ticker, multiplier, timespan, start_date, end_date)
 
     next_url: str | None = None

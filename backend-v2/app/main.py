@@ -11,22 +11,25 @@ directly) - see db/session.py's WAL-mode comment for why that stopped being viab
 (a heavy job's CPU/DB usage could make the dashboard unresponsive while it ran).
 """
 
+import asyncio
 import csv
 import datetime as dt
 import json
 import logging
 import os
 import statistics
+import tempfile
 import threading
 import time
 from contextlib import asynccontextmanager, contextmanager
-from typing import Any, Literal
+from typing import Any, Callable, Iterator, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy import Connection, Float, case, cast, delete, func, or_, select, text, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.orm import Session, aliased
@@ -37,6 +40,7 @@ from db.models import (
     BuySellPattern,
     BuySellPatternName,
     BuySellPatternStat,
+    CurrentPredResult,
     CurrentSnapshot,
     JobConfig,
     JobRun,
@@ -53,9 +57,12 @@ from db.models import (
     SyncProgress,
     SyncState,
     TechnicalIndicator,
+    TestPredResult,
     Ticker,
     TickerDetail,
     TickerGroup,
+    TickerHitRate,
+    TickerPredictionHeader,
     TickerType,
     TopMarketMover,
     UnifiedSnapshot,
@@ -453,6 +460,12 @@ class WatchlistReorderIn(BaseModel):
     tickers: list[str]
 
 
+class PredictionHeaderIn(BaseModel):
+    pred_date: dt.date
+    comments: str | None = None
+    ref_pred_id: int | None = None
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -649,6 +662,364 @@ def remove_from_watchlist(ticker: str) -> dict:
         session.delete(entry)
         session.commit()
         return {"ticker": entry.ticker}
+
+
+def _prediction_header_to_dict(header: TickerPredictionHeader, counts: dict[str, int]) -> dict:
+    return {
+        "pred_id": header.pred_id,
+        "pred_date": header.pred_date.isoformat(),
+        "comments": header.comments,
+        "ref_pred_id": header.ref_pred_id,
+        "hit_rate_rows": counts.get("hit_rate_rows", 0),
+        "test_result_rows": counts.get("test_result_rows", 0),
+        "current_result_rows": counts.get("current_result_rows", 0),
+    }
+
+
+def _prediction_row_counts(session: Session, pred_ids: list[int] | None = None) -> dict[int, dict[str, int]]:
+    """Rows already uploaded per prediction set, per table - shown on the Prediction
+    Headers page and the upload pages' header pickers."""
+    counts: dict[int, dict[str, int]] = {}
+    for label, model in (
+        ("hit_rate_rows", TickerHitRate),
+        ("test_result_rows", TestPredResult),
+        ("current_result_rows", CurrentPredResult),
+    ):
+        query = select(model.pred_id, func.count()).group_by(model.pred_id)
+        if pred_ids is not None:
+            query = query.where(model.pred_id.in_(pred_ids))
+        for pred_id, count in session.execute(query):
+            counts.setdefault(pred_id, {})[label] = count
+    return counts
+
+
+def _check_ref_pred_id(session: Session, ref_pred_id: int | None, pred_id: int | None = None) -> None:
+    if ref_pred_id is None:
+        return
+    if ref_pred_id == pred_id:
+        raise HTTPException(status_code=400, detail="a prediction header can't reference itself")
+    if session.get(TickerPredictionHeader, ref_pred_id) is None:
+        raise HTTPException(status_code=400, detail=f"reference prediction {ref_pred_id} does not exist")
+
+
+@app.get("/prediction-headers")
+def list_prediction_headers() -> list[dict]:
+    """Backs the Prediction Headers page and the upload pages' prediction pickers -
+    newest prediction set first."""
+    with SessionLocal() as session:
+        headers = (
+            session.execute(
+                select(TickerPredictionHeader).order_by(
+                    TickerPredictionHeader.pred_date.desc(), TickerPredictionHeader.pred_id.desc()
+                )
+            )
+            .scalars()
+            .all()
+        )
+        counts = _prediction_row_counts(session)
+        return [_prediction_header_to_dict(h, counts.get(h.pred_id, {})) for h in headers]
+
+
+@app.post("/prediction-headers")
+def create_prediction_header(body: PredictionHeaderIn) -> dict:
+    with SessionLocal() as session:
+        _check_ref_pred_id(session, body.ref_pred_id)
+        header = TickerPredictionHeader(
+            pred_date=body.pred_date,
+            comments=(body.comments or "").strip() or None,
+            ref_pred_id=body.ref_pred_id,
+        )
+        session.add(header)
+        session.commit()
+        return _prediction_header_to_dict(header, {})
+
+
+@app.put("/prediction-headers/{pred_id}")
+def update_prediction_header(pred_id: int, body: PredictionHeaderIn) -> dict:
+    with SessionLocal() as session:
+        header = session.get(TickerPredictionHeader, pred_id)
+        if header is None:
+            raise HTTPException(status_code=404, detail=f"prediction {pred_id} not found")
+        _check_ref_pred_id(session, body.ref_pred_id, pred_id)
+        header.pred_date = body.pred_date
+        header.comments = (body.comments or "").strip() or None
+        header.ref_pred_id = body.ref_pred_id
+        session.commit()
+        return _prediction_header_to_dict(header, _prediction_row_counts(session, [pred_id]).get(pred_id, {}))
+
+
+# Cell values treated as NULL in an uploaded prediction CSV - blank, plus R's NA/NaN
+# (the files come out of R's write.csv).
+_CSV_NULLS = {"", "NA", "NAN", "NULL", "NONE"}
+_CSV_INSERT_BATCH = 5000
+# Largest prediction CSV upload accepted - checked against Content-Length up front and
+# again against the bytes actually received while streaming.
+MAX_PREDICTION_UPLOAD_BYTES = 600 * 1024 * 1024
+# Cap on how many bad rows an upload's error lists - enough to spot the pattern.
+_CSV_MAX_ERRORS = 10
+
+
+def _csv_null(value: str | None) -> bool:
+    return value is None or value.strip().upper() in _CSV_NULLS
+
+
+def _csv_float(value: str | None) -> float | None:
+    if _csv_null(value):
+        return None
+    return float(value.strip().rstrip("%"))
+
+
+def _csv_int(value: str | None) -> int | None:
+    number = _csv_float(value)
+    if number is None:
+        return None
+    if not number.is_integer():
+        raise ValueError(f"{value!r} is not a whole number")
+    return int(number)
+
+
+def _csv_datetime(value: str | None) -> dt.datetime | None:
+    """Accepts a date or date-time, with an optional trailing "Z"/" UTC" or UTC offset
+    - stored naive UTC like every other timestamp column here."""
+    if _csv_null(value):
+        return None
+    text_value = value.strip()
+    for suffix in (" UTC", "Z"):
+        if text_value.endswith(suffix):
+            text_value = text_value[: -len(suffix)]
+    parsed = dt.datetime.fromisoformat(text_value)
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(dt.timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _csv_date(value: str | None) -> dt.date | None:
+    parsed = _csv_datetime(value)
+    return parsed.date() if parsed is not None else None
+
+
+def _csv_str(value: str | None) -> str | None:
+    return None if _csv_null(value) else value.strip()
+
+
+def _csv_ticker(value: str | None) -> str | None:
+    """Only a blank cell is missing here - not _CSV_NULLS' NA/NaN/NULL/None, since NA
+    and NAN are real ticker symbols. A stray R NA still can't slip through as a ticker:
+    the upload rejects any ticker not in the tickers table.
+
+    Case is kept as-is, not upper-cased: massive.com writes preferred shares with a
+    lowercase "p" (e.g. ABRpD), so upper-casing breaks the match against tickers."""
+    if value is None or not value.strip():
+        return None
+    return value.strip()
+
+
+# CSV header -> (db column, parser, required) for each upload type. Headers are
+# matched exactly; extra columns (e.g. R's unnamed row-number column) are ignored.
+_HIT_RATE_CSV_COLUMNS: dict[str, tuple[str, Callable[[str | None], Any], bool]] = {
+    "Direction": ("direction", _csv_str, True),
+    "Ticker": ("ticker", _csv_ticker, True),
+    "Count of Trading Days": ("trading_days_count", _csv_int, True),
+    "Hit Rate (Count)": ("hit_rate_count", _csv_int, True),
+    "Hit Rate (Pcnt)": ("hit_rate_pcnt", _csv_float, True),
+    "Pcnt Difference": ("pcnt_difference", _csv_float, False),
+}
+
+_PRED_RESULT_CSV_COLUMNS: dict[str, tuple[str, Callable[[str | None], Any], bool]] = {
+    "ticker": ("ticker", _csv_ticker, True),
+    "timestamp": ("timestamp", _csv_datetime, True),
+    "close": ("close", _csv_float, False),
+    "prev_timestamp": ("prev_timestamp", _csv_datetime, False),
+    "prev_close": ("prev_close", _csv_float, False),
+    "pct_return": ("pct_return", _csv_float, False),
+    "p_end": ("p_end", _csv_float, False),
+    "p_start": ("p_start", _csv_float, False),
+    "momentum": ("momentum", _csv_float, False),
+    "volatility": ("volatility", _csv_float, False),
+    "date": ("date", _csv_date, False),
+    "pcnt_daily_return": ("pcnt_daily_return", _csv_float, False),
+    "momentum_z": ("momentum_z", _csv_float, False),
+    "volatility_z": ("volatility_z", _csv_float, False),
+    "pred": ("pred", _csv_float, False),
+    "pred_close": ("pred_close", _csv_float, False),
+    "pcnt_diff": ("pcnt_diff", _csv_float, False),
+}
+
+
+_CsvColumns = dict[str, tuple[str, Callable[[str | None], Any], bool]]
+
+
+def _describe_csv_record(record: dict[str | None, Any], headers: list[str]) -> str:
+    """One bad CSV row's values, for an upload error - every column in file order plus
+    a note when the row's field count doesn't match the header's, which is the usual
+    reason a required value comes through empty (a missing or extra delimiter shifts
+    every value after it)."""
+
+    def shown(value: Any) -> str:
+        text_value = repr(value)
+        return text_value if len(text_value) <= 40 else text_value[:37] + "..."
+
+    parts = [f"{header or '(unnamed)'}={shown(record.get(header))}" for header in headers]
+    extra = record.get(None) or []
+    if extra:
+        parts.append(f"(+{len(extra)} extra value(s) beyond the header: {shown(extra)})")
+    elif any(record.get(header) is None for header in headers):
+        present = sum(record.get(header) is not None for header in headers)
+        parts.append(f"(only {present} of {len(headers)} values - row is short)")
+    return ", ".join(parts)
+
+
+def _iter_prediction_csv(path: str, columns: _CsvColumns, pred_id: int, errors: list[str]) -> Iterator[dict[str, Any]]:
+    """Streams the uploaded file's rows as insert-ready dicts, one at a time, so a
+    multi-hundred-MB file is never held in memory. A bad row is recorded in `errors`
+    (not yielded); iteration stops once _CSV_MAX_ERRORS have been collected."""
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as fh:
+            reader = csv.DictReader(fh)
+            headers = [h.strip() for h in (reader.fieldnames or [])]
+            reader.fieldnames = headers
+            missing = [name for name in columns if name not in headers]
+            if missing:
+                raise HTTPException(status_code=400, detail=f"CSV is missing column(s): {', '.join(missing)}")
+            for record in reader:
+                row: dict[str, Any] = {"pred_id": pred_id}
+                for header, (column, parse, required) in columns.items():
+                    raw = record.get(header)
+                    try:
+                        value = parse(raw)
+                    except ValueError:
+                        problem = f"invalid {header} {raw!r}"
+                    else:
+                        if value is not None or not required:
+                            row[column] = value
+                            continue
+                        problem = f"{header} is required"
+                    # reader.line_num is the file's physical line (the last one, for a
+                    # record whose quoted values span several lines) - so it matches
+                    # what `sed -n '<N>p'` shows.
+                    error = f"line {reader.line_num}: {problem} - row: {_describe_csv_record(record, headers)}"
+                    logger.warning("prediction CSV upload (pred_id=%s) rejected %s", pred_id, error)
+                    errors.append(error)
+                    break
+                else:
+                    yield row
+                if len(errors) >= _CSV_MAX_ERRORS:
+                    return
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="CSV must be UTF-8 encoded") from None
+
+
+def _ingest_prediction_csv(path: str, model: type[Base], columns: _CsvColumns, pred_id: int, replace: bool) -> dict:
+    """Two passes over the uploaded file. The first validates every row and collects
+    the tickers without writing anything, so a bad file is rejected whole. The second
+    upserts in batches of _CSV_INSERT_BATCH, committing each - rather than one
+    transaction for millions of rows, which would hold SQLite's write lock long enough
+    for concurrently running jobs to time out (busy_timeout is 30s). The flip side:
+    if the second pass somehow fails partway, the batches before it stay written -
+    re-upload with `replace` to start clean.
+
+    Every ticker must already exist in the tickers table - SQLite doesn't enforce the
+    foreign key, same reasoning as add_to_watchlist."""
+    with SessionLocal() as session:
+        _require_prediction_header(session, pred_id)
+
+        errors: list[str] = []
+        tickers: set[str] = set()
+        row_count = 0
+        for row in _iter_prediction_csv(path, columns, pred_id, errors):
+            tickers.add(row["ticker"])
+            row_count += 1
+        if errors:
+            raise HTTPException(status_code=400, detail="\n".join(errors))
+        if row_count == 0:
+            raise HTTPException(status_code=400, detail="CSV has no data rows")
+
+        ordered = sorted(tickers)
+        known: set[str] = set()
+        for start in range(0, len(ordered), 500):
+            chunk = ordered[start : start + 500]
+            known.update(session.execute(select(Ticker.ticker).where(Ticker.ticker.in_(chunk))).scalars())
+        unknown = [t for t in ordered if t not in known]
+        if unknown:
+            shown = ", ".join(unknown[:20]) + (f" (+{len(unknown) - 20} more)" if len(unknown) > 20 else "")
+            raise HTTPException(status_code=400, detail=f"unknown ticker(s): {shown}")
+
+        replaced = 0
+        if replace:
+            replaced = session.execute(delete(model).where(model.pred_id == pred_id)).rowcount or 0
+            session.commit()
+        key_columns = [col.name for col in model.__table__.primary_key.columns]
+        stmt = sqlite_insert(model)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=key_columns,
+            set_={column: stmt.excluded[column] for column, _, _ in columns.values() if column not in key_columns},
+        )
+        batch: list[dict[str, Any]] = []
+        for row in _iter_prediction_csv(path, columns, pred_id, errors):
+            batch.append(row)
+            if len(batch) >= _CSV_INSERT_BATCH:
+                session.execute(stmt, batch)
+                session.commit()
+                batch = []
+        if batch:
+            session.execute(stmt, batch)
+            session.commit()
+        return {"pred_id": pred_id, "rows": row_count, "tickers": len(tickers), "replaced": replaced}
+
+
+def _require_prediction_header(session: Session, pred_id: int) -> None:
+    if session.get(TickerPredictionHeader, pred_id) is None:
+        raise HTTPException(status_code=404, detail=f"prediction {pred_id} not found")
+
+
+async def _upload_prediction_csv(
+    request: Request, model: type[Base], columns: _CsvColumns, pred_id: int, replace: bool
+) -> dict:
+    """The request body is the raw CSV file (not JSON or multipart), streamed to a temp
+    file as it arrives so memory use stays flat regardless of file size; the file is
+    then ingested on a worker thread so the event loop isn't blocked meanwhile."""
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_PREDICTION_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=_upload_too_large_detail())
+    with SessionLocal() as session:
+        _require_prediction_header(session, pred_id)
+
+    fd, path = tempfile.mkstemp(prefix="prediction-upload-", suffix=".csv")
+    try:
+        received = 0
+        with os.fdopen(fd, "wb") as fh:
+            async for chunk in request.stream():
+                received += len(chunk)
+                if received > MAX_PREDICTION_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail=_upload_too_large_detail())
+                fh.write(chunk)
+        if received == 0:
+            raise HTTPException(status_code=400, detail="CSV is empty")
+        return await asyncio.to_thread(_ingest_prediction_csv, path, model, columns, pred_id, replace)
+    finally:
+        os.unlink(path)
+
+
+def _upload_too_large_detail() -> str:
+    return f"CSV is larger than the {MAX_PREDICTION_UPLOAD_BYTES // (1024 * 1024)} MB upload limit"
+
+
+@app.post("/prediction-headers/{pred_id}/hit-rates")
+async def upload_prediction_hit_rates(pred_id: int, request: Request, replace: bool = False) -> dict:
+    """Backs the Upload Ticker Predictions page - one CSV row per ticker, into
+    tickers_hit_rate under pred_id. `replace` deletes the prediction set's existing
+    rows first rather than upserting on top of them."""
+    return await _upload_prediction_csv(request, TickerHitRate, _HIT_RATE_CSV_COLUMNS, pred_id, replace)
+
+
+@app.post("/prediction-headers/{pred_id}/results/{kind}")
+async def upload_prediction_results(
+    pred_id: int, kind: Literal["test", "current"], request: Request, replace: bool = False
+) -> dict:
+    """Backs the Upload Prediction Results page - one CSV row per (ticker, timestamp),
+    into test_pred_results or current_pred_results under pred_id. `replace` as above."""
+    model = TestPredResult if kind == "test" else CurrentPredResult
+    return await _upload_prediction_csv(request, model, _PRED_RESULT_CSV_COLUMNS, pred_id, replace)
 
 
 def _prediction_fields(prediction: MarketPrediction | None) -> dict[str, Any]:

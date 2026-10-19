@@ -1147,6 +1147,71 @@ class BuySellPatternStat(Base):
     computed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False))
 
 
+class TickerPredictionHeader(Base):
+    """One row per prediction set - every TickerHitRate row points here by pred_id.
+    ref_pred_id optionally points to another prediction set in this same table (e.g.
+    the one this set was derived from or is compared against); NULL when there isn't
+    one."""
+
+    __tablename__ = "prediction_header"
+
+    pred_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    pred_date: Mapped[dt.date] = mapped_column(Date)
+    comments: Mapped[str | None] = mapped_column(String)
+    ref_pred_id: Mapped[int | None] = mapped_column(ForeignKey("prediction_header.pred_id"))
+
+
+class TickerHitRate(Base):
+    """One row per (pred_id, ticker, direction) - that ticker's hit rate in that
+    direction under the prediction set in TickerPredictionHeader. hit_rate_pcnt and pcnt_difference are percentages
+    (0-100), same as BuySellPatternStat.total_profit."""
+
+    __tablename__ = "tickers_hit_rate"
+
+    pred_id: Mapped[int] = mapped_column(ForeignKey("prediction_header.pred_id"), primary_key=True)
+    ticker: Mapped[str] = mapped_column(ForeignKey("tickers.ticker"), primary_key=True)
+    trading_days_count: Mapped[int] = mapped_column(Integer)
+    hit_rate_count: Mapped[int] = mapped_column(Integer)
+    hit_rate_pcnt: Mapped[float] = mapped_column(Float)
+    pcnt_difference: Mapped[float | None] = mapped_column(Float)
+    direction: Mapped[str] = mapped_column(String, primary_key=True)
+
+
+class _PredResultColumns:
+    """Columns shared by test_pred_results and current_pred_results - one row per
+    (pred_id, ticker, timestamp) under the prediction set in TickerPredictionHeader.
+    Everything outside the key is nullable: lagged values (prev_close, momentum, ...)
+    are NULL at the start of a ticker's history, and a current prediction's close may
+    not be known yet."""
+
+    pred_id: Mapped[int] = mapped_column(ForeignKey("prediction_header.pred_id"), primary_key=True)
+    ticker: Mapped[str] = mapped_column(ForeignKey("tickers.ticker"), primary_key=True)
+    timestamp: Mapped[dt.datetime] = mapped_column(DateTime(timezone=False), primary_key=True)
+    close: Mapped[float | None] = mapped_column(Float)
+    prev_timestamp: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=False))
+    prev_close: Mapped[float | None] = mapped_column(Float)
+    pct_return: Mapped[float | None] = mapped_column(Float)
+    p_end: Mapped[float | None] = mapped_column(Float)
+    p_start: Mapped[float | None] = mapped_column(Float)
+    momentum: Mapped[float | None] = mapped_column(Float)
+    volatility: Mapped[float | None] = mapped_column(Float)
+    date: Mapped[dt.date | None] = mapped_column(Date)
+    pcnt_daily_return: Mapped[float | None] = mapped_column(Float)
+    momentum_z: Mapped[float | None] = mapped_column(Float)
+    volatility_z: Mapped[float | None] = mapped_column(Float)
+    pred: Mapped[float | None] = mapped_column(Float)
+    pred_close: Mapped[float | None] = mapped_column(Float)
+    pcnt_diff: Mapped[float | None] = mapped_column(Float)
+
+
+class TestPredResult(_PredResultColumns, Base):
+    __tablename__ = "test_pred_results"
+
+
+class CurrentPredResult(_PredResultColumns, Base):
+    __tablename__ = "current_pred_results"
+
+
 class News(Base):
     """One row per article returned by GET /v2/reference/news, keyed by massive.com's
     own article `id` rather than by ticker - a single article often covers more than

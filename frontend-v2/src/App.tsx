@@ -17,6 +17,8 @@ import { SqlConsolePage } from './components/SqlConsolePage'
 import { WatchlistPage } from './components/WatchlistPage'
 import { BuySellPatternPage } from './components/BuySellPatternPage'
 import { BuySellTradesPage } from './components/BuySellTradesPage'
+import { PredictionHeadersPage } from './components/PredictionHeadersPage'
+import { UploadPredictionResultsPage, UploadTickerPredictionsPage } from './components/PredictionUploadPages'
 
 // Below this width the side menu renders as an overlay drawer (see index.css) and
 // should start closed; at/above it, it renders inline and should start open.
@@ -42,6 +44,10 @@ export type View =
   | 'Buy Sell Pattern'
   | 'Buy Sell Pattern (Date Range)'
   | 'Buy Sell Trades'
+  | 'Predictions'
+  | 'Prediction Headers'
+  | 'Upload Ticker Hit Rates'
+  | 'Upload Prediction Results'
   | 'Settings'
   | 'Ticker Types'
   | 'SQL Console'
@@ -92,6 +98,12 @@ function App() {
             <BuySellPatternPage key="date-range" dateRange />
           ) : activeView === 'Buy Sell Trades' ? (
             <BuySellTradesPage />
+          ) : activeView === 'Prediction Headers' ? (
+            <PredictionHeadersPage />
+          ) : activeView === 'Upload Ticker Hit Rates' ? (
+            <UploadTickerPredictionsPage />
+          ) : activeView === 'Upload Prediction Results' ? (
+            <UploadPredictionResultsPage />
           ) : activeView === 'Watchlist' ? (
             <WatchlistPage />
           ) : activeView === 'Research' ? (

@@ -1268,6 +1268,68 @@ export function adhocExportDownloadUrl(id: string): string {
   return `${API_BASE}/admin/query/exports/${id}`
 }
 
+// Mirrors app/main.py's /prediction-headers endpoints. The *_rows counts are how many
+// rows are already uploaded for this prediction set in each table.
+export interface PredictionHeader {
+  pred_id: number
+  pred_date: string
+  comments: string | null
+  ref_pred_id: number | null
+  hit_rate_rows: number
+  test_result_rows: number
+  current_result_rows: number
+}
+
+export interface PredictionHeaderInput {
+  pred_date: string
+  comments: string | null
+  ref_pred_id: number | null
+}
+
+export type PredictionResultKind = 'test' | 'current'
+
+export interface PredictionUploadResult {
+  pred_id: number
+  rows: number
+  tickers: number
+  replaced: number
+}
+
+// Mirrors app/main.py's MAX_PREDICTION_UPLOAD_BYTES.
+export const MAX_PREDICTION_UPLOAD_BYTES = 600 * 1024 * 1024
+
+// Sends `file` itself as the request body - the browser streams it from disk, so a
+// multi-hundred-MB CSV is never read into memory here. XMLHttpRequest rather than
+// fetch because fetch can't report upload progress. `onProgress` gets the fraction
+// sent (0-1); once it hits 1 the server is still validating and inserting rows.
+function uploadFile<T>(path: string, file: File, onProgress?: (fraction: number) => void): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `${API_BASE}${path}`)
+    xhr.setRequestHeader('Content-Type', 'text/csv')
+    if (onProgress) {
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) onProgress(event.loaded / event.total)
+      }
+    }
+    xhr.onload = () => {
+      let body: unknown = null
+      try {
+        body = JSON.parse(xhr.responseText)
+      } catch {
+        // non-JSON error body - fall through to the status-only message
+      }
+      if (xhr.status >= 200 && xhr.status < 300) resolve(body as T)
+      else {
+        const detail = (body as { detail?: unknown } | null)?.detail
+        reject(new Error(typeof detail === 'string' ? detail : `${path} failed: ${xhr.status}`))
+      }
+    }
+    xhr.onerror = () => reject(new Error(`${path} failed: network error`))
+    xhr.send(file)
+  })
+}
+
 export const api = {
   jobs: () => getJSON<Job[]>('/jobs'),
   job: (name: string) => getJSON<Job>(`/jobs/${name}`),
@@ -1614,4 +1676,24 @@ export const api = {
     qs.set('order_by', orderByParam)
     return getJSON<PredictionAccuracyReport>(`/reports/prediction-accuracy?${qs.toString()}`)
   },
+  predictionHeaders: () => getJSON<PredictionHeader[]>('/prediction-headers'),
+  createPredictionHeader: (body: PredictionHeaderInput) => postJSONBody<PredictionHeader>('/prediction-headers', body),
+  updatePredictionHeader: (predId: number, body: PredictionHeaderInput) =>
+    putJSON<PredictionHeader>(`/prediction-headers/${predId}`, body),
+  // `replace` deletes the prediction set's existing rows in that table first;
+  // otherwise rows are upserted on top of them. See uploadFile for `onProgress`.
+  uploadPredictionHitRates: (predId: number, file: File, replace: boolean, onProgress?: (fraction: number) => void) =>
+    uploadFile<PredictionUploadResult>(`/prediction-headers/${predId}/hit-rates?replace=${replace}`, file, onProgress),
+  uploadPredictionResults: (
+    predId: number,
+    kind: PredictionResultKind,
+    file: File,
+    replace: boolean,
+    onProgress?: (fraction: number) => void,
+  ) =>
+    uploadFile<PredictionUploadResult>(
+      `/prediction-headers/${predId}/results/${kind}?replace=${replace}`,
+      file,
+      onProgress,
+    ),
 }
