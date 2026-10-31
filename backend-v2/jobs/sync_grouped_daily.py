@@ -78,12 +78,15 @@ def weekdays(start_date: dt.date, end_date: dt.date) -> list[dt.date]:
     return days
 
 
-def _bar_row(result: dict[str, Any]) -> dict[str, Any]:
+def _bar_row(result: dict[str, Any], day: dt.date) -> dict[str, Any]:
     row: dict[str, Any] = {
         "ticker": result["T"],
         "multiplier": DEFAULT_MULTIPLIER,
         "timespan": DEFAULT_TIMESPAN,
-        "timestamp": dt.datetime.fromtimestamp(result["t"] / 1000, tz=dt.timezone.utc).replace(tzinfo=None),
+        # This endpoint's "t" is the session close (16:00 ET = 20:00/21:00 UTC), not the
+        # start of the day - key the bar by the requested trading date at midnight instead,
+        # so it lands on the same (ticker, day) row rather than a second one beside it.
+        "timestamp": dt.datetime.combine(day, dt.time()),
     }
     for source, field in _BAR_FIELD_MAP.items():
         row[field] = result.get(source)
@@ -163,7 +166,7 @@ def sync_grouped_daily(
             if control is not None:
                 await control.checkpoint_async()
             try:
-                rows = [_bar_row(result) for result in await _fetch_day(client, day) if result.get("T") in selected]
+                rows = [_bar_row(result, day) for result in await _fetch_day(client, day) if result.get("T") in selected]
             except Exception:
                 logger.exception("grouped daily sync failed for %s", day)
                 failed.append(day)

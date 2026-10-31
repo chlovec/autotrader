@@ -30,7 +30,8 @@ def _clean_db():
 
 
 def _ms(day: dt.date) -> int:
-    return int(dt.datetime.combine(day, dt.time(), tzinfo=dt.timezone.utc).timestamp() * 1000)
+    # The real endpoint's "t" is the session close, 16:00 ET (20:00 UTC during EDT).
+    return int(dt.datetime.combine(day, dt.time(20), tzinfo=dt.timezone.utc).timestamp() * 1000)
 
 
 def _bar(ticker: str, day: dt.date, open_: float = 10.0, close: float = 11.0) -> dict:
